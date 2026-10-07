@@ -1,0 +1,166 @@
+name: Release
+
+# Pushing a tag like v0.2.0 (scripts/bump-version.sh makes one) builds PhotoSlop for every
+# platform and publishes a GitHub release with the notes from CHANGELOG.md. Running it by hand
+# (Actions > Release > Run workflow) is a dry run: it builds the packages but publishes nothing.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: macos
+            os: macos-latest
+          - platform: windows
+            os: windows-latest
+          # The oldest supported runner, so the AppImage runs on older distributions.
+          - platform: linux
+            os: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches VERSION
+        shell: bash
+        run: |
+          version=$(tr -d '[:space:]' < VERSION)
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match VERSION ($version)"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.10.*'
+          cache: true
+
+      - name: Install Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1-mesa-dev libxkbcommon-dev libxkbcommon-x11-0 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
+
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure
+        shell: bash
+        run: |
+          extra=()
+          # One app for both Apple silicon and Intel Macs.
+          if [ "$RUNNER_OS" = macOS ]; then extra+=("-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"); fi
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "${extra[@]}"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          macdeployqt build/PhotoSlop.app
+          # macdeployqt rewrites the binaries, and Apple silicon refuses to run unsigned code,
+          # so sign the whole bundle again (ad hoc, until there is a Developer ID).
+          codesign --force --deep --sign - build/PhotoSlop.app
+          codesign --verify --deep --strict build/PhotoSlop.app
+          # A disk image with an Applications shortcut to drag the app onto.
+          mkdir -p dmg dist
+          cp -R build/PhotoSlop.app dmg/
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname "PhotoSlop $VERSION" -srcfolder dmg -ov -format UDZO \
+            "dist/PhotoSlop-$VERSION-macos.dmg"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/PhotoSlop | Out-Null
+          Copy-Item build/PhotoSlop.exe dist/PhotoSlop/
+          windeployqt --release --no-translations --compiler-runtime dist/PhotoSlop/PhotoSlop.exe
+          Copy-Item LICENSE dist/PhotoSlop/LICENSE.txt
+          Compress-Archive -Path dist/PhotoSlop -DestinationPath "dist/PhotoSlop-$env:VERSION-windows-x64.zip"
+          Remove-Item -Recurse dist/PhotoSlop
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        env:
+          # The runners have no FUSE, so the linuxdeploy AppImages unpack themselves instead.
+          APPIMAGE_EXTRACT_AND_RUN: 1
+          LINUXDEPLOY_OUTPUT_VERSION: ${{ env.VERSION }}
+        run: |
+          base=https://github.com/linuxdeploy
+          wget -q "$base/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
+          wget -q "$base/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage"
+          chmod +x linuxdeploy*.AppImage
+          cp resources/icons/app.svg photoslop.svg
+          export QMAKE="$QT_ROOT_DIR/bin/qmake"
+          ./linuxdeploy-x86_64.AppImage --appdir AppDir \
+            --executable build/PhotoSlop \
+            --desktop-file packaging/photoslop.desktop \
+            --icon-file photoslop.svg \
+            --plugin qt --output appimage
+          mkdir -p dist
+          mv PhotoSlop-*.AppImage "dist/PhotoSlop-$VERSION-linux-x86_64.AppImage"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: photoslop-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          awk -v v="$version" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            /^## / { on = 0 }
+            on
+          ' CHANGELOG.md > notes.md
+          cat >> notes.md <<'EOF'
+
+          ### Downloads
+          - **macOS** (Apple silicon and Intel): `.dmg`. The app is not signed yet, so the first time, right-click PhotoSlop and choose Open.
+          - **Windows** (64-bit): `.zip`. Unzip it and run `PhotoSlop.exe`.
+          - **Linux** (x86-64): `.AppImage`. Make it executable (`chmod +x`) and run it.
+          EOF
+          cat notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: PhotoSlop ${{ github.ref_name }}
+          body_path: notes.md
+          files: dist/*

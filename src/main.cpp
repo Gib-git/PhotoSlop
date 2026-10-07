@@ -77,7 +77,7 @@ int main(int argc, char** argv)
 {
     QApplication::setOrganizationName(QStringLiteral("PhotoSlop"));
     QApplication::setApplicationName(QStringLiteral("PhotoSlop"));
-    QApplication::setApplicationVersion(QStringLiteral("0.1.0"));
+    QApplication::setApplicationVersion(QStringLiteral(PHOTOSLOP_VERSION));
     PhotoSlopApp app(argc, argv);
     Theme::apply(app);
     app.setWindowIcon(Theme::icon(QStringLiteral("app")));

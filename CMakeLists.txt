@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.21)
-project(PhotoSlop VERSION 0.1.0 LANGUAGES CXX)
+# The version lives in the VERSION file; scripts/bump-version.sh updates it.
+file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/VERSION PHOTOSLOP_VERSION LIMIT_COUNT 1)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS VERSION)
+project(PhotoSlop VERSION ${PHOTOSLOP_VERSION} LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -39,6 +42,7 @@ qt_add_resources(PhotoSlop "resources"
     BASE resources
     FILES ${ICON_FILES} resources/logo.svg)
 target_link_libraries(PhotoSlop PRIVATE photoslop_ui)
+target_compile_definitions(PhotoSlop PRIVATE PHOTOSLOP_VERSION="${PROJECT_VERSION}")
 
 set_target_properties(PhotoSlop PROPERTIES
     MACOSX_BUNDLE_GUI_IDENTIFIER com.photoslop.app

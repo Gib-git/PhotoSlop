@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=PhotoSlop
+GenericName=Image Editor
+Comment=Edit layered raster images
+Exec=PhotoSlop %F
+Icon=photoslop
+Terminal=false
+Categories=Graphics;2DGraphics;RasterGraphics;
+MimeType=image/png;image/jpeg;image/bmp;image/gif;image/tiff;image/webp;

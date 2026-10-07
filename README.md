@@ -6,7 +6,7 @@
 
 ---
 
-PhotoSlop is a cross-platform raster image editor for macOS, Linux and Windows. Its layout, behaviour and keyboard shortcuts closely follow Adobe Photoshop, so Photoshop users can work in it without relearning anything.
+PhotoSlop is a cross-platform raster image editor for macOS, Linux and Windows. Its layout, behaviour and keyboard shortcuts are designed to feel familiar, so anyone who has used a traditional image editor can pick it up straight away.
 
 It is written in C++20 with Qt 6 (Widgets). PhotoSlop is not affiliated with Adobe. All icons and artwork are original.
 
@@ -76,6 +76,18 @@ The shortcuts match Photoshop on every platform. Wherever Windows and Linux use 
 | Hide panels / hide right panels | Tab / Shift+Tab | same |
 | Panels | F6 Color, F7 Layers, F8 Info | same |
 
+## Download
+
+Ready-to-run builds for each platform are on the GitHub **Releases** page:
+
+| Platform | File | How to run it |
+|---|---|---|
+| macOS (Apple silicon and Intel) | `PhotoSlop-<version>-macos.dmg` | Open the disk image and drag PhotoSlop to Applications. The app is not signed yet, so the first time, right-click it and choose Open |
+| Windows (64-bit) | `PhotoSlop-<version>-windows-x64.zip` | Unzip it and run `PhotoSlop.exe` |
+| Linux (x86-64) | `PhotoSlop-<version>-linux-x86_64.AppImage` | `chmod +x` the file, then run it |
+
+The version history is in [CHANGELOG.md](CHANGELOG.md).
+
 ## Building
 
 You need CMake 3.21+, Ninja (optional) and Qt 6.5 or newer with the Widgets and Svg modules.
@@ -109,6 +121,14 @@ ctest --test-dir build --output-on-failure
 ```
 `test_core` covers blend maths, undo/redo, selections and Select ▸ Modify, transform and warp resampling, Quick Mask, guides, merging, crop/rotate and file round-trips. `test_ui` drives the real main window with simulated mouse input to check every tool, Free Transform, Quick Mask, rulers, guides and snapping. On a headless machine, run it with `QT_QPA_PLATFORM=offscreen`.
 
+### Versions and releases
+
+The version number lives in the `VERSION` file; CMake reads it and the app shows it in the splash screen and About box. To make a release:
+
+1. Add notes under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) and commit them.
+2. Run `scripts/bump-version.sh minor` (or `patch`, `major`, or an exact `X.Y.Z`). It updates `VERSION`, dates the changelog section, commits, and tags the commit `vX.Y.Z`.
+3. Run `git push --follow-tags`. The tag starts the Release workflow, which builds and tests on all three platforms and publishes a GitHub release with the downloads and the changelog notes.
+
 ## Project layout
 
 ```
@@ -118,6 +138,8 @@ src/tools/    One class per tool, plus the ToolManager (groups, shortcuts, tempo
 src/ui/       Main window, canvas view, rulers, view options, toolbox, panels and dialogs
 resources/    Original SVG icons and the logo
 docs/         README screenshots
+packaging/    Linux desktop entry for the AppImage
+scripts/      bump-version.sh
 tests/        Core unit tests and GUI tests
 ```
 
