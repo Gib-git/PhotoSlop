@@ -44,6 +44,8 @@ jobs:
         uses: jurplel/install-qt-action@v4
         with:
           version: '6.10.*'
+          # TIFF and WebP support.
+          modules: qtimageformats
           cache: true
 
       - name: Install Ninja
@@ -98,7 +100,11 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist/PhotoSlop | Out-Null
           Copy-Item build/PhotoSlop.exe dist/PhotoSlop/
-          windeployqt --release --no-translations --compiler-runtime dist/PhotoSlop/PhotoSlop.exe
+          windeployqt --release --no-translations --no-compiler-runtime dist/PhotoSlop/PhotoSlop.exe
+          # Ship the C++ runtime DLLs next to the exe, so PCs without the VC++ redistributable can run it.
+          $crt = Get-ChildItem "$env:VCToolsRedistDir\x64\Microsoft.VC*.CRT\*.dll"
+          if (-not $crt) { throw "Visual C++ runtime DLLs not found under $env:VCToolsRedistDir" }
+          $crt | Copy-Item -Destination dist/PhotoSlop/
           Copy-Item LICENSE dist/PhotoSlop/LICENSE.txt
           Compress-Archive -Path dist/PhotoSlop -DestinationPath "dist/PhotoSlop-$env:VERSION-windows-x64.zip"
           Remove-Item -Recurse dist/PhotoSlop
