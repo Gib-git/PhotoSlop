@@ -128,3 +128,9 @@ tests/        Core unit tests and GUI tests
 3. **Adjustments and filters**: Levels, Curves, Hue/Saturation, Color Balance, Gaussian Blur, Unsharp Mask, Add Noise and more, with live preview.
 4. **Layer power features**: masks, clipping masks, groups, adjustment layers, layer styles, Type tool, Shape tools, Clone Stamp, Healing, Dodge/Burn.
 5. **Pro and platform**: PSD import/export, 16/32-bit and CMYK/Lab modes, GPU canvas, an editable shortcut editor, Preferences, and installers for every platform.
+
+## License
+
+Copyright (C) 2026 gibigbig
+
+PhotoSlop is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See [LICENSE](LICENSE) for the full text.
