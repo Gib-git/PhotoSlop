@@ -49,6 +49,7 @@ Layer* Document::activeLayer()
 
 int Document::indexOfId(quint64 id) const
 {
+    if (m_quickMask && id == m_qmLayer.id) return kQuickMaskIndex;
     for (int i = 0; i < m_layers.size(); ++i)
         if (m_layers[i].id == id) return i;
     return -1;
@@ -91,6 +92,8 @@ void Document::setSelectionRaw(const QImage& mask)
     m_selection = mask;
     m_selCacheValid = false;
     emit selectionChanged();
+    emit guidesChanged();
+    emit quickMaskChanged();
 }
 
 void Document::changeSelection(const QImage& mask, const QString& undoText)
@@ -98,6 +101,59 @@ void Document::changeSelection(const QImage& mask, const QString& undoText)
     if (mask.isNull() && m_selection.isNull()) return;
     DocState before = state();
     setSelectionRaw(mask);
+    pushSnapshot(undoText, before);
+}
+
+// ---------------- Quick Mask ----------------
+
+void Document::setQuickMaskRaw(bool on, const Layer& maskLayer)
+{
+    m_quickMask = on;
+    m_qmLayer = on ? maskLayer : Layer();
+    m_qmOverlay = QImage();
+    if (on) updateQuickMaskOverlay(bounds());
+    emit quickMaskChanged();
+    emit imageChanged(bounds());
+}
+
+const QImage& Document::quickMaskOverlay()
+{
+    if (!m_dirty.isEmpty()) flush();
+    return m_qmOverlay;
+}
+
+void Document::updateQuickMaskOverlay(const QRect& rect)
+{
+    if (!m_quickMask) return;
+    if (m_qmOverlay.size() != m_size) {
+        m_qmOverlay = QImage(m_size, QImage::Format_ARGB32_Premultiplied);
+        m_qmOverlay.fill(Qt::transparent);
+    }
+    // Masked (dark) areas get Photoshop's default 50% red tint.
+    const QRect r = rect & bounds();
+    for (int y = r.top(); y <= r.bottom(); ++y) {
+        auto* d = reinterpret_cast<QRgb*>(m_qmOverlay.scanLine(y));
+        for (int x = r.left(); x <= r.right(); ++x) {
+            const int a = (255 - qGray(m_qmLayer.pixelAt(QPoint(x, y)))) / 2;
+            d[x] = qRgba(a, 0, 0, a);
+        }
+    }
+}
+
+// ---------------- Guides ----------------
+
+void Document::setGuidesRaw(const QList<Guide>& guides)
+{
+    if (guides == m_guides) return;
+    m_guides = guides;
+    emit guidesChanged();
+}
+
+void Document::changeGuides(const QList<Guide>& guides, const QString& undoText)
+{
+    if (guides == m_guides) return;
+    DocState before = state();
+    setGuidesRaw(guides);
     pushSnapshot(undoText, before);
 }
 
@@ -137,6 +193,7 @@ void Document::flush()
     m_dirty = QRect();
     recomposite(r);
     updatePyramid(r);
+    updateQuickMaskOverlay(r);
     emit imageChanged(r);
 }
 
@@ -218,6 +275,9 @@ DocState Document::state() const
     s.layers = m_layers;
     s.active = m_active;
     s.selection = m_selection;
+    s.guides = m_guides;
+    s.quickMask = m_quickMask;
+    s.quickMaskLayer = m_qmLayer;
     return s;
 }
 
@@ -263,8 +323,24 @@ void Document::restoreState(const DocState& s)
         m_selCacheValid = false;
         emit selectionChanged();
     }
+    if (s.guides != m_guides) {
+        m_guides = s.guides;
+        emit guidesChanged();
+    }
+    restoreQuickMask(s.quickMask, s.quickMaskLayer);
     if (layersDiffer || sizeChange) emit layersChanged();
     if (activeChange || layersDiffer) emit activeLayerChanged();
+}
+
+void Document::restoreQuickMask(bool on, const Layer& maskLayer)
+{
+    if (on == m_quickMask && (!on || sameLayer(maskLayer, m_qmLayer))) return;
+    if (on && m_quickMask) {
+        m_qmLayer = maskLayer;
+        invalidate();
+        return;
+    }
+    setQuickMaskRaw(on, maskLayer);
 }
 
 void Document::pushSnapshot(const QString& text, const DocState& before, int mergeId)
@@ -316,6 +392,10 @@ void Document::initialize(const DocState& s)
     m_active = std::clamp(s.active, 0, std::max(0, int(m_layers.size()) - 1));
     m_selection = s.selection;
     m_selCacheValid = false;
+    m_guides = s.guides;
+    m_quickMask = s.quickMask;
+    m_qmLayer = s.quickMaskLayer;
+    m_qmOverlay = QImage();
     reallocate();
     invalidate();
     m_undo->clear();
@@ -323,4 +403,6 @@ void Document::initialize(const DocState& s)
     emit layersChanged();
     emit activeLayerChanged();
     emit selectionChanged();
+    emit guidesChanged();
+    emit quickMaskChanged();
 }

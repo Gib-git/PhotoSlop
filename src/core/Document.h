@@ -10,6 +10,14 @@
 
 class QUndoStack;
 
+// A ruler guide. Horizontal guides sit at a y position, vertical guides at an x position
+// (canvas pixels).
+struct Guide {
+    Qt::Orientation orientation = Qt::Horizontal;
+    double position = 0.0;
+    bool operator==(const Guide& o) const { return orientation == o.orientation && position == o.position; }
+};
+
 // Everything needed to restore a document for undo. Images are implicitly
 // shared, so taking a snapshot is cheap.
 struct DocState {
@@ -18,6 +26,9 @@ struct DocState {
     QList<Layer> layers;
     int active = 0;
     QImage selection;
+    QList<Guide> guides;
+    bool quickMask = false;
+    Layer quickMaskLayer; // opaque grey: white = selected
 };
 
 class Document : public QObject {
@@ -45,8 +56,9 @@ public:
     // ---- Layers (index 0 is the bottom of the stack) ----
     int layerCount() const { return int(m_layers.size()); }
     const QList<Layer>& layers() const { return m_layers; }
-    const Layer& layerAt(int index) const { return m_layers[index]; }
-    Layer& layerRef(int index) { return m_layers[index]; } // direct, un-undoable access
+    // `index` may be kQuickMaskIndex while Quick Mask mode is on.
+    const Layer& layerAt(int index) const { return index == kQuickMaskIndex ? m_qmLayer : m_layers[index]; }
+    Layer& layerRef(int index) { return index == kQuickMaskIndex ? m_qmLayer : m_layers[index]; } // direct, un-undoable access
     QList<Layer>& layersRef() { return m_layers; }
     int activeIndex() const { return m_active; }
     void setActiveIndex(int index);
@@ -54,6 +66,25 @@ public:
     int indexOfId(quint64 id) const;
     QString nextLayerName();
     bool hasBackground() const { return !m_layers.isEmpty() && m_layers.first().isBackground; }
+
+    // ---- Edit target ----
+    // Painting and pixel commands go to the Quick Mask while it is on, otherwise to the active layer.
+    static constexpr int kQuickMaskIndex = -2;
+    int editIndex() const { return m_quickMask ? kQuickMaskIndex : m_active; }
+    Layer* editLayer() { return m_quickMask ? &m_qmLayer : activeLayer(); }
+
+    // ---- Quick Mask ----
+    bool inQuickMask() const { return m_quickMask; }
+    // Red overlay over masked (unselected) areas, canvas sized; null when Quick Mask is off.
+    const QImage& quickMaskOverlay();
+    // Switches Quick Mask on or off without recording history; call inside modify().
+    void setQuickMaskRaw(bool on, const Layer& maskLayer = Layer());
+    const Layer& quickMaskLayer() const { return m_qmLayer; }
+
+    // ---- Guides ----
+    const QList<Guide>& guides() const { return m_guides; }
+    void setGuidesRaw(const QList<Guide>& guides);
+    void changeGuides(const QList<Guide>& guides, const QString& undoText);
 
     // ---- Selection ----
     const QImage& selection() const { return m_selection; }
@@ -98,12 +129,16 @@ signals:
     void layerPixelsChanged(int index);
     void activeLayerChanged();
     void selectionChanged();
+    void guidesChanged();
+    void quickMaskChanged();
     void sizeChanged();
     void modifiedChanged();
     void titleChanged();
 
 private:
     void recomposite(const QRect& r);
+    void updateQuickMaskOverlay(const QRect& r);
+    void restoreQuickMask(bool on, const Layer& maskLayer);
     void updatePyramid(const QRect& r);
     void reallocate();
 
@@ -120,6 +155,11 @@ private:
     mutable bool m_selCacheValid = false;
     mutable QRect m_selBounds;
     mutable QVector<QLine> m_selEdges;
+
+    QList<Guide> m_guides;
+    bool m_quickMask = false;
+    Layer m_qmLayer;
+    QImage m_qmOverlay;
 
     QImage m_composite;
     QVector<QImage> m_pyramid; // levels 1..n

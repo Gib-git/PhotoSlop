@@ -38,6 +38,7 @@ private:
     QImage m_cleared;
     QRect m_prevRect;
     QImage m_selOrig;
+    QRect m_snapRect; // what is being moved, for snapping
     DocState m_before;
 };
 

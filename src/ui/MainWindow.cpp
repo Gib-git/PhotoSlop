@@ -8,6 +8,7 @@
 #include "core/ImageOps.h"
 #include "io/DocumentIO.h"
 #include "tools/FillTools.h"
+#include "tools/FreeTransformTool.h"
 #include "tools/NavigationTools.h"
 #include "tools/PaintTools.h"
 #include "tools/SelectionTools.h"
@@ -40,6 +41,7 @@
 #include <QMimeData>
 #include <QPlainTextEdit>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QStackedWidget>
 #include <QStandardPaths>
 #include <QTabBar>
@@ -73,6 +75,7 @@ MainWindow::MainWindow(QWidget* parent)
     , m_colors(new ColorState(this))
     , m_tools(new ToolManager(m_colors, this))
     , m_undoGroup(new QUndoGroup(this))
+    , m_viewOptions(new ViewOptions(this))
 {
     setWindowTitle(QStringLiteral("PhotoSlop — %1").arg(kSlogan));
     setWindowIcon(Theme::icon(QStringLiteral("app")));
@@ -109,6 +112,7 @@ MainWindow::MainWindow(QWidget* parent)
     createHiddenShortcuts();
 
     connect(m_tools, &ToolManager::alertRequested, this, &MainWindow::alert);
+    connect(m_viewOptions, &ViewOptions::changed, this, &MainWindow::syncViewActions);
     connect(QApplication::clipboard(), &QClipboard::dataChanged, this, [this] {
         if (!m_settingClipboard) m_clipValid = false;
     });
@@ -127,6 +131,12 @@ MainWindow::MainWindow(QWidget* parent)
 MainWindow::~MainWindow()
 {
     qApp->removeEventFilter(this);
+    // Documents outlive this object's slots during teardown (their undo stacks signal as they clear).
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        Document* doc = static_cast<DocumentPage*>(m_tabs->widget(i))->document();
+        disconnect(doc, nullptr, this, nullptr);
+        disconnect(doc->undoStack(), nullptr, this, nullptr);
+    }
 }
 
 // ---------------- Setup ----------------
@@ -139,15 +149,20 @@ void MainWindow::createTools()
     m_tools->addTool(new MarqueeTool(m_tools, true), 1);
     m_tools->addTool(new LassoTool(m_tools, false), 2);
     m_tools->addTool(new LassoTool(m_tools, true), 2);
-    m_tools->addTool(new CropTool(m_tools), 3);
-    m_tools->addTool(new EyedropperTool(m_tools), 4);
-    m_tools->addTool(new BrushTool(m_tools, K::Brush), 5);
-    m_tools->addTool(new BrushTool(m_tools, K::Pencil), 5);
-    m_tools->addTool(new BrushTool(m_tools, K::Eraser), 6);
-    m_tools->addTool(new GradientTool(m_tools), 7);
-    m_tools->addTool(new PaintBucketTool(m_tools), 7);
-    m_tools->addTool(new HandTool(m_tools), 8);
-    m_tools->addTool(new ZoomTool(m_tools), 9);
+    m_tools->addTool(new MagneticLassoTool(m_tools), 2);
+    m_tools->addTool(new QuickSelectionTool(m_tools), 3);
+    m_tools->addTool(new MagicWandTool(m_tools), 3);
+    m_tools->addTool(new CropTool(m_tools), 4);
+    m_tools->addTool(new EyedropperTool(m_tools), 5);
+    m_tools->addTool(new BrushTool(m_tools, K::Brush), 6);
+    m_tools->addTool(new BrushTool(m_tools, K::Pencil), 6);
+    m_tools->addTool(new BrushTool(m_tools, K::Eraser), 7);
+    m_tools->addTool(new GradientTool(m_tools), 8);
+    m_tools->addTool(new PaintBucketTool(m_tools), 8);
+    m_tools->addTool(new HandTool(m_tools), 9);
+    m_tools->addTool(new ZoomTool(m_tools), 10);
+    m_transform = new FreeTransformTool(m_tools);
+    m_tools->addTool(m_transform, -1);
 }
 
 void MainWindow::createToolBars()
@@ -188,9 +203,13 @@ void MainWindow::createToolBars()
     m_toolsBar->setMovable(false);
     m_toolsBar->setFloatable(false);
     m_toolsBar->setOrientation(Qt::Vertical);
-    auto* box = new ToolBox(m_tools, m_colors, m_toolsBar);
-    connect(box, &ToolBox::screenModeRequested, this, &MainWindow::cycleScreenMode);
-    m_toolsBar->addWidget(box);
+    m_toolBox = new ToolBox(m_tools, m_colors, m_toolsBar);
+    connect(m_toolBox, &ToolBox::screenModeRequested, this, &MainWindow::cycleScreenMode);
+    connect(m_toolBox, &ToolBox::quickMaskRequested, this, [this] {
+        m_tools->commitModal();
+        toggleQuickMask();
+    });
+    m_toolsBar->addWidget(m_toolBox);
     addToolBar(Qt::LeftToolBarArea, m_toolsBar);
 }
 
@@ -273,7 +292,15 @@ QAction* MainWindow::makeAction(const QString& id, const QString& text, const QL
     auto* a = new QAction(text, this);
     a->setShortcuts(ks);
     a->setShortcutContext(Qt::WindowShortcut);
-    connect(a, &QAction::triggered, this, [fn = std::move(fn)] { fn(); });
+    // Most commands apply a pending Free Transform first, as Photoshop does.
+    static const QStringList keepsTransform = {QStringLiteral("view."), QStringLiteral("transform."), QStringLiteral("tool."),
+                                               QStringLiteral("color."), QStringLiteral("brush."), QStringLiteral("window."),
+                                               QStringLiteral("edit.freeTransform"), QStringLiteral("edit.shortcuts")};
+    const bool commits = std::none_of(keepsTransform.begin(), keepsTransform.end(), [&](const QString& p) { return id.startsWith(p); });
+    connect(a, &QAction::triggered, this, [this, commits, fn = std::move(fn)] {
+        if (commits) m_tools->commitModal();
+        fn();
+    });
     m_actions.insert(id, a);
     if (needsDocument) m_docActions.append(a);
     return a;
@@ -350,6 +377,16 @@ void MainWindow::createMenus()
     undo->setShortcut(QKeySequence(QStringLiteral("Ctrl+Z")));
     QAction* redo = m_undoGroup->createRedoAction(this, QStringLiteral("Redo"));
     redo->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+Z")));
+    // Undo during Free Transform cancels it instead of stepping back through history.
+    disconnect(undo, &QAction::triggered, m_undoGroup, nullptr);
+    connect(undo, &QAction::triggered, this, [this] {
+        if (m_transform->isActive()) m_transform->cancel(currentView());
+        else m_undoGroup->undo();
+    });
+    disconnect(redo, &QAction::triggered, m_undoGroup, nullptr);
+    connect(redo, &QAction::triggered, this, [this] {
+        if (!m_transform->isActive()) m_undoGroup->redo();
+    });
     m_actions.insert(QStringLiteral("edit.undo"), undo);
     m_actions.insert(QStringLiteral("edit.redo"), redo);
     edit->addAction(undo);
@@ -392,8 +429,44 @@ void MainWindow::createMenus()
     stub(edit, QStringLiteral("Content-Aware Scale"), QKeySequence(QStringLiteral("Ctrl+Alt+Shift+C")));
     stub(edit, QStringLiteral("Puppet Warp"));
     stub(edit, QStringLiteral("Perspective Warp"));
-    stub(edit, QStringLiteral("Free Transform"), QKeySequence(QStringLiteral("Ctrl+T")));
-    stub(edit, QStringLiteral("Transform"));
+    edit->addAction(makeAction(QStringLiteral("edit.freeTransform"), QStringLiteral("Free Transform"), keys({"Ctrl+T"}),
+                               [this] { startTransform(false, int(FreeTransformTool::Mode::Free)); }));
+    QMenu* transform = edit->addMenu(QStringLiteral("Transform"));
+    transform->addAction(makeAction(QStringLiteral("transform.again"), QStringLiteral("Again"), keys({"Ctrl+Shift+T"}),
+                                    [this] { quickTransform([this] { m_transform->applyLastTransform(); }); }));
+    transform->addSeparator();
+    const struct { const char* id; const char* text; FreeTransformTool::Mode mode; } modes[] = {
+        {"transform.scale", "Scale", FreeTransformTool::Mode::Scale},
+        {"transform.rotate", "Rotate", FreeTransformTool::Mode::Rotate},
+        {"transform.skew", "Skew", FreeTransformTool::Mode::Skew},
+        {"transform.distort", "Distort", FreeTransformTool::Mode::Distort},
+        {"transform.perspective", "Perspective", FreeTransformTool::Mode::Perspective},
+        {"transform.warp", "Warp", FreeTransformTool::Mode::Warp},
+    };
+    for (const auto& m : modes) {
+        const int mode = int(m.mode);
+        transform->addAction(makeAction(QString::fromLatin1(m.id), QString::fromLatin1(m.text), {}, [this, mode] { startTransform(false, mode); }));
+    }
+    transform->addSeparator();
+    const struct { const char* id; const char* text; double degrees; int flip; } fixed[] = {
+        {"transform.rot180", "Rotate 180°", 180, 0},
+        {"transform.rot90cw", "Rotate 90° Clockwise", 90, 0},
+        {"transform.rot90ccw", "Rotate 90° Counter Clockwise", -90, 0},
+        {"transform.flipH", "Flip Horizontal", 0, 1},
+        {"transform.flipV", "Flip Vertical", 0, 2},
+    };
+    for (const auto& f : fixed) {
+        if (f.flip == 1) transform->addSeparator();
+        const QString text = QString::fromUtf8(f.text);
+        const double degrees = f.degrees;
+        const int flip = f.flip;
+        transform->addAction(makeAction(QString::fromLatin1(f.id), text, {}, [this, text, degrees, flip] {
+            quickTransform([this, text, degrees, flip] {
+                if (flip) m_transform->flip(flip == 1, text);
+                else m_transform->rotateBy(degrees, text);
+            });
+        }));
+    }
     stub(edit, QStringLiteral("Auto-Align Layers..."));
     stub(edit, QStringLiteral("Auto-Blend Layers..."));
     edit->addSeparator();
@@ -648,18 +721,33 @@ void MainWindow::createMenus()
     stub(select, QStringLiteral("Sky"));
     stub(select, QStringLiteral("Select and Mask..."), QKeySequence(QStringLiteral("Ctrl+Alt+R")));
     QMenu* modify = select->addMenu(QStringLiteral("Modify"));
-    stub(modify, QStringLiteral("Border..."));
-    stub(modify, QStringLiteral("Smooth..."));
-    stub(modify, QStringLiteral("Expand..."));
-    stub(modify, QStringLiteral("Contract..."));
+    const struct { const char* id; const char* text; Ops::Modify how; } modifyItems[] = {
+        {"select.border", "Border...", Ops::Modify::Border},
+        {"select.smooth", "Smooth...", Ops::Modify::Smooth},
+        {"select.expand", "Expand...", Ops::Modify::Expand},
+        {"select.contract", "Contract...", Ops::Modify::Contract},
+    };
+    for (const auto& m : modifyItems) {
+        const int how = int(m.how);
+        modify->addAction(makeAction(QString::fromLatin1(m.id), QString::fromLatin1(m.text), {}, [this, how] { modifySelectionDialog(how); }));
+    }
     modify->addAction(makeAction(QStringLiteral("select.feather"), QStringLiteral("Feather..."), keys({"Shift+F6"}), [this] { featherDialog(); }));
     select->addSeparator();
-    stub(select, QStringLiteral("Grow"));
-    stub(select, QStringLiteral("Similar"));
+    auto wandTolerance = [this] { return static_cast<MagicWandTool*>(m_tools->tool(QStringLiteral("magic-wand")))->tolerance(); };
+    select->addAction(makeAction(QStringLiteral("select.grow"), QStringLiteral("Grow"), {}, [this, wandTolerance] {
+        if (Document* d = currentDoc()) Ops::growSelection(d, wandTolerance(), true);
+    }));
+    select->addAction(makeAction(QStringLiteral("select.similar"), QStringLiteral("Similar"), {}, [this, wandTolerance] {
+        if (Document* d = currentDoc()) Ops::growSelection(d, wandTolerance(), false);
+    }));
     select->addSeparator();
-    stub(select, QStringLiteral("Transform Selection"));
+    select->addAction(makeAction(QStringLiteral("select.transform"), QStringLiteral("Transform Selection"), {},
+                                 [this] { startTransform(true, int(FreeTransformTool::Mode::Free)); }));
     select->addSeparator();
-    stub(select, QStringLiteral("Edit in Quick Mask Mode"));
+    QAction* quickMask = makeAction(QStringLiteral("select.quickMask"), QStringLiteral("Edit in Quick Mask Mode"), keys({"Q"}),
+                                    [this] { toggleQuickMask(); });
+    quickMask->setCheckable(true);
+    select->addAction(quickMask);
     select->addSeparator();
     stub(select, QStringLiteral("Load Selection..."));
     stub(select, QStringLiteral("Save Selection..."));
@@ -741,34 +829,37 @@ void MainWindow::createMenus()
     screen->addAction(makeAction(QStringLiteral("view.screenFullMenu"), QStringLiteral("Full Screen Mode With Menu Bar"), {}, [this] { setScreenMode(1); }, false));
     screen->addAction(makeAction(QStringLiteral("view.screenFull"), QStringLiteral("Full Screen Mode"), {}, [this] { setScreenMode(2); }, false));
     view->addSeparator();
-    QAction* extras = makeAction(QStringLiteral("view.extras"), QStringLiteral("Extras"), keys({"Ctrl+H"}), [this] {
-        const bool on = action(QStringLiteral("view.extras"))->isChecked();
-        for (int i = 0; i < m_tabs->count(); ++i)
-            static_cast<DocumentPage*>(m_tabs->widget(i))->view()->setShowSelectionEdges(on);
-    }, false);
-    extras->setCheckable(true);
-    extras->setChecked(true);
-    view->addAction(extras);
+    view->addAction(viewToggle(QStringLiteral("view.extras"), QStringLiteral("Extras"), keys({"Ctrl+H"}), &ViewOptions::extras));
     QMenu* show = view->addMenu(QStringLiteral("Show"));
-    QAction* pixelGrid = makeAction(QStringLiteral("view.pixelGrid"), QStringLiteral("Pixel Grid"), {}, [this] {
-        const bool on = action(QStringLiteral("view.pixelGrid"))->isChecked();
-        for (int i = 0; i < m_tabs->count(); ++i)
-            static_cast<DocumentPage*>(m_tabs->widget(i))->view()->setShowPixelGrid(on);
-    }, false);
-    pixelGrid->setCheckable(true);
-    pixelGrid->setChecked(true);
-    show->addAction(pixelGrid);
-    stub(show, QStringLiteral("Grid"), QKeySequence(QStringLiteral("Ctrl+'")));
-    stub(show, QStringLiteral("Guides"), QKeySequence(QStringLiteral("Ctrl+;")));
+    show->addAction(viewToggle(QStringLiteral("view.selectionEdges"), QStringLiteral("Selection Edges"), {}, &ViewOptions::selectionEdges));
+    show->addAction(viewToggle(QStringLiteral("view.pixelGrid"), QStringLiteral("Pixel Grid"), {}, &ViewOptions::pixelGrid));
+    show->addAction(viewToggle(QStringLiteral("view.grid"), QStringLiteral("Grid"), keys({"Ctrl+'"}), &ViewOptions::grid));
+    show->addAction(viewToggle(QStringLiteral("view.guides"), QStringLiteral("Guides"), keys({"Ctrl+;"}), &ViewOptions::guides));
     view->addSeparator();
-    stub(view, QStringLiteral("Rulers"), QKeySequence(QStringLiteral("Ctrl+R")));
+    view->addAction(viewToggle(QStringLiteral("view.rulers"), QStringLiteral("Rulers"), keys({"Ctrl+R"}), &ViewOptions::rulers));
     view->addSeparator();
-    stub(view, QStringLiteral("Snap"), QKeySequence(QStringLiteral("Ctrl+Shift+;")));
-    stub(view, QStringLiteral("Snap To"));
+    view->addAction(viewToggle(QStringLiteral("view.snap"), QStringLiteral("Snap"), keys({"Ctrl+Shift+;", "Ctrl+:"}), &ViewOptions::snap));
+    QMenu* snapTo = view->addMenu(QStringLiteral("Snap To"));
+    snapTo->addAction(viewToggle(QStringLiteral("view.snapGuides"), QStringLiteral("Guides"), {}, &ViewOptions::snapGuides));
+    snapTo->addAction(viewToggle(QStringLiteral("view.snapGrid"), QStringLiteral("Grid"), {}, &ViewOptions::snapGrid));
+    stub(snapTo, QStringLiteral("Layers"));
+    stub(snapTo, QStringLiteral("Slices"));
+    snapTo->addAction(viewToggle(QStringLiteral("view.snapBounds"), QStringLiteral("Document Bounds"), {}, &ViewOptions::snapBounds));
+    snapTo->addSeparator();
+    auto snapAll = [this](bool on) {
+        m_viewOptions->snapGuides = m_viewOptions->snapGrid = m_viewOptions->snapBounds = on;
+        m_viewOptions->notify();
+    };
+    snapTo->addAction(makeAction(QStringLiteral("view.snapAll"), QStringLiteral("All"), {}, [snapAll] { snapAll(true); }, false));
+    snapTo->addAction(makeAction(QStringLiteral("view.snapNone"), QStringLiteral("None"), {}, [snapAll] { snapAll(false); }, false));
     view->addSeparator();
-    stub(view, QStringLiteral("Lock Guides"), QKeySequence(QStringLiteral("Ctrl+Alt+;")));
-    stub(view, QStringLiteral("Clear Guides"));
-    stub(view, QStringLiteral("New Guide..."));
+    view->addAction(viewToggle(QStringLiteral("view.lockGuides"), QStringLiteral("Lock Guides"), keys({"Ctrl+Alt+;"}), &ViewOptions::lockGuides));
+    view->addAction(makeAction(QStringLiteral("view.clearGuides"), QStringLiteral("Clear Guides"), {}, [this] {
+        if (Document* d = currentDoc()) d->changeGuides({}, QStringLiteral("Clear Guides"));
+    }));
+    view->addAction(makeAction(QStringLiteral("view.newGuide"), QStringLiteral("New Guide..."), {}, [this] { newGuideDialog(); }));
+    stub(view, QStringLiteral("New Guide Layout..."));
+    stub(view, QStringLiteral("New Guides From Shape"));
 
     // ---------------- Window ----------------
     m_windowMenu = mb->addMenu(QStringLiteral("&Window"));
@@ -886,14 +977,14 @@ CanvasView* MainWindow::currentView() const { return currentPage() ? currentPage
 
 void MainWindow::addDocument(Document* doc)
 {
-    auto* page = new DocumentPage(doc, m_tools, m_tabs);
-    page->view()->setShowPixelGrid(action(QStringLiteral("view.pixelGrid"))->isChecked());
-    page->view()->setShowSelectionEdges(action(QStringLiteral("view.extras"))->isChecked());
+    auto* page = new DocumentPage(doc, m_tools, m_viewOptions, m_tabs);
     m_undoGroup->addStack(doc->undoStack());
     const int idx = m_tabs->addTab(page, page->tabTitle());
     connect(page, &DocumentPage::titleChanged, this, &MainWindow::updateTabTitles);
     connect(doc, &Document::selectionChanged, this, &MainWindow::updateActions);
     connect(doc, &Document::layersChanged, this, &MainWindow::updateActions);
+    connect(doc, &Document::quickMaskChanged, this, &MainWindow::updateActions);
+    connect(doc->undoStack(), &QUndoStack::indexChanged, this, &MainWindow::updateActions);
     m_tabs->setCurrentIndex(idx);
     m_central->setCurrentWidget(m_tabs);
     onCurrentChanged();
@@ -1164,13 +1255,19 @@ void MainWindow::updateActions()
 {
     Document* doc = currentDoc();
     for (QAction* a : std::as_const(m_docActions)) a->setEnabled(doc != nullptr);
+    m_toolBox->setQuickMask(doc && doc->inQuickMask());
+    action(QStringLiteral("select.quickMask"))->setChecked(doc && doc->inQuickMask());
     if (!doc) return;
     const bool sel = doc->hasSelection();
     const Layer* l = doc->activeLayer();
     action(QStringLiteral("select.deselect"))->setEnabled(sel);
     action(QStringLiteral("select.inverse"))->setEnabled(sel);
     action(QStringLiteral("select.reselect"))->setEnabled(!doc->lastSelection().isNull());
-    action(QStringLiteral("select.feather"))->setEnabled(sel);
+    for (const char* id : {"select.feather", "select.border", "select.smooth", "select.expand", "select.contract",
+                           "select.grow", "select.similar", "select.transform"})
+        action(QString::fromLatin1(id))->setEnabled(sel);
+    action(QStringLiteral("transform.again"))->setEnabled(FreeTransformTool::hasLastTransform());
+    action(QStringLiteral("view.clearGuides"))->setEnabled(!doc->guides().isEmpty());
     action(QStringLiteral("image.crop"))->setEnabled(sel);
     action(QStringLiteral("edit.cut"))->setEnabled(sel);
     action(QStringLiteral("layer.viaCut"))->setEnabled(sel);
@@ -1372,18 +1469,103 @@ void MainWindow::featherDialog()
     doc->changeSelection(Sel::isEmpty(mask) ? QImage() : mask, QStringLiteral("Feather"));
 }
 
+void MainWindow::modifySelectionDialog(int howInt)
+{
+    Document* doc = currentDoc();
+    if (!doc || !doc->hasSelection()) return;
+    const auto how = Ops::Modify(howInt);
+    static int last[4] = {1, 2, 1, 1};
+    const struct { const char* title; const char* label; bool bounds; } info[] = {
+        {"Border Selection", "Width:", false},
+        {"Smooth Selection", "Sample Radius:", true},
+        {"Expand Selection", "Expand By:", true},
+        {"Contract Selection", "Contract By:", true},
+    };
+    const auto& i = info[howInt];
+    ModifySelectionDialog dlg(QString::fromLatin1(i.title), QString::fromLatin1(i.label), last[howInt], i.bounds, this);
+    if (dlg.exec() != QDialog::Accepted) return;
+    last[howInt] = dlg.amount();
+    Ops::modifySelection(doc, how, dlg.amount(), dlg.atCanvasBounds());
+}
+
+void MainWindow::toggleQuickMask()
+{
+    if (Document* doc = currentDoc()) Ops::setQuickMask(doc, !doc->inQuickMask());
+}
+
+void MainWindow::startTransform(bool selectionOnly, int mode)
+{
+    CanvasView* v = currentView();
+    if (!v) return;
+    if (m_transform->isActive()) {
+        if (!selectionOnly) m_transform->setMode(FreeTransformTool::Mode(mode));
+        return;
+    }
+    m_tempFromKey = false;
+    m_transform->begin(v, selectionOnly, FreeTransformTool::Mode(mode));
+}
+
+void MainWindow::quickTransform(const std::function<void()>& apply)
+{
+    // Inside Free Transform these adjust the pending transform; otherwise they apply at once.
+    if (m_transform->isActive()) {
+        apply();
+        return;
+    }
+    CanvasView* v = currentView();
+    if (!v || !m_transform->begin(v, false)) return;
+    apply();
+    m_transform->commit(v);
+}
+
+void MainWindow::newGuideDialog()
+{
+    Document* doc = currentDoc();
+    if (!doc) return;
+    NewGuideDialog dlg(this);
+    if (dlg.exec() != QDialog::Accepted) return;
+    QList<Guide> guides = doc->guides();
+    guides.append(Guide{dlg.orientation(), dlg.position()});
+    doc->changeGuides(guides, QStringLiteral("New Guide"));
+    if (!m_viewOptions->showsGuides()) {
+        m_viewOptions->extras = m_viewOptions->guides = true;
+        m_viewOptions->notify();
+    }
+}
+
+QAction* MainWindow::viewToggle(const QString& id, const QString& text, const QList<QKeySequence>& ks, bool ViewOptions::*field)
+{
+    QAction* a = makeAction(id, text, ks, [this, id, field] {
+        m_viewOptions->*field = action(id)->isChecked();
+        m_viewOptions->notify();
+    }, false);
+    a->setCheckable(true);
+    a->setChecked(m_viewOptions->*field);
+    m_viewToggles.insert(id, field);
+    return a;
+}
+
+void MainWindow::syncViewActions()
+{
+    for (auto it = m_viewToggles.cbegin(); it != m_viewToggles.cend(); ++it) {
+        QAction* a = action(it.key());
+        QSignalBlocker block(a);
+        a->setChecked(m_viewOptions->*(it.value()));
+    }
+}
+
 void MainWindow::applyPixelFilter(const QString& name, const std::function<QRgb(QRgb)>& fn)
 {
     Document* doc = currentDoc();
-    if (!doc || !doc->activeLayer()) return;
-    const Layer* l = doc->activeLayer();
+    if (!doc || !doc->editLayer()) return;
+    const Layer* l = doc->editLayer();
     if (l->pixelsLocked()) {
         alert(QStringLiteral("Could not complete the %1 command because the layer is locked.").arg(name));
         return;
     }
     QRect r = (doc->hasSelection() ? doc->selectionBounds() : doc->bounds()) & l->rect();
     if (r.isEmpty()) return;
-    PixelEdit edit(doc, doc->activeIndex(), QRect());
+    PixelEdit edit(doc, doc->editIndex(), QRect());
     Layer& layer = edit.layer();
     const QImage& sel = doc->selection();
     for (int y = r.top(); y <= r.bottom(); ++y) {
@@ -1571,6 +1753,15 @@ bool MainWindow::isTypingTarget() const
 
 bool MainWindow::eventFilter(QObject* obj, QEvent* e)
 {
+    if (e->type() == QEvent::MouseButtonPress && m_tools->modalTool()) {
+        // Clicking a panel applies a pending Free Transform first; the canvas, the options
+        // bar and menus keep it open.
+        auto* w = qobject_cast<QWidget*>(obj);
+        CanvasView* v = currentView();
+        const bool keep = !w || (v && (w == v || v->isAncestorOf(w))) || m_optionsBar->isAncestorOf(w) || w == m_optionsBar
+            || qobject_cast<QMenu*>(w) || qobject_cast<QMenuBar*>(w) || w->window() != this;
+        if (!keep) m_tools->commitModal();
+    }
     if (e->type() != QEvent::KeyPress && e->type() != QEvent::KeyRelease) return QMainWindow::eventFilter(obj, e);
     if (QApplication::activeModalWidget() || QApplication::activePopupWidget() || !isActiveWindow() || isTypingTarget())
         return QMainWindow::eventFilter(obj, e);
@@ -1608,7 +1799,7 @@ bool MainWindow::eventFilter(QObject* obj, QEvent* e)
         // Hold Ctrl/Cmd for the Move tool.
         if (press && !ke->isAutoRepeat() && !m_tools->hasTemporary()
             && !(curId == QLatin1String("move") || curId == QLatin1String("hand") || curId == QLatin1String("zoom")
-                 || curId == QLatin1String("crop"))) {
+                 || curId == QLatin1String("crop") || curId == QLatin1String("transform"))) {
             m_tools->pushTemporary(QStringLiteral("move"));
             m_tempFromKey = m_tools->hasTemporary();
         } else if (!press && m_tempFromKey && curId == QLatin1String("move")) {
@@ -1632,7 +1823,8 @@ bool MainWindow::eventFilter(QObject* obj, QEvent* e)
         }
         break;
     default:
-        if (press && ke->key() >= Qt::Key_0 && ke->key() <= Qt::Key_9 && mods == Qt::NoModifier && currentDoc()) {
+        if (press && ke->key() >= Qt::Key_0 && ke->key() <= Qt::Key_9 && mods == Qt::NoModifier && currentDoc()
+            && !m_tools->modalTool()) {
             handleDigit(ke->key() - Qt::Key_0);
             return true;
         }
@@ -1654,6 +1846,7 @@ void MainWindow::dropEvent(QDropEvent* e)
     if (!files.isEmpty()) {
         openFiles(files);
     } else if (e->mimeData()->hasImage()) {
+        m_tools->commitModal();
         QImage img = qvariant_cast<QImage>(e->mimeData()->imageData());
         if (Document* doc = currentDoc()) Ops::paste(doc, img);
         else addDocument(DocumentIO::fromImage(img, QStringLiteral("Untitled-%1").arg(++m_untitled)));

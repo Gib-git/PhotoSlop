@@ -29,9 +29,13 @@ void fillColor(Layer& layer, const QRect& canvasRect, QRgb premulColor, BlendMod
 // Removes pixels (or scales alpha down) by the selection coverage.
 void clearPixels(Layer& layer, const QRect& canvasRect, const QImage& selection);
 
-// Magic-wand style region (Grayscale8, canvas sized).
+// Pixels of `layer` within `canvasRect`, multiplied by the selection coverage (null = all).
+QImage maskedPixels(const Layer& layer, const QRect& canvasRect, const QImage& selection);
+
+// Magic-wand style region (Grayscale8, canvas sized). The reference colour is the
+// average of a `sampleSize` x `sampleSize` square around the seed.
 QImage floodMask(const QImage& canvasImage, const QPoint& seed, int tolerance, bool contiguous,
-                 bool antialias);
+                 bool antialias, int sampleSize = 1);
 
 QImage renderGradient(const QSize& canvasSize, const QPointF& p0, const QPointF& p1,
                       GradientType type, const QGradientStops& stops, bool reverse, bool dither,

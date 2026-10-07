@@ -224,6 +224,217 @@ QVector<QLine> edges(const QImage& mask)
     return out;
 }
 
+namespace {
+
+// Squared Euclidean distance transform of a 1D sampled function (Felzenszwalb & Huttenlocher).
+void edt1d(const float* f, int n, float* d, int* v, float* z)
+{
+    constexpr float inf = 1e20f;
+    int k = 0;
+    v[0] = 0;
+    z[0] = -inf;
+    z[1] = inf;
+    for (int q = 1; q < n; ++q) {
+        float s = ((f[q] + float(q) * q) - (f[v[k]] + float(v[k]) * v[k])) / (2.0f * q - 2.0f * v[k]);
+        while (s <= z[k]) {
+            --k;
+            s = ((f[q] + float(q) * q) - (f[v[k]] + float(v[k]) * v[k])) / (2.0f * q - 2.0f * v[k]);
+        }
+        ++k;
+        v[k] = q;
+        z[k] = s;
+        z[k + 1] = inf;
+    }
+    k = 0;
+    for (int q = 0; q < n; ++q) {
+        while (z[k + 1] < q) ++k;
+        d[q] = float(q - v[k]) * float(q - v[k]) + f[v[k]];
+    }
+}
+
+// Distance from every pixel to the nearest pixel where `feature(x, y)` is true. With
+// `borderIsFeature`, pixels just outside the image count as features.
+template <typename F>
+std::vector<float> distanceTo(int w, int h, F feature, bool borderIsFeature)
+{
+    constexpr float inf = 1e20f;
+    const int pad = borderIsFeature ? 1 : 0;
+    const int W = w + 2 * pad, H = h + 2 * pad;
+    std::vector<float> grid(size_t(W) * H);
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const int ix = x - pad, iy = y - pad;
+            const bool inside = ix >= 0 && iy >= 0 && ix < w && iy < h;
+            grid[size_t(y) * W + x] = (inside ? feature(ix, iy) : true) ? 0.0f : inf;
+        }
+    const int n = std::max(W, H);
+    std::vector<float> f(n), d(n), z(n + 1);
+    std::vector<int> v(n);
+    for (int x = 0; x < W; ++x) {
+        for (int y = 0; y < H; ++y) f[y] = grid[size_t(y) * W + x];
+        edt1d(f.data(), H, d.data(), v.data(), z.data());
+        for (int y = 0; y < H; ++y) grid[size_t(y) * W + x] = d[y];
+    }
+    for (int y = 0; y < H; ++y) {
+        float* row = grid.data() + size_t(y) * W;
+        std::copy(row, row + W, f.begin());
+        edt1d(f.data(), W, d.data(), v.data(), z.data());
+        std::copy(d.begin(), d.begin() + W, row);
+    }
+    std::vector<float> out(size_t(w) * h);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) out[size_t(y) * w + x] = std::sqrt(grid[size_t(y + pad) * W + x + pad]);
+    return out;
+}
+
+bool selectedAt(const QImage& m, int x, int y) { return m.constScanLine(y)[x] >= 128; }
+
+} // namespace
+
+QImage expanded(const QImage& mask, int radius)
+{
+    if (mask.isNull() || radius <= 0) return mask;
+    const int w = mask.width(), h = mask.height();
+    auto dist = distanceTo(w, h, [&](int x, int y) { return selectedAt(mask, x, y); }, false);
+    QImage r = mask.copy();
+    for (int y = 0; y < h; ++y) {
+        uchar* d = r.scanLine(y);
+        for (int x = 0; x < w; ++x) {
+            const float cover = std::clamp(radius + 1.0f - dist[size_t(y) * w + x], 0.0f, 1.0f);
+            d[x] = std::max(d[x], uchar(std::lround(cover * 255)));
+        }
+    }
+    return r;
+}
+
+QImage contracted(const QImage& mask, int radius, bool atCanvasBounds)
+{
+    if (mask.isNull() || radius <= 0) return mask;
+    const int w = mask.width(), h = mask.height();
+    auto dist = distanceTo(w, h, [&](int x, int y) { return !selectedAt(mask, x, y); }, atCanvasBounds);
+    QImage r = mask.copy();
+    for (int y = 0; y < h; ++y) {
+        uchar* d = r.scanLine(y);
+        for (int x = 0; x < w; ++x) {
+            const float cover = std::clamp(dist[size_t(y) * w + x] - radius, 0.0f, 1.0f);
+            d[x] = std::min(d[x], uchar(std::lround(cover * 255)));
+        }
+    }
+    return isEmpty(r) ? QImage() : r;
+}
+
+QImage border(const QImage& mask, int width)
+{
+    if (mask.isNull() || width <= 0) return mask;
+    // A band centred on the selection edge.
+    QImage outer = expanded(mask, (width + 1) / 2);
+    QImage inner = contracted(mask, width / 2, false);
+    if (inner.isNull()) return outer;
+    for (int y = 0; y < outer.height(); ++y) {
+        uchar* d = outer.scanLine(y);
+        const uchar* s = inner.constScanLine(y);
+        for (int x = 0; x < outer.width(); ++x) d[x] = uchar(d[x] * (255 - s[x]) / 255);
+    }
+    return isEmpty(outer) ? QImage() : outer;
+}
+
+QImage smoothed(const QImage& mask, int radius, bool atCanvasBounds)
+{
+    if (mask.isNull() || radius <= 0) return mask;
+    // Majority vote over a (2r+1)² square, using a summed-area table.
+    const int w = mask.width(), h = mask.height();
+    std::vector<int> sat(size_t(w + 1) * (h + 1), 0);
+    for (int y = 0; y < h; ++y) {
+        const uchar* s = mask.constScanLine(y);
+        int run = 0;
+        for (int x = 0; x < w; ++x) {
+            run += s[x] >= 128 ? 1 : 0;
+            sat[size_t(y + 1) * (w + 1) + x + 1] = sat[size_t(y) * (w + 1) + x + 1] + run;
+        }
+    }
+    QImage r(mask.size(), QImage::Format_Grayscale8);
+    for (int y = 0; y < h; ++y) {
+        uchar* d = r.scanLine(y);
+        const int y0 = std::max(0, y - radius), y1 = std::min(h, y + radius + 1);
+        for (int x = 0; x < w; ++x) {
+            const int x0 = std::max(0, x - radius), x1 = std::min(w, x + radius + 1);
+            const int on = sat[size_t(y1) * (w + 1) + x1] - sat[size_t(y0) * (w + 1) + x1]
+                - sat[size_t(y1) * (w + 1) + x0] + sat[size_t(y0) * (w + 1) + x0];
+            // Outside the canvas counts as selected unless the effect applies at the bounds.
+            const int total = (2 * radius + 1) * (2 * radius + 1);
+            const int inside = (x1 - x0) * (y1 - y0);
+            const int votes = on + (atCanvasBounds ? 0 : total - inside);
+            d[x] = votes * 2 > total ? 255 : 0;
+        }
+    }
+    return isEmpty(r) ? QImage() : r;
+}
+
+QImage grown(const QImage& mask, const QImage& image, int tolerance, bool contiguous)
+{
+    if (mask.isNull()) return mask;
+    const int w = mask.width(), h = mask.height();
+    int lo[4] = {255, 255, 255, 255}, hi[4] = {0, 0, 0, 0};
+    auto channels = [](QRgb p, int out[4]) {
+        out[0] = qRed(p);
+        out[1] = qGreen(p);
+        out[2] = qBlue(p);
+        out[3] = qAlpha(p);
+    };
+    bool any = false;
+    for (int y = 0; y < h; ++y) {
+        const uchar* m = mask.constScanLine(y);
+        const QRgb* row = reinterpret_cast<const QRgb*>(image.constScanLine(y));
+        for (int x = 0; x < w; ++x) {
+            if (m[x] < 128) continue;
+            int c[4];
+            channels(row[x], c);
+            for (int i = 0; i < 4; ++i) {
+                lo[i] = std::min(lo[i], c[i]);
+                hi[i] = std::max(hi[i], c[i]);
+            }
+            any = true;
+        }
+    }
+    if (!any) return mask;
+    const int slack = (tolerance + 1) / 2;
+    auto within = [&](int x, int y) {
+        int c[4];
+        channels(reinterpret_cast<const QRgb*>(image.constScanLine(y))[x], c);
+        for (int i = 0; i < 4; ++i)
+            if (c[i] < lo[i] - slack || c[i] > hi[i] + slack) return false;
+        return true;
+    };
+    QImage r = mask.copy();
+    if (!contiguous) {
+        for (int y = 0; y < h; ++y) {
+            uchar* d = r.scanLine(y);
+            for (int x = 0; x < w; ++x)
+                if (within(x, y)) d[x] = 255;
+        }
+        return r;
+    }
+    std::vector<QPoint> stack;
+    for (int y = 0; y < h; ++y) {
+        const uchar* m = mask.constScanLine(y);
+        for (int x = 0; x < w; ++x)
+            if (m[x] >= 128) stack.emplace_back(x, y);
+    }
+    while (!stack.empty()) {
+        const QPoint p = stack.back();
+        stack.pop_back();
+        const QPoint nbrs[4] = {{p.x() - 1, p.y()}, {p.x() + 1, p.y()}, {p.x(), p.y() - 1}, {p.x(), p.y() + 1}};
+        for (const QPoint& q : nbrs) {
+            if (q.x() < 0 || q.y() < 0 || q.x() >= w || q.y() >= h) continue;
+            uchar& d = r.scanLine(q.y())[q.x()];
+            if (d >= 128 || !within(q.x(), q.y())) continue;
+            d = 255;
+            stack.push_back(q);
+        }
+    }
+    return r;
+}
+
 QImage fromLayerAlpha(const Layer& layer, const QSize& canvasSize)
 {
     QImage m = empty(canvasSize);

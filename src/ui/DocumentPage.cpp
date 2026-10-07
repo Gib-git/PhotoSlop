@@ -2,6 +2,10 @@
 
 #include "core/Document.h"
 #include "ui/CanvasView.h"
+#include "ui/Ruler.h"
+#include "ui/ViewOptions.h"
+
+#include <QGridLayout>
 
 #include <QHBoxLayout>
 #include <QLabel>
@@ -18,16 +22,31 @@ QString formatZoom(double zoom)
     return QString::number(pct, 'f', pct < 10 ? 2 : 1) + QLatin1Char('%');
 }
 
-DocumentPage::DocumentPage(Document* doc, ToolManager* tools, QWidget* parent)
+DocumentPage::DocumentPage(Document* doc, ToolManager* tools, ViewOptions* options, QWidget* parent)
     : QWidget(parent)
     , m_doc(doc)
+    , m_options(options)
 {
     doc->setParent(this);
     auto* root = new QVBoxLayout(this);
     root->setContentsMargins(0, 0, 0, 0);
     root->setSpacing(0);
-    m_view = new CanvasView(doc, tools, this);
-    root->addWidget(m_view, 1);
+    m_view = new CanvasView(doc, tools, options, this);
+    m_hRuler = new Ruler(Qt::Horizontal, m_view, this);
+    m_vRuler = new Ruler(Qt::Vertical, m_view, this);
+    m_corner = new QWidget(this);
+    m_corner->setFixedSize(Ruler::kThickness, Ruler::kThickness);
+    m_corner->setStyleSheet(QStringLiteral("background: #323232; border-right: 1px solid #1e1e1e; border-bottom: 1px solid #1e1e1e;"));
+    auto* grid = new QGridLayout;
+    grid->setContentsMargins(0, 0, 0, 0);
+    grid->setSpacing(0);
+    grid->addWidget(m_corner, 0, 0);
+    grid->addWidget(m_hRuler, 0, 1);
+    grid->addWidget(m_vRuler, 1, 0);
+    grid->addWidget(m_view, 1, 1);
+    root->addLayout(grid, 1);
+    connect(options, &ViewOptions::changed, this, &DocumentPage::updateRulers);
+    updateRulers();
 
     auto* status = new QWidget(this);
     status->setObjectName(QStringLiteral("DocStatusBar"));
@@ -63,7 +82,14 @@ DocumentPage::DocumentPage(Document* doc, ToolManager* tools, QWidget* parent)
     connect(doc, &Document::modifiedChanged, this, &DocumentPage::titleChanged);
     connect(doc, &Document::activeLayerChanged, this, &DocumentPage::titleChanged);
     connect(doc, &Document::layersChanged, this, &DocumentPage::titleChanged);
+    connect(doc, &Document::quickMaskChanged, this, &DocumentPage::titleChanged);
     updateStatus();
+}
+
+void DocumentPage::updateRulers()
+{
+    for (QWidget* w : {static_cast<QWidget*>(m_hRuler), static_cast<QWidget*>(m_vRuler), m_corner})
+        w->setVisible(m_options->rulers);
 }
 
 DocumentPage::~DocumentPage()
@@ -75,9 +101,10 @@ DocumentPage::~DocumentPage()
 QString DocumentPage::tabTitle() const
 {
     const Layer* l = m_doc->activeLayer();
-    return QStringLiteral("%1 @ %2 (%3, RGB/8)%4")
-        .arg(m_doc->title(), formatZoom(m_view->zoom()), l ? l->name : QString(),
-             m_doc->isModified() ? QStringLiteral(" *") : QString());
+    const QString target = m_doc->inQuickMask() ? QStringLiteral("Quick Mask/8")
+                                                : QStringLiteral("%1, RGB/8").arg(l ? l->name : QString());
+    return QStringLiteral("%1 @ %2 (%3)%4")
+        .arg(m_doc->title(), formatZoom(m_view->zoom()), target, m_doc->isModified() ? QStringLiteral(" *") : QString());
 }
 
 void DocumentPage::updateStatus()

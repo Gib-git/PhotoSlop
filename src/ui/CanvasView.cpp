@@ -4,6 +4,7 @@
 #include "core/Document.h"
 #include "tools/Tool.h"
 #include "tools/ToolManager.h"
+#include "ui/ViewOptions.h"
 
 #include <QKeyEvent>
 #include <QMouseEvent>
@@ -13,6 +14,7 @@
 #include <QTabletEvent>
 #include <QWheelEvent>
 #include <cmath>
+#include <limits>
 #include <algorithm>
 #include <iterator>
 
@@ -53,10 +55,11 @@ QBrush antsBrush(int phase)
 
 } // namespace
 
-CanvasView::CanvasView(Document* doc, ToolManager* tools, QWidget* parent)
+CanvasView::CanvasView(Document* doc, ToolManager* tools, ViewOptions* options, QWidget* parent)
     : QAbstractScrollArea(parent)
     , m_doc(doc)
     , m_tools(tools)
+    , m_opts(options)
 {
     setFrameShape(QFrame::NoFrame);
     setFocusPolicy(Qt::StrongFocus);
@@ -80,6 +83,10 @@ CanvasView::CanvasView(Document* doc, ToolManager* tools, QWidget* parent)
         if (m_doc->hasSelection()) m_antsTimer.start();
         else m_antsTimer.stop();
     });
+
+    connect(doc, &Document::guidesChanged, viewport(), qOverload<>(&QWidget::update));
+    connect(doc, &Document::quickMaskChanged, viewport(), qOverload<>(&QWidget::update));
+    connect(options, &ViewOptions::changed, viewport(), qOverload<>(&QWidget::update));
 
     m_antsTimer.setInterval(120);
     connect(&m_antsTimer, &QTimer::timeout, this, [this] {
@@ -194,16 +201,209 @@ void CanvasView::centerOn(const QPointF& canvasPt)
     verticalScrollBar()->setValue(int(canvasPt.y() * s - viewport()->height() / 2.0));
 }
 
-void CanvasView::setShowPixelGrid(bool on)
+void CanvasView::setSelectionEdgesSuppressed(bool on)
 {
-    m_pixelGrid = on;
+    if (on == m_suppressEdges) return;
+    m_suppressEdges = on;
     viewport()->update();
 }
 
-void CanvasView::setShowSelectionEdges(bool on)
+// ---------------- Snapping ----------------
+
+double CanvasView::gridStep() const
 {
-    m_showEdges = on;
+    const double major = std::max(2.0, m_opts->gridInches * m_doc->dpi());
+    return major / std::max(1, m_opts->gridSubdivisions);
+}
+
+double CanvasView::snapValue(double v, bool xAxis, bool includeGuides, double* distance) const
+{
+    // Photoshop snaps within a few screen pixels.
+    double best = 6.0 / scale();
+    double result = v;
+    auto consider = [&](double target) {
+        const double d = std::fabs(target - v);
+        if (d < best) {
+            best = d;
+            result = target;
+        }
+    };
+    if (m_opts->snap) {
+        if (includeGuides && m_opts->snapGuides && m_opts->showsGuides())
+            for (const Guide& g : m_doc->guides())
+                if ((g.orientation == Qt::Vertical) == xAxis) consider(g.position);
+        if (m_opts->snapGrid && m_opts->showsGrid()) {
+            const double step = gridStep();
+            consider(std::round(v / step) * step);
+        }
+        if (m_opts->snapBounds) {
+            consider(0.0);
+            consider(xAxis ? m_doc->width() : m_doc->height());
+        }
+    }
+    if (distance) *distance = result == v ? std::numeric_limits<double>::max() : best;
+    return result;
+}
+
+QPointF CanvasView::snapPoint(const QPointF& p) const
+{
+    return QPointF(snapValue(p.x(), true, true, nullptr), snapValue(p.y(), false, true, nullptr));
+}
+
+QPointF CanvasView::snapRectOffset(const QRectF& r) const
+{
+    QPointF offset;
+    for (bool xAxis : {true, false}) {
+        const double edges[3] = {xAxis ? r.left() : r.top(), xAxis ? r.right() : r.bottom(),
+                                 xAxis ? r.center().x() : r.center().y()};
+        double bestDist = std::numeric_limits<double>::max(), bestDelta = 0.0;
+        for (double e : edges) {
+            double d = 0.0;
+            const double snapped = snapValue(e, xAxis, true, &d);
+            if (d < bestDist) {
+                bestDist = d;
+                bestDelta = snapped - e;
+            }
+        }
+        if (xAxis) offset.setX(bestDelta);
+        else offset.setY(bestDelta);
+    }
+    return offset;
+}
+
+// ---------------- Guides ----------------
+
+int CanvasView::guideAt(const QPointF& viewPos) const
+{
+    if (!m_opts->showsGuides()) return -1;
+    const auto& guides = m_doc->guides();
+    for (int i = int(guides.size()) - 1; i >= 0; --i) {
+        const Guide& g = guides[i];
+        const double v = g.orientation == Qt::Vertical ? canvasToView(QPointF(g.position, 0)).x()
+                                                       : canvasToView(QPointF(0, g.position)).y();
+        const double cur = g.orientation == Qt::Vertical ? viewPos.x() : viewPos.y();
+        if (std::fabs(v - cur) <= 3.0) return i;
+    }
+    return -1;
+}
+
+bool CanvasView::canDragGuides() const
+{
+    const Tool* t = m_tools->current();
+    return t && t->id() == QLatin1String("move") && m_opts->showsGuides() && !m_opts->lockGuides;
+}
+
+void CanvasView::beginGuideDrag(Qt::Orientation orientation, int index, bool fromRuler)
+{
+    m_guideDrag = GuideDrag();
+    m_guideDrag.active = true;
+    m_guideDrag.fromRuler = fromRuler;
+    m_guideDrag.index = index;
+    m_guideDrag.orientation = m_guideDrag.startOrientation = orientation;
+    if (index >= 0) {
+        m_guideDrag.position = m_doc->guides()[index].position;
+        m_guideDrag.visible = true;
+    }
+    if (!m_opts->showsGuides()) {
+        // Dragging from a ruler shows guides again, as in Photoshop.
+        m_opts->extras = m_opts->guides = true;
+        m_opts->notify();
+    }
     viewport()->update();
+}
+
+void CanvasView::updateGuideDrag(const QPointF& viewPos, Qt::KeyboardModifiers mods)
+{
+    if (!m_guideDrag.active) return;
+    // Alt/Option flips a guide pulled from a ruler.
+    m_guideDrag.orientation = m_guideDrag.startOrientation;
+    if (m_guideDrag.fromRuler && (mods & Qt::AltModifier))
+        m_guideDrag.orientation = m_guideDrag.orientation == Qt::Horizontal ? Qt::Vertical : Qt::Horizontal;
+    const QPointF c = viewToCanvas(viewPos);
+    const bool xAxis = m_guideDrag.orientation == Qt::Vertical;
+    const double raw = std::round(xAxis ? c.x() : c.y());
+    m_guideDrag.position = snapValue(raw, xAxis, false, nullptr);
+    m_guideDrag.visible = viewport()->rect().contains(viewPos.toPoint());
+    viewport()->update();
+}
+
+void CanvasView::endGuideDrag(const QPointF& viewPos)
+{
+    if (!m_guideDrag.active) return;
+    const GuideDrag d = m_guideDrag;
+    m_guideDrag = GuideDrag();
+    viewport()->update();
+    QList<Guide> guides = m_doc->guides();
+    const bool inside = viewport()->rect().contains(viewPos.toPoint());
+    if (d.index >= 0 && d.index < guides.size()) {
+        if (!inside) {
+            guides.removeAt(d.index);
+            m_doc->changeGuides(guides, QStringLiteral("Delete Guide"));
+            return;
+        }
+        guides[d.index] = Guide{d.orientation, d.position};
+        m_doc->changeGuides(guides, QStringLiteral("Move Guide"));
+        return;
+    }
+    if (!inside) return;
+    guides.append(Guide{d.orientation, d.position});
+    m_doc->changeGuides(guides, QStringLiteral("New Guide"));
+}
+
+void CanvasView::paintGridAndGuides(QPainter& p, const QRectF& canvasView)
+{
+    p.save();
+    p.setRenderHint(QPainter::Antialiasing, false);
+    const QRectF vis = canvasView & QRectF(viewport()->rect());
+    if (m_opts->showsGrid() && !vis.isEmpty()) {
+        const double step = gridStep();
+        const int sub = std::max(1, m_opts->gridSubdivisions);
+        const double viewStep = step * scale();
+        if (viewStep * sub >= 4.0) {
+            const QRectF c(viewToCanvas(vis.topLeft()), viewToCanvas(vis.bottomRight()));
+            QVector<QLineF> major, minor;
+            const bool showMinor = viewStep >= 5.0;
+            for (long i = long(std::floor(c.left() / step)); i * step <= c.right(); ++i) {
+                if (i * step < c.left()) continue;
+                const double x = canvasToView(QPointF(i * step, 0)).x();
+                if (i % sub == 0) major.append(QLineF(x, vis.top(), x, vis.bottom()));
+                else if (showMinor) minor.append(QLineF(x, vis.top(), x, vis.bottom()));
+            }
+            for (long i = long(std::floor(c.top() / step)); i * step <= c.bottom(); ++i) {
+                if (i * step < c.top()) continue;
+                const double y = canvasToView(QPointF(0, i * step)).y();
+                if (i % sub == 0) major.append(QLineF(vis.left(), y, vis.right(), y));
+                else if (showMinor) minor.append(QLineF(vis.left(), y, vis.right(), y));
+            }
+            QPen minorPen(QColor(150, 150, 150, 110), 0, Qt::DotLine);
+            p.setPen(minorPen);
+            p.drawLines(minor);
+            p.setPen(QPen(QColor(150, 150, 150, 170), 0));
+            p.drawLines(major);
+        }
+    }
+    // Guides span the whole window, like Photoshop's.
+    const QColor guideColor(74, 255, 255);
+    auto drawGuide = [&](Qt::Orientation o, double pos) {
+        if (o == Qt::Vertical) {
+            const double x = std::round(canvasToView(QPointF(pos, 0)).x()) + 0.5;
+            p.drawLine(QPointF(x, 0), QPointF(x, viewport()->height()));
+        } else {
+            const double y = std::round(canvasToView(QPointF(0, pos)).y()) + 0.5;
+            p.drawLine(QPointF(0, y), QPointF(viewport()->width(), y));
+        }
+    };
+    if (m_opts->showsGuides()) {
+        p.setPen(QPen(guideColor, 0));
+        const auto& guides = m_doc->guides();
+        for (int i = 0; i < guides.size(); ++i)
+            if (!(m_guideDrag.active && i == m_guideDrag.index)) drawGuide(guides[i].orientation, guides[i].position);
+    }
+    if (m_guideDrag.active && m_guideDrag.visible) {
+        p.setPen(QPen(guideColor, 0));
+        drawGuide(m_guideDrag.orientation, m_guideDrag.position);
+    }
+    p.restore();
 }
 
 void CanvasView::scrollContentsBy(int, int)
@@ -284,10 +484,14 @@ void CanvasView::paintEvent(QPaintEvent* e)
             const QRectF levelSrc(src.x() / f, src.y() / f, src.width() / f, src.height() / f);
             p.setRenderHint(QPainter::SmoothPixmapTransform, m_zoom < 1.0 && std::fabs(m_zoom * f - 1.0) > 1e-6);
             p.drawImage(canvasToView(QRectF(src)), img, levelSrc);
+            if (m_doc->inQuickMask()) {
+                p.setRenderHint(QPainter::SmoothPixmapTransform, false);
+                p.drawImage(canvasToView(QRectF(src)), m_doc->quickMaskOverlay(), QRectF(src));
+            }
         }
 
         // Pixel grid at high zoom (Photoshop shows it above 500%).
-        if (m_pixelGrid && m_zoom >= 6.0) {
+        if (m_opts->showsPixelGrid() && m_zoom >= 6.0) {
             QRect vis = (QRectF(viewToCanvas(visible.topLeft()), viewToCanvas(visible.bottomRight()))
                              .toAlignedRect() & m_doc->bounds());
             p.setPen(QPen(QColor(128, 128, 128, 90), 0));
@@ -304,8 +508,10 @@ void CanvasView::paintEvent(QPaintEvent* e)
         }
     }
 
+    paintGridAndGuides(p, canvasView);
+
     // Marching ants.
-    if (m_showEdges && m_doc->hasSelection()) {
+    if (m_opts->showsSelectionEdges() && !m_suppressEdges && m_doc->hasSelection()) {
         const auto& edges = m_doc->selectionEdges();
         const double s = scale();
         const QPointF o = origin();
@@ -407,6 +613,14 @@ void CanvasView::mousePressEvent(QMouseEvent* e)
         return;
     }
     if (e->button() != Qt::LeftButton || m_pressTool) return;
+    if (canDragGuides()) {
+        const int g = guideAt(e->position());
+        if (g >= 0) {
+            m_guideMouse = true;
+            beginGuideDrag(m_doc->guides()[g].orientation, g, false);
+            return;
+        }
+    }
     handlePress(makeEvent(e->position(), e->modifiers(), e->button(), e->buttons(), 1.0, false));
 }
 
@@ -417,6 +631,21 @@ void CanvasView::mouseMoveEvent(QMouseEvent* e)
         m_panLast = e->position();
         return;
     }
+    if (m_guideMouse) {
+        updateGuideDrag(e->position(), e->modifiers());
+        return;
+    }
+    if (!m_pressTool) {
+        // Hovering a guide with the Move tool offers to drag it.
+        const int g = canDragGuides() ? guideAt(e->position()) : -1;
+        if (g >= 0) {
+            viewport()->setCursor(m_doc->guides()[g].orientation == Qt::Vertical ? Qt::SplitHCursor : Qt::SplitVCursor);
+            m_hoverGuide = true;
+        } else if (m_hoverGuide) {
+            m_hoverGuide = false;
+            updateCursor();
+        }
+    }
     handleMove(makeEvent(e->position(), e->modifiers(), Qt::NoButton, e->buttons(), 1.0, false));
 }
 
@@ -424,6 +653,12 @@ void CanvasView::mouseReleaseEvent(QMouseEvent* e)
 {
     if (e->button() == Qt::MiddleButton && m_panning) {
         m_panning = false;
+        updateCursor();
+        return;
+    }
+    if (e->button() == Qt::LeftButton && m_guideMouse) {
+        m_guideMouse = false;
+        endGuideDrag(e->position());
         updateCursor();
         return;
     }

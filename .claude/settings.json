@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "defaultMode": "dontAsk",
+    "allow": [
+      "Bash(npm run *)",
+      "Bash(node p/04-merge-fee-periods.ts)",
+      "Bash(./check *)",
+      "Bash(./check)",
+      "Bash(bash *)",
+      "Bash(sh *)",
+      "Bash(./*)",
+      "Bash(timeout 10 node --inspect-brk=9229 p/04-merge-fee-periods.ts)",
+      "Bash",
+      "Read",
+      "Edit",
+      "Write",
+      "WebFetch",
+      "Grep",
+      "Glob",
+      "LS",
+      "MultiEdit",
+      "Bash(git *)",
+      "Bash(ls *)",
+      "Bash(grep *)",
+      "Bash(npm test)",
+      "Bash(find:*)"
+    ],
+    "permissions": {
+      "defaultMode": "bypassPermissions",
+      "dangerousOperations": "allow",
+      "allow": [
+        "Bash(*)",
+        "Edit(*)",
+        "Write(*)"
+      ]
+    }
+  }
+}

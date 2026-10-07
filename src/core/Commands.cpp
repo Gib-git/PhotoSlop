@@ -57,7 +57,7 @@ void PixelCommand::apply(const QImage& pixels, const QRect& geometryBefore,
                          const QRect& geometryAfter)
 {
     int idx = m_doc->indexOfId(m_layerId);
-    if (idx < 0) return;
+    if (idx == -1) return; // may be Document::kQuickMaskIndex
     Layer& l = m_doc->layerRef(idx);
     // Write pixels while the buffer has the geometry they were captured in.
     l.setGeometry(geometryBefore);
@@ -104,7 +104,7 @@ PixelEdit::~PixelEdit()
 Layer& PixelEdit::layer()
 {
     int idx = m_doc->indexOfId(m_layerId);
-    Q_ASSERT(idx >= 0);
+    Q_ASSERT(idx != -1);
     return m_doc->layerRef(idx);
 }
 

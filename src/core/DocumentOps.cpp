@@ -47,22 +47,6 @@ bool isTransparent(const QImage& img)
     return true;
 }
 
-// Pixels of `layer` within `rect`, multiplied by the selection coverage.
-QImage maskedPixels(const Layer& layer, const QRect& rect, const QImage& selection)
-{
-    QImage out(rect.size(), QImage::Format_ARGB32_Premultiplied);
-    out.fill(Qt::transparent);
-    QRect r = layer.rect() & rect;
-    for (int y = r.top(); y <= r.bottom(); ++y) {
-        auto* dst = reinterpret_cast<uint32_t*>(out.scanLine(y - rect.top())) + (r.left() - rect.left());
-        auto* src = reinterpret_cast<const uint32_t*>(layer.image.constScanLine(y - layer.offset.y()))
-            + (r.left() - layer.offset.x());
-        const uchar* m = selection.isNull() ? nullptr : selection.constScanLine(y) + r.left();
-        for (int i = 0; i < r.width(); ++i) dst[i] = m ? Blend::byteMul(src[i], m[i]) : src[i];
-    }
-    return out;
-}
-
 QRect mapRect(const QRect& r, Rotation how, const QSize& s)
 {
     const int W = s.width(), H = s.height();
@@ -342,7 +326,7 @@ bool layerViaCopy(Document* doc, bool cut, QString* error)
         return duplicateLayer(doc, doc->nextLayerName());
     }
     QRect r = doc->selectionBounds();
-    QImage pixels = maskedPixels(*src, r, doc->selection());
+    QImage pixels = ImageOps::maskedPixels(*src, r, doc->selection());
     if (isTransparent(pixels)) {
         setError(error, cut ? QStringLiteral("Could not complete the New Layer via Cut command because the selected area is empty.")
                             : QStringLiteral("Could not complete the New Layer via Copy command because the selected area is empty."));
@@ -389,6 +373,79 @@ void inverse(Document* doc)
     doc->changeSelection(Sel::inverted(doc->selection(), doc->size()), QStringLiteral("Inverse"));
 }
 
+bool modifySelection(Document* doc, Modify how, int amount, bool atCanvasBounds)
+{
+    if (!doc->hasSelection() || amount <= 0) return false;
+    const QImage& sel = doc->selection();
+    QImage result;
+    QString text;
+    switch (how) {
+    case Modify::Border:
+        result = Sel::border(sel, amount);
+        text = QStringLiteral("Border");
+        break;
+    case Modify::Smooth:
+        result = Sel::smoothed(sel, amount, atCanvasBounds);
+        text = QStringLiteral("Smooth");
+        break;
+    case Modify::Expand:
+        result = Sel::expanded(sel, amount);
+        text = QStringLiteral("Expand");
+        break;
+    case Modify::Contract:
+        result = Sel::contracted(sel, amount, atCanvasBounds);
+        text = QStringLiteral("Contract");
+        break;
+    }
+    doc->changeSelection(Sel::isEmpty(result) ? QImage() : result, text);
+    return true;
+}
+
+bool growSelection(Document* doc, int tolerance, bool contiguous)
+{
+    if (!doc->hasSelection()) return false;
+    QImage result = Sel::grown(doc->selection(), doc->composite(), tolerance, contiguous);
+    doc->changeSelection(result, contiguous ? QStringLiteral("Grow") : QStringLiteral("Similar"));
+    return true;
+}
+
+void setQuickMask(Document* doc, bool on)
+{
+    if (on == doc->inQuickMask()) return;
+    doc->modify(QStringLiteral("Quick Mask"), [&] {
+        if (on) {
+            // White is selected, black is masked; no selection means everything is selected.
+            Layer mask = Layer::create(QStringLiteral("Quick Mask"));
+            mask.isBackground = true;
+            mask.image = QImage(doc->size(), QImage::Format_ARGB32_Premultiplied);
+            const QImage& sel = doc->selection();
+            for (int y = 0; y < doc->height(); ++y) {
+                auto* d = reinterpret_cast<QRgb*>(mask.image.scanLine(y));
+                const uchar* s = sel.isNull() ? nullptr : sel.constScanLine(y);
+                for (int x = 0; x < doc->width(); ++x) {
+                    const int v = s ? s[x] : 255;
+                    d[x] = qRgb(v, v, v);
+                }
+            }
+            doc->setSelectionRaw(QImage());
+            doc->setQuickMaskRaw(true, mask);
+        } else {
+            const Layer& mask = doc->quickMaskLayer();
+            QImage sel = Sel::empty(doc->size());
+            bool all = true;
+            for (int y = 0; y < doc->height(); ++y) {
+                uchar* d = sel.scanLine(y);
+                for (int x = 0; x < doc->width(); ++x) {
+                    d[x] = uchar(qGray(mask.pixelAt(QPoint(x, y))));
+                    all = all && d[x] == 255;
+                }
+            }
+            doc->setQuickMaskRaw(false);
+            doc->setSelectionRaw(all || Sel::isEmpty(sel) ? QImage() : sel);
+        }
+    });
+}
+
 void loadSelectionFromLayer(Document* doc, int index, Sel::Op op)
 {
     QImage mask = Sel::fromLayerAlpha(doc->layerAt(index), doc->size());
@@ -402,7 +459,7 @@ void loadSelectionFromLayer(Document* doc, int index, Sel::Op op)
 bool fill(Document* doc, const QColor& color, BlendMode mode, float opacity,
           bool preserveTransparency, QString* error)
 {
-    Layer* l = doc->activeLayer();
+    Layer* l = doc->editLayer();
     if (!l) return false;
     if (l->pixelsLocked()) {
         setError(error, QStringLiteral("Could not use the Fill command because the layer is locked."));
@@ -413,7 +470,7 @@ bool fill(Document* doc, const QColor& color, BlendMode mode, float opacity,
         return false;
     }
     QRect r = doc->hasSelection() ? doc->selectionBounds() : doc->bounds();
-    PixelEdit edit(doc, doc->activeIndex(), preserveTransparency ? QRect() : r);
+    PixelEdit edit(doc, doc->editIndex(), preserveTransparency ? QRect() : r);
     ImageOps::fillColor(edit.layer(), r, ImageOps::premultiplied(color), mode, opacity,
                         doc->selection(), preserveTransparency || edit.layer().lockTransparency);
     edit.markDirty(r);
@@ -423,14 +480,14 @@ bool fill(Document* doc, const QColor& color, BlendMode mode, float opacity,
 
 bool clear(Document* doc, const QColor& backgroundColor, QString* error)
 {
-    Layer* l = doc->activeLayer();
+    Layer* l = doc->editLayer();
     if (!l || !doc->hasSelection()) return false;
     if (l->pixelsLocked() || (l->lockTransparency && !l->isBackground)) {
         setError(error, QStringLiteral("Could not complete the Clear command because the layer is locked."));
         return false;
     }
     QRect r = doc->selectionBounds();
-    PixelEdit edit(doc, doc->activeIndex(), QRect());
+    PixelEdit edit(doc, doc->editIndex(), QRect());
     if (edit.layer().isBackground)
         ImageOps::fillColor(edit.layer(), r, ImageOps::premultiplied(backgroundColor),
                             BlendMode::Normal, 1.f, doc->selection(), false);
@@ -448,11 +505,11 @@ QImage copy(Document* doc, bool merged, QPoint* topLeft, QString* error)
     if (merged) {
         Layer tmp;
         tmp.image = doc->composite();
-        out = maskedPixels(tmp, r, doc->selection());
+        out = ImageOps::maskedPixels(tmp, r, doc->selection());
     } else {
         Layer* l = doc->activeLayer();
         if (!l) return QImage();
-        out = maskedPixels(*l, r, doc->selection());
+        out = ImageOps::maskedPixels(*l, r, doc->selection());
     }
     if (isTransparent(out)) {
         setError(error, QStringLiteral("Could not complete the Copy command because the selected area is empty."));

@@ -52,10 +52,13 @@ class ToolBox : public QWidget {
     Q_OBJECT
 public:
     ToolBox(ToolManager* manager, ColorState* colors, QWidget* parent = nullptr);
+    void setQuickMask(bool on);
 
 signals:
     void screenModeRequested();
+    void quickMaskRequested();
 
 private:
     ToolManager* m_manager;
+    QToolButton* m_quickMask = nullptr;
 };

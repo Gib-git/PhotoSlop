@@ -163,7 +163,7 @@ ToolBox::ToolBox(ToolManager* manager, ColorState* colors, QWidget* parent)
     lay->addSpacing(4);
 
     // Separators after these group indices mirror Photoshop's toolbar sections.
-    const QList<int> separatorsAfter = {0, 4, 7};
+    const QList<int> separatorsAfter = {0, 5, 8};
     const auto& groups = manager->groups();
     for (int g = 0; g < groups.size(); ++g) {
         lay->addWidget(new ToolGroupButton(manager, g, this), 0, Qt::AlignHCenter);
@@ -180,13 +180,19 @@ ToolBox::ToolBox(ToolManager* manager, ColorState* colors, QWidget* parent)
     lay->addWidget(new ColorSwatchWidget(colors, this), 0, Qt::AlignHCenter);
     lay->addSpacing(6);
 
-    auto* quickMask = new QToolButton(this);
-    quickMask->setIcon(Theme::icon(QStringLiteral("quickmask")));
-    quickMask->setToolTip(QStringLiteral("Edit in Quick Mask Mode (Q)"));
-    quickMask->setFixedSize(34, 28);
-    quickMask->setIconSize(QSize(18, 18));
-    quickMask->setEnabled(false);
-    lay->addWidget(quickMask, 0, Qt::AlignHCenter);
+    m_quickMask = new QToolButton(this);
+    m_quickMask->setIcon(Theme::icon(QStringLiteral("quickmask")));
+    m_quickMask->setToolTip(QStringLiteral("Edit in Quick Mask Mode (Q)"));
+    m_quickMask->setFixedSize(34, 28);
+    m_quickMask->setIconSize(QSize(18, 18));
+    m_quickMask->setCheckable(true);
+    m_quickMask->setAutoRaise(true);
+    // The click only asks; the button reflects the document's actual state.
+    connect(m_quickMask, &QToolButton::clicked, this, [this](bool on) {
+        m_quickMask->setChecked(!on);
+        emit quickMaskRequested();
+    });
+    lay->addWidget(m_quickMask, 0, Qt::AlignHCenter);
 
     auto* screen = new QToolButton(this);
     screen->setIcon(Theme::icon(QStringLiteral("screenmode")));
@@ -196,4 +202,10 @@ ToolBox::ToolBox(ToolManager* manager, ColorState* colors, QWidget* parent)
     connect(screen, &QToolButton::clicked, this, &ToolBox::screenModeRequested);
     lay->addWidget(screen, 0, Qt::AlignHCenter);
     lay->addStretch();
+}
+
+void ToolBox::setQuickMask(bool on)
+{
+    m_quickMask->setChecked(on);
+    m_quickMask->setToolTip(on ? QStringLiteral("Edit in Standard Mode (Q)") : QStringLiteral("Edit in Quick Mask Mode (Q)"));
 }

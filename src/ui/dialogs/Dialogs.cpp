@@ -21,6 +21,7 @@
 #include <QListWidget>
 #include <QPainter>
 #include <QPushButton>
+#include <QRadioButton>
 #include <QSlider>
 #include <QSpinBox>
 #include <QTabBar>
@@ -794,3 +795,74 @@ QString ExportDialog::extension() const
     if (f == "tiff") return QStringLiteral("tif");
     return QString::fromLatin1(f);
 }
+
+// ---------------- ModifySelectionDialog ----------------
+
+ModifySelectionDialog::ModifySelectionDialog(const QString& title, const QString& label, int initial,
+                                             bool boundsOption, QWidget* parent)
+    : QDialog(parent)
+{
+    setWindowTitle(title);
+    auto* root = new QVBoxLayout(this);
+    auto* row = new QHBoxLayout;
+    row->addWidget(new QLabel(label, this));
+    m_amount = new QSpinBox(this);
+    m_amount->setRange(1, 500);
+    m_amount->setValue(initial);
+    m_amount->setButtonSymbols(QAbstractSpinBox::NoButtons);
+    m_amount->setFixedWidth(64);
+    row->addWidget(m_amount);
+    row->addWidget(new QLabel(QStringLiteral("pixels"), this));
+    row->addStretch();
+    root->addLayout(row);
+    if (boundsOption) {
+        m_bounds = new QCheckBox(QStringLiteral("Apply effect at canvas bounds"), this);
+        root->addWidget(m_bounds);
+    }
+    auto* box = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+    connect(box, &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(box, &QDialogButtonBox::rejected, this, &QDialog::reject);
+    root->addWidget(box);
+    m_amount->selectAll();
+}
+
+int ModifySelectionDialog::amount() const { return m_amount->value(); }
+
+bool ModifySelectionDialog::atCanvasBounds() const { return m_bounds && m_bounds->isChecked(); }
+
+// ---------------- NewGuideDialog ----------------
+
+NewGuideDialog::NewGuideDialog(QWidget* parent)
+    : QDialog(parent)
+{
+    setWindowTitle(QStringLiteral("New Guide"));
+    auto* root = new QVBoxLayout(this);
+    auto* group = new QGroupBox(QStringLiteral("Orientation"), this);
+    auto* gl = new QVBoxLayout(group);
+    m_horizontal = new QRadioButton(QStringLiteral("Horizontal"), group);
+    auto* vertical = new QRadioButton(QStringLiteral("Vertical"), group);
+    m_horizontal->setChecked(true);
+    gl->addWidget(m_horizontal);
+    gl->addWidget(vertical);
+    root->addWidget(group);
+    auto* row = new QHBoxLayout;
+    row->addWidget(new QLabel(QStringLiteral("Position:"), this));
+    m_position = new QDoubleSpinBox(this);
+    m_position->setRange(-30000, 30000);
+    m_position->setDecimals(0);
+    m_position->setSuffix(QStringLiteral(" px"));
+    m_position->setButtonSymbols(QAbstractSpinBox::NoButtons);
+    row->addWidget(m_position, 1);
+    root->addLayout(row);
+    auto* box = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+    connect(box, &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(box, &QDialogButtonBox::rejected, this, &QDialog::reject);
+    root->addWidget(box);
+}
+
+Qt::Orientation NewGuideDialog::orientation() const
+{
+    return m_horizontal->isChecked() ? Qt::Horizontal : Qt::Vertical;
+}
+
+double NewGuideDialog::position() const { return m_position->value(); }

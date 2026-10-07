@@ -18,7 +18,7 @@ namespace DocumentIO {
 
 namespace {
 constexpr quint32 kMagic = 0x50534C50; // "PSLP"
-constexpr quint32 kVersion = 1;
+constexpr quint32 kVersion = 2; // 2 added guides
 } // namespace
 
 QString openFilter()
@@ -114,6 +114,17 @@ static Document* loadNative(const QString& path, QString* error)
         }
         s.layers.append(l);
     }
+    if (version >= 2) {
+        qint32 guideCount = 0;
+        in >> guideCount;
+        for (int i = 0; i < guideCount && in.status() == QDataStream::Ok; ++i) {
+            bool vertical = false;
+            Guide g;
+            in >> vertical >> g.position;
+            g.orientation = vertical ? Qt::Vertical : Qt::Horizontal;
+            s.guides.append(g);
+        }
+    }
     if (in.status() != QDataStream::Ok) {
         if (error) *error = QStringLiteral("The document is damaged.");
         return nullptr;
@@ -164,6 +175,8 @@ bool saveNative(Document* doc, const QString& path, QString* error)
             << l.lockTransparency << l.lockPixels << l.lockPosition << l.lockAll << l.isBackground
             << png;
     }
+    out << qint32(doc->guides().size());
+    for (const Guide& g : doc->guides()) out << (g.orientation == Qt::Vertical) << g.position;
     if (!f.commit()) {
         if (error) *error = f.errorString();
         return false;

@@ -7,11 +7,14 @@
 #include <QPointer>
 #include <functional>
 
+#include "ui/ViewOptions.h"
+
 class CanvasView;
 class ChannelsPanel;
 class ColorState;
 class Document;
 class DocumentPage;
+class FreeTransformTool;
 class HistoryPanel;
 class HomeScreen;
 class InfoPanel;
@@ -28,6 +31,7 @@ class QToolButton;
 class QUndoGroup;
 class SwatchesPanel;
 class Tool;
+class ToolBox;
 class ToolManager;
 
 class MainWindow : public QMainWindow {
@@ -91,6 +95,13 @@ private:
     void imageSizeDialog();
     void canvasSizeDialog();
     void featherDialog();
+    void modifySelectionDialog(int how);
+    void toggleQuickMask();
+    void startTransform(bool selectionOnly, int mode);
+    void quickTransform(const std::function<void()>& apply);
+    void newGuideDialog();
+    QAction* viewToggle(const QString& id, const QString& text, const QList<QKeySequence>& keys, bool ViewOptions::*field);
+    void syncViewActions();
     void applyPixelFilter(const QString& name, const std::function<QRgb(QRgb)>& fn);
     void showShortcuts();
     void showAbout();
@@ -103,6 +114,10 @@ private:
     ColorState* m_colors;
     ToolManager* m_tools;
     QUndoGroup* m_undoGroup;
+    ViewOptions* m_viewOptions;
+    FreeTransformTool* m_transform = nullptr;
+    ToolBox* m_toolBox = nullptr;
+    QHash<QString, bool ViewOptions::*> m_viewToggles;
 
     QStackedWidget* m_central = nullptr;
     HomeScreen* m_home = nullptr;

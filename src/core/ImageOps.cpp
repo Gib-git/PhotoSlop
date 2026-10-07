@@ -89,15 +89,45 @@ void clearPixels(Layer& layer, const QRect& canvasRect, const QImage& selection)
     }
 }
 
+QImage maskedPixels(const Layer& layer, const QRect& rect, const QImage& selection)
+{
+    QImage out(rect.size(), QImage::Format_ARGB32_Premultiplied);
+    out.fill(Qt::transparent);
+    QRect r = layer.rect() & rect;
+    for (int y = r.top(); y <= r.bottom(); ++y) {
+        auto* dst = reinterpret_cast<uint32_t*>(out.scanLine(y - rect.top())) + (r.left() - rect.left());
+        auto* src = reinterpret_cast<const uint32_t*>(layer.image.constScanLine(y - layer.offset.y()))
+            + (r.left() - layer.offset.x());
+        const uchar* m = selection.isNull() ? nullptr : selection.constScanLine(y) + r.left();
+        for (int i = 0; i < r.width(); ++i) dst[i] = m ? Blend::byteMul(src[i], m[i]) : src[i];
+    }
+    return out;
+}
+
 QImage floodMask(const QImage& img, const QPoint& seed, int tolerance, bool contiguous,
-                 bool antialias)
+                 bool antialias, int sampleSize)
 {
     const int w = img.width(), h = img.height();
     QImage mask(img.size(), QImage::Format_Grayscale8);
     mask.fill(0);
     if (!img.rect().contains(seed)) return mask;
 
-    const QRgb ref = img.pixel(seed);
+    QRgb ref = img.pixel(seed);
+    if (sampleSize > 1) {
+        const int half = sampleSize / 2;
+        const QRect area = QRect(seed.x() - half, seed.y() - half, sampleSize, sampleSize) & img.rect();
+        int sum[4] = {0, 0, 0, 0};
+        for (int y = area.top(); y <= area.bottom(); ++y)
+            for (int x = area.left(); x <= area.right(); ++x) {
+                const QRgb p = reinterpret_cast<const QRgb*>(img.constScanLine(y))[x];
+                sum[0] += qRed(p);
+                sum[1] += qGreen(p);
+                sum[2] += qBlue(p);
+                sum[3] += qAlpha(p);
+            }
+        const int n = area.width() * area.height();
+        ref = qRgba((sum[0] + n / 2) / n, (sum[1] + n / 2) / n, (sum[2] + n / 2) / n, (sum[3] + n / 2) / n);
+    }
     auto within = [&](QRgb p) {
         return std::abs(qRed(p) - qRed(ref)) <= tolerance
             && std::abs(qGreen(p) - qGreen(ref)) <= tolerance

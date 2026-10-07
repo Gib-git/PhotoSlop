@@ -326,7 +326,7 @@ void BrushTool::adjustHardness(int dir)
 bool BrushTool::begin(CanvasView* v, const ToolEvent& e)
 {
     Document* doc = v->document();
-    Layer* l = doc->activeLayer();
+    Layer* l = doc->editLayer();
     if (!l) return false;
     const QString toolName = name().section(QLatin1Char(' '), 0, 0).toLower();
     if (!l->visible) {
@@ -342,7 +342,7 @@ bool BrushTool::begin(CanvasView* v, const ToolEvent& e)
     const bool paintsBackgroundColor = m_kind == Kind::Eraser && !m_erase;
     m_color = ImageOps::premultiplied(paintsBackgroundColor ? colors()->background() : colors()->foreground());
 
-    m_edit = std::make_unique<PixelEdit>(doc, doc->activeIndex(), (m_erase || m_preserveAlpha) ? QRect() : doc->bounds());
+    m_edit = std::make_unique<PixelEdit>(doc, doc->editIndex(), (m_erase || m_preserveAlpha) ? QRect() : doc->bounds());
     m_maskRect = m_edit->layerRect() & doc->bounds();
     if (m_maskRect.isEmpty()) {
         m_edit->cancel();

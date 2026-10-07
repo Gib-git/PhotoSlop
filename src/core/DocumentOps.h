@@ -16,6 +16,7 @@ namespace Ops {
 
 enum class Arrange { BringToFront, BringForward, SendBackward, SendToBack };
 enum class Resample { NearestNeighbor, Bilinear, Bicubic };
+enum class Modify { Border, Smooth, Expand, Contract };
 enum class Rotation { Rotate180, Rotate90CW, Rotate90CCW, FlipHorizontal, FlipVertical };
 
 // Layers
@@ -44,6 +45,11 @@ void deselect(Document* doc);
 void reselect(Document* doc);
 void inverse(Document* doc);
 void loadSelectionFromLayer(Document* doc, int index, Sel::Op op = Sel::Op::Replace);
+bool modifySelection(Document* doc, Modify how, int amount, bool atCanvasBounds = false);
+// Select > Grow (contiguous) and Select > Similar, using the Magic Wand tolerance.
+bool growSelection(Document* doc, int tolerance, bool contiguous);
+// Edit in Quick Mask Mode: the selection becomes a paintable mask, and back.
+void setQuickMask(Document* doc, bool on);
 
 // Pixels
 bool fill(Document* doc, const QColor& color, BlendMode mode, float opacity,

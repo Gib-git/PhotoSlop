@@ -4,11 +4,28 @@
 #include "core/DocumentOps.h"
 #include "core/ImageOps.h"
 #include "core/Selection.h"
+#include "core/Transform.h"
 #include "io/DocumentIO.h"
 
 #include <QTemporaryDir>
 #include <QUndoStack>
 #include <QtTest>
+
+static QImage rectMask(QSize size, QRect r)
+{
+    QPainterPath path;
+    path.addRect(r);
+    return Sel::pathMask(size, path, false);
+}
+
+// A test pattern with distinct pixels, so resampling errors show up.
+static QImage pattern(int w, int h)
+{
+    QImage img(w, h, QImage::Format_ARGB32_Premultiplied);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) img.setPixel(x, y, qRgb(x * 37 % 256, y * 53 % 256, (x * y) % 256));
+    return img;
+}
 
 static Document* makeDoc(QSize size = QSize(64, 48))
 {
@@ -199,6 +216,192 @@ private slots:
         QCOMPARE(Sel::bounds(m), QRect(0, 0, 5, 10));
         QImage all = ImageOps::floodMask(img, QPoint(1, 1), 0, false, false);
         QCOMPARE(all.constScanLine(0)[7], uchar(255));
+    }
+
+    // ---------------- Stage 2 ----------------
+
+    void selectionExpandContract()
+    {
+        const QSize s(40, 40);
+        const QImage m = rectMask(s, QRect(10, 10, 10, 10));
+        QCOMPARE(Sel::bounds(Sel::expanded(m, 3)), QRect(7, 7, 16, 16));
+        // Straight edges grow by exactly the radius; corners round off.
+        QCOMPARE(Sel::expanded(m, 3).constScanLine(15)[7], uchar(255));
+        QVERIFY(Sel::expanded(m, 3).constScanLine(7)[7] < 128);
+        QCOMPARE(Sel::bounds(Sel::contracted(m, 2, false)), QRect(12, 12, 6, 6));
+        QVERIFY(Sel::contracted(m, 5, false).isNull());
+    }
+
+    void contractAtCanvasBounds()
+    {
+        const QImage all = Sel::full(QSize(20, 20));
+        // Without the option, the canvas edge does not eat into the selection.
+        QCOMPARE(Sel::bounds(Sel::contracted(all, 3, false)), QRect(0, 0, 20, 20));
+        QCOMPARE(Sel::bounds(Sel::contracted(all, 3, true)), QRect(3, 3, 14, 14));
+    }
+
+    void selectionBorderAndSmooth()
+    {
+        const QSize s(40, 40);
+        const QImage m = rectMask(s, QRect(10, 10, 20, 20));
+        const QImage b = Sel::border(m, 4);
+        QCOMPARE(b.constScanLine(20)[20], uchar(0)); // centre is no longer selected
+        QCOMPARE(b.constScanLine(20)[10], uchar(255)); // the edge is
+        QCOMPARE(b.constScanLine(20)[8], uchar(255));
+        QCOMPARE(b.constScanLine(20)[5], uchar(0));
+        // A one-pixel spike disappears when smoothed.
+        QImage spiky = m.copy();
+        spiky.scanLine(5)[20] = 255;
+        const QImage sm = Sel::smoothed(spiky, 2, false);
+        QCOMPARE(sm.constScanLine(5)[20], uchar(0));
+        QCOMPARE(sm.constScanLine(20)[20], uchar(255));
+    }
+
+    void growAndSimilar()
+    {
+        QImage img(30, 10, QImage::Format_ARGB32_Premultiplied);
+        img.fill(Qt::white);
+        for (int y = 0; y < 10; ++y) {
+            img.setPixel(10, y, qRgb(0, 0, 0)); // a wall
+            img.setPixel(5, y, qRgb(250, 250, 250));
+        }
+        const QImage seed = rectMask(img.size(), QRect(0, 0, 2, 2));
+        const QImage grown = Sel::grown(seed, img, 32, true);
+        QCOMPARE(Sel::bounds(grown), QRect(0, 0, 10, 10));
+        const QImage similar = Sel::grown(seed, img, 32, false);
+        QCOMPARE(similar.constScanLine(5)[20], uchar(255));
+        QCOMPARE(similar.constScanLine(5)[10], uchar(0));
+    }
+
+    void modifySelectionUndo()
+    {
+        std::unique_ptr<Document> doc(makeDoc());
+        doc->changeSelection(rectMask(doc->size(), QRect(10, 10, 10, 10)), "Rectangular Marquee");
+        QVERIFY(Ops::modifySelection(doc.get(), Ops::Modify::Expand, 2));
+        QCOMPARE(doc->selectionBounds(), QRect(8, 8, 14, 14));
+        QCOMPARE(doc->undoStack()->text(doc->undoStack()->index() - 1), QStringLiteral("Expand"));
+        doc->undoStack()->undo();
+        QCOMPARE(doc->selectionBounds(), QRect(10, 10, 10, 10));
+    }
+
+    void wandSampleSizeAveragesSeed()
+    {
+        QImage img(10, 10, QImage::Format_ARGB32_Premultiplied);
+        img.fill(qRgb(100, 100, 100));
+        img.setPixel(5, 5, qRgb(255, 255, 255)); // a speck under the cursor
+        // Point sample picks the speck; a 3x3 average sees the grey around it.
+        QCOMPARE(Sel::bounds(ImageOps::floodMask(img, QPoint(5, 5), 10, true, false, 1)), QRect(5, 5, 1, 1));
+        QCOMPARE(Sel::bounds(ImageOps::floodMask(img, QPoint(5, 5), 30, true, false, 3)).width(), 10);
+    }
+
+    void transformIdentityAndTranslationAreLossless()
+    {
+        const QImage src = pattern(16, 12);
+        for (auto interp : {Xform::Interp::NearestNeighbor, Xform::Interp::Bilinear, Xform::Interp::Bicubic}) {
+            QRect r;
+            const QImage out = Xform::transformed(src, QTransform::fromTranslate(5, 3), interp, QRect(0, 0, 100, 100), &r);
+            QCOMPARE(r, QRect(5, 3, 16, 12));
+            QCOMPARE(out, src);
+        }
+    }
+
+    void transformRotate90IsExact()
+    {
+        const QImage src = pattern(8, 5);
+        QTransform t;
+        QVERIFY(Xform::quadTransform(QRectF(0, 0, 8, 5), QPolygonF{{5, 0}, {5, 8}, {0, 8}, {0, 0}}, &t));
+        QRect r;
+        const QImage out = Xform::transformed(src, t, Xform::Interp::Bicubic, QRect(0, 0, 100, 100), &r);
+        QCOMPARE(r, QRect(0, 0, 5, 8));
+        QCOMPARE(out.pixel(4, 0), src.pixel(0, 0));
+        QCOMPARE(out.pixel(0, 7), src.pixel(7, 4));
+        QCOMPARE(out, src.transformed(QTransform().rotate(90)).convertToFormat(QImage::Format_ARGB32_Premultiplied));
+    }
+
+    void transformScaleAndPerspective()
+    {
+        QImage src(10, 10, QImage::Format_ARGB32_Premultiplied);
+        src.fill(Qt::red);
+        QRect r;
+        const QImage up = Xform::transformed(src, QTransform::fromScale(2, 2), Xform::Interp::NearestNeighbor, QRect(0, 0, 100, 100), &r);
+        QCOMPARE(r, QRect(0, 0, 20, 20));
+        QCOMPARE(QColor(up.pixel(10, 10)), QColor(Qt::red));
+        // A strong shrink takes the pre-filtered path and keeps colour and coverage.
+        const QImage down = Xform::transformed(pattern(64, 64), QTransform::fromScale(0.25, 0.25), Xform::Interp::Bilinear, QRect(0, 0, 100, 100), &r);
+        QCOMPARE(r, QRect(0, 0, 16, 16));
+        QCOMPARE(qAlpha(down.pixel(8, 8)), 255);
+        QTransform p;
+        QVERIFY(Xform::quadTransform(QRectF(0, 0, 10, 10), QPolygonF{{2, 0}, {8, 0}, {10, 10}, {0, 10}}, &p));
+        const QImage persp = Xform::transformed(src, p, Xform::Interp::Bilinear, QRect(0, 0, 100, 100), &r);
+        QCOMPARE(qAlpha(persp.pixel(5 - r.left(), 5 - r.top())), 255);
+        QCOMPARE(qAlpha(persp.pixel(0 - r.left(), 0 - r.top())), 0);
+        QVERIFY(Xform::isConvex(QPolygonF{{2, 0}, {8, 0}, {10, 10}, {0, 10}}));
+        QVERIFY(!Xform::isConvex(QPolygonF{{0, 0}, {10, 10}, {10, 0}, {0, 10}}));
+    }
+
+    void warpIdentityMatchesSource()
+    {
+        const QImage src = pattern(24, 16);
+        const auto patch = Xform::Patch::fromTransform(QRectF(0, 0, 24, 16), QTransform());
+        QCOMPARE(patch.eval(0.5, 0.5), QPointF(12, 8));
+        QRect r;
+        const QImage out = Xform::warped(src, patch, Xform::Interp::Bilinear, QRect(0, 0, 100, 100), &r);
+        QVERIFY(r.contains(QRect(0, 0, 24, 16)));
+        int maxDiff = 0;
+        for (int y = 0; y < 16; ++y)
+            for (int x = 0; x < 24; ++x) {
+                const QRgb a = src.pixel(x, y), b = out.pixel(x - r.left(), y - r.top());
+                maxDiff = std::max({maxDiff, std::abs(qRed(a) - qRed(b)), std::abs(qGreen(a) - qGreen(b)), std::abs(qAlpha(a) - qAlpha(b))});
+            }
+        QVERIFY2(maxDiff <= 1, qPrintable(QString::number(maxDiff)));
+    }
+
+    void quickMaskRoundTrip()
+    {
+        std::unique_ptr<Document> doc(makeDoc());
+        doc->changeSelection(rectMask(doc->size(), QRect(10, 10, 20, 20)), "Rectangular Marquee");
+        Ops::setQuickMask(doc.get(), true);
+        QVERIFY(doc->inQuickMask());
+        QVERIFY(!doc->hasSelection());
+        QCOMPARE(doc->editIndex(), Document::kQuickMaskIndex);
+        // Masked areas are tinted red; selected ones are not.
+        QVERIFY(qAlpha(doc->quickMaskOverlay().pixel(2, 2)) > 100);
+        QCOMPARE(qAlpha(doc->quickMaskOverlay().pixel(15, 15)), 0);
+        // Painting white on the mask adds to the selection; the layers are untouched.
+        QVERIFY(Ops::fill(doc.get(), Qt::white, BlendMode::Normal, 1.f, false));
+        QCOMPARE(QColor(doc->composite().pixel(2, 2)), QColor(Qt::white));
+        doc->undoStack()->undo();
+        doc->changeSelection(rectMask(doc->size(), QRect(40, 0, 10, 10)), "Rectangular Marquee");
+        QVERIFY(Ops::fill(doc.get(), Qt::white, BlendMode::Normal, 1.f, false));
+        doc->changeSelection(QImage(), "Deselect");
+        Ops::setQuickMask(doc.get(), false);
+        QVERIFY(!doc->inQuickMask());
+        QCOMPARE(doc->selection().constScanLine(15)[15], uchar(255));
+        QCOMPARE(doc->selection().constScanLine(5)[45], uchar(255));
+        QCOMPARE(doc->selection().constScanLine(2)[2], uchar(0));
+        // Undo walks back into Quick Mask mode with the painted mask.
+        doc->undoStack()->undo();
+        QVERIFY(doc->inQuickMask());
+        doc->undoStack()->undo();
+        doc->undoStack()->undo();
+        QCOMPARE(qGray(doc->quickMaskLayer().pixelAt(QPoint(45, 5))), 0);
+    }
+
+    void guidesUndoAndSave()
+    {
+        QTemporaryDir dir;
+        std::unique_ptr<Document> doc(makeDoc());
+        doc->changeGuides({Guide{Qt::Vertical, 12}, Guide{Qt::Horizontal, 30}}, "New Guide");
+        QCOMPARE(doc->guides().size(), 2);
+        doc->undoStack()->undo();
+        QVERIFY(doc->guides().isEmpty());
+        doc->undoStack()->redo();
+        const QString path = dir.filePath("g.pslop");
+        QString err;
+        QVERIFY2(DocumentIO::saveNative(doc.get(), path, &err), qPrintable(err));
+        std::unique_ptr<Document> loaded(DocumentIO::load(path, &err));
+        QVERIFY2(loaded, qPrintable(err));
+        QCOMPARE(loaded->guides(), doc->guides());
     }
 };
 

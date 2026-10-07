@@ -7,6 +7,7 @@
 class Document;
 class Tool;
 class ToolManager;
+class ViewOptions;
 struct ToolEvent;
 
 // Displays a document and routes pointer input to the current tool.
@@ -15,7 +16,7 @@ struct ToolEvent;
 class CanvasView : public QAbstractScrollArea {
     Q_OBJECT
 public:
-    CanvasView(Document* doc, ToolManager* tools, QWidget* parent = nullptr);
+    CanvasView(Document* doc, ToolManager* tools, ViewOptions* options, QWidget* parent = nullptr);
 
     Document* document() const { return m_doc; }
     double zoom() const { return m_zoom; }
@@ -37,9 +38,26 @@ public:
 
     void updateCursor();
     QPointF lastCanvasPos() const { return m_lastCanvasPos; }
-    bool showPixelGrid() const { return m_pixelGrid; }
-    void setShowPixelGrid(bool on);
-    void setShowSelectionEdges(bool on);
+    ViewOptions* options() const { return m_opts; }
+    // Hides the marching ants while a tool shows its own outline (Transform Selection).
+    void setSelectionEdgesSuppressed(bool on);
+
+    // ---- Snapping (View > Snap / Snap To) ----
+    // Snaps each coordinate independently to the nearest guide, grid line or document edge.
+    QPointF snapPoint(const QPointF& canvasPt) const;
+    // Offset that snaps the closest edge (or centre) of `canvasRect` on each axis.
+    QPointF snapRectOffset(const QRectF& canvasRect) const;
+
+    // ---- Guides ----
+    // Index of the guide under a viewport position, or -1.
+    int guideAt(const QPointF& viewPos) const;
+    bool canDragGuides() const;
+    // Drags a new guide (index -1, e.g. out of a ruler) or an existing one. Releasing
+    // outside the viewport deletes it.
+    void beginGuideDrag(Qt::Orientation orientation, int index, bool fromRuler);
+    void updateGuideDrag(const QPointF& viewPos, Qt::KeyboardModifiers mods);
+    void endGuideDrag(const QPointF& viewPos);
+    bool isDraggingGuide() const { return m_guideDrag.active; }
 
 signals:
     void zoomChanged(double zoom);
@@ -74,9 +92,23 @@ private:
     void onImageChanged(const QRect& r);
     void updateCursorArea(const QPointF& oldPos, const QPointF& newPos);
     QRectF selectionViewRect() const;
+    double gridStep() const; // canvas pixels between grid subdivisions
+    double snapValue(double v, bool xAxis, bool includeGuides, double* distance) const;
+    void paintGridAndGuides(QPainter& p, const QRectF& canvasView);
+
+    struct GuideDrag {
+        bool active = false;
+        bool fromRuler = false;
+        bool visible = false;
+        int index = -1;
+        Qt::Orientation orientation = Qt::Horizontal;
+        Qt::Orientation startOrientation = Qt::Horizontal;
+        double position = 0.0;
+    };
 
     Document* m_doc;
     ToolManager* m_tools;
+    ViewOptions* m_opts;
     double m_zoom = 1.0;
     bool m_userZoomed = false;
     QPointer<Tool> m_pressTool;
@@ -85,8 +117,10 @@ private:
     QPointF m_lastCanvasPos;
     QPointF m_lastViewPos;
     bool m_cursorInside = false;
-    bool m_pixelGrid = true;
-    bool m_showEdges = true;
+    bool m_suppressEdges = false;
+    GuideDrag m_guideDrag;
+    bool m_guideMouse = false;
+    bool m_hoverGuide = false;
     int m_antsPhase = 0;
     QTimer m_antsTimer;
 };

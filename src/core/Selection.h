@@ -26,6 +26,16 @@ bool isEmpty(const QImage& mask);
 // Boundary of the >=50% region, as axis-aligned segments in canvas coordinates.
 QVector<QLine> edges(const QImage& mask);
 QImage fromLayerAlpha(const Layer& layer, const QSize& canvasSize);
+// Select > Modify. Radii are in pixels; results are null when nothing stays selected.
+// With `atCanvasBounds`, the canvas edge counts as unselected (Photoshop's
+// "Apply effect at canvas bounds").
+QImage expanded(const QImage& mask, int radius);
+QImage contracted(const QImage& mask, int radius, bool atCanvasBounds);
+QImage border(const QImage& mask, int width);
+QImage smoothed(const QImage& mask, int radius, bool atCanvasBounds);
+// Select > Grow (contiguous) and Select > Similar: adds pixels of `image` (canvas-sized,
+// premultiplied) whose colour lies within the selected colour range widened by `tolerance`.
+QImage grown(const QImage& mask, const QImage& image, int tolerance, bool contiguous);
 // Resize/crop helpers used by canvas operations.
 QImage remapped(const QImage& mask, const QSize& newSize, const QPoint& offset);
 

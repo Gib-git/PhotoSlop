@@ -10,7 +10,7 @@ PhotoSlop is a cross-platform raster image editor for macOS, Linux and Windows. 
 
 It is written in C++20 with Qt 6 (Widgets). PhotoSlop is not affiliated with Adobe. All icons and artwork are original.
 
-## Status: Stage 1 (core editor)
+## Status: Stage 2 (selections and transforms)
 
 | Area | What works |
 |---|---|
@@ -18,14 +18,21 @@ It is written in C++20 with Qt 6 (Widgets). PhotoSlop is not affiliated with Ado
 | Documents | New (preset browser), Open, Open Recent, Save, Save As, Save a Copy, Revert, Export As, Quick Export as PNG, Close / Close All / Close Others, multiple documents, drag-and-drop to open |
 | File formats | Native layered `.pslop`; PNG, JPEG, BMP, GIF, TIFF and WebP for import and flattened export |
 | Layers | New, duplicate, delete, rename, drag to reorder, visibility (Alt-click to solo), opacity, fill, 27 blend modes, four lock types, Background layer rules, Layer via Copy/Cut, Merge Down, Merge Visible, Flatten, Ctrl/Cmd-click a thumbnail to load its transparency as a selection |
-| Tools | Move, Rectangular and Elliptical Marquee, Lasso and Polygonal Lasso, Crop, Eyedropper, Brush, Pencil, Eraser, Gradient (5 types), Paint Bucket, Hand, Zoom |
+| Tools | Move, Rectangular and Elliptical Marquee, Lasso, Polygonal Lasso and Magnetic Lasso, Quick Selection, Magic Wand, Crop, Eyedropper, Brush, Pencil, Eraser, Gradient (5 types), Paint Bucket, Hand, Zoom |
 | Painting | Size, hardness, opacity, flow, blend mode, pen pressure for size and opacity, Shift-click straight lines, brush preset picker. Opacity caps each stroke the same way it does in Photoshop |
-| Selections | Feathered 8-bit masks; add, subtract and intersect (Shift / Alt / Shift+Alt); marching ants; All, Deselect, Reselect, Inverse, Feather; drag inside a selection to move its outline; arrow keys to nudge |
+| Selections | Feathered 8-bit masks; add, subtract and intersect (Shift / Alt / Shift+Alt); marching ants; All, Deselect, Reselect, Inverse; Modify ▸ Border, Smooth, Expand, Contract, Feather; Grow and Similar (using the Magic Wand tolerance); Transform Selection; drag inside a selection to move its outline; arrow keys to nudge |
+| Selection tools | Magic Wand (tolerance, sample size, contiguous, sample all layers); Quick Selection (paint to grow the selection into similar, edge-bounded areas; switches to Add after the first stroke); Magnetic Lasso (follows the strongest edge within Width; Contrast and Frequency options; Backspace removes the last anchor, double-click or Enter closes) |
+| Quick Mask | Q toggles it. The selection becomes a red-tinted mask that every painting tool, Fill, Clear and Invert can edit; leaving Quick Mask turns it back into a selection. Entering and leaving are history states |
+| Transform | Free Transform and Edit ▸ Transform (Scale, Rotate, Skew, Distort, Perspective, Warp, Rotate 180°/90°, Flip, Again). Corner handles scale proportionally (Shift for free scaling, Alt from the reference point), drag outside to rotate (Shift for 15° steps), Ctrl/Cmd-drag a corner to distort or an edge to skew, Ctrl+Alt+Shift-drag a corner for perspective. The options bar takes exact X/Y, W/H, angle and skew values and the interpolation. Warp bends the layer with a 4 × 4 control grid: drag the points or the surface. Enter commits, Esc or Undo cancels |
+| Rulers, guides, grid | Rulers (pixels, inches, cm, mm or percent; right-click to change). Drag a guide out of a ruler (Alt flips its direction), move guides with the Move tool and drag them off the window to delete; New Guide, Clear Guides, Lock Guides; guides are saved in `.pslop` files and undoable. Grid every inch with four subdivisions. Extras (Ctrl+H) hides them all |
+| Snapping | Snap (Ctrl+Shift+;) to guides, the grid and document bounds while drawing marquees, cropping, moving layers and selections, and transforming |
 | Edit | History panel (50 states), Undo/Redo, Toggle Last State, Cut/Copy/Copy Merged/Paste/Paste in Place, Fill dialog, Clear |
 | Image | Image Size, Canvas Size (with anchor), rotate 90°/180°, flip canvas, Crop to selection, Duplicate, Invert, Desaturate |
 | Colour | Foreground/background colours, Photoshop-style Color Picker (HSB / RGB / CMYK / hex), Color panel, Swatches panel |
 
 Menu items for later stages are already in the menus, greyed out, with their Photoshop shortcuts shown.
+
+What differs from Photoshop in this stage: Quick Selection uses colour similarity and edge strength rather than a trained model; Warp offers the custom grid only (no Arc, Bulge and other presets); Transform ▸ Again repeats the last transform's matrix rather than its parameters; Snap To ▸ Layers and Slices are not implemented yet.
 
 ## Keyboard shortcuts
 
@@ -43,9 +50,14 @@ The shortcuts match Photoshop on every platform. Wherever Windows and Linux use 
 | Merge Down / Merge Visible | Ctrl+E / Ctrl+Shift+E | ⌘E / ⇧⌘E |
 | Bring Forward / Send Backward | Ctrl+] / Ctrl+[ | ⌘] / ⌘[ |
 | Image Size / Canvas Size | Ctrl+Alt+I / Ctrl+Alt+C | ⌥⌘I / ⌥⌘C |
+| Free Transform / Transform Again | Ctrl+T / Ctrl+Shift+T | ⌘T / ⇧⌘T |
+| Quick Mask | Q | Q |
+| Feather | Shift+F6 | ⇧F6 |
+| Rulers / Grid / Guides | Ctrl+R / Ctrl+' / Ctrl+; | ⌘R / ⌘' / ⌘; |
+| Snap / Lock Guides / Extras | Ctrl+Shift+; / Ctrl+Alt+; / Ctrl+H | ⇧⌘; / ⌥⌘; / ⌘H |
 | Invert / Desaturate | Ctrl+I / Ctrl+Shift+U | ⌘I / ⇧⌘U |
 | Zoom In / Out / Fit / 100% | Ctrl+= / Ctrl+- / Ctrl+0 / Ctrl+1 | ⌘= / ⌘- / ⌘0 / ⌘1 |
-| Tools | V M L C I B E G H Z (Shift+letter cycles a tool group) | same |
+| Tools | V M L W C I B E G H Z (Shift+letter cycles a tool group) | same |
 | Default colours / Swap colours | D / X | same |
 | Brush size / hardness | [ ] / Shift+[ Shift+] | same |
 | Tool or layer opacity | 1…9, 0 = 100%, type two digits fast for e.g. 45% | same |
@@ -84,23 +96,23 @@ build\PhotoSlop.exe
 ```sh
 ctest --test-dir build --output-on-failure
 ```
-`test_core` covers blend maths, undo/redo, selections, merging, crop/rotate and file round-trips. `test_ui` drives the real main window with simulated mouse input to check every tool. On a headless machine, run it with `QT_QPA_PLATFORM=offscreen`.
+`test_core` covers blend maths, undo/redo, selections and Select ▸ Modify, transform and warp resampling, Quick Mask, guides, merging, crop/rotate and file round-trips. `test_ui` drives the real main window with simulated mouse input to check every tool, Free Transform, Quick Mask, rulers, guides and snapping. On a headless machine, run it with `QT_QPA_PLATFORM=offscreen`.
 
 ## Project layout
 
 ```
-src/core/     Document model: layers, blend modes, compositing, selections, undo commands, document operations
+src/core/     Document model: layers, blend modes, compositing, selections, transforms and warps, undo commands, document operations
 src/io/       File loading and saving (.pslop and flat image formats)
 src/tools/    One class per tool, plus the ToolManager (groups, shortcuts, temporary tools)
-src/ui/       Main window, canvas view, toolbox, panels and dialogs
+src/ui/       Main window, canvas view, rulers, view options, toolbox, panels and dialogs
 resources/    Original SVG icons and the logo
 tests/        Core unit tests and GUI tests
 ```
 
 ## Roadmap
 
-1. **Core editor**: done (this release).
-2. **Selections and transforms**: Magic Wand, Quick Selection, Quick Mask, Free Transform, Select ▸ Modify, rulers, guides, grid, snapping.
+1. **Core editor**: done.
+2. **Selections and transforms**: done (this release).
 3. **Adjustments and filters**: Levels, Curves, Hue/Saturation, Color Balance, Gaussian Blur, Unsharp Mask, Add Noise and more, with live preview.
 4. **Layer power features**: masks, clipping masks, groups, adjustment layers, layer styles, Type tool, Shape tools, Clone Stamp, Healing, Dodge/Burn.
 5. **Pro and platform**: PSD import/export, 16/32-bit and CMYK/Lab modes, GPU canvas, an editable shortcut editor, Preferences, and installers for every platform.

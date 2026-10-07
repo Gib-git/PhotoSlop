@@ -86,9 +86,13 @@ bool MoveTool::begin(Document* doc)
         m_cleared = l->image;
         m_prevRect = QRect();
         m_selOrig = sel;
+        m_snapRect = r;
         moveTo(doc, QPoint());
     } else {
         m_origOffset = l->offset;
+        Layer content = *l;
+        content.trimToContent();
+        m_snapRect = content.rect();
     }
     m_active = true;
     return true;
@@ -165,6 +169,7 @@ void MoveTool::mouseMove(CanvasView* v, const ToolEvent& e)
         if (std::fabs(d.x()) > std::fabs(d.y())) d.setY(0);
         else d.setX(0);
     }
+    if (!m_snapRect.isEmpty()) d += v->snapRectOffset(QRectF(m_snapRect).translated(d));
     QPoint delta(int(std::round(d.x())), int(std::round(d.y())));
     if (delta != m_delta) moveTo(v->document(), delta);
 }
@@ -321,9 +326,9 @@ void CropTool::mousePress(CanvasView* v, const ToolEvent& e)
     m_drag = hitTest(v, e.viewPos);
     // Dragging inside the untouched default box draws a new crop area, as in Photoshop.
     if (m_drag == Inside && m_rect == QRectF(v->document()->bounds())) m_drag = Outside;
-    m_pressPos = e.pos;
+    m_pressPos = v->snapPoint(e.pos);
     m_pressRect = m_rect;
-    if (m_drag == Outside) m_rect = QRectF(e.pos, QSizeF(0, 0));
+    if (m_drag == Outside) m_rect = QRectF(m_pressPos, QSizeF(0, 0));
 }
 
 void CropTool::mouseMove(CanvasView* v, const ToolEvent& e)
@@ -340,8 +345,9 @@ void CropTool::mouseMove(CanvasView* v, const ToolEvent& e)
         }
         return;
     }
-    const QPointF p(std::round(e.pos.x()), std::round(e.pos.y()));
-    const QPointF d = e.pos - m_pressPos;
+    const QPointF p = v->snapPoint(QPointF(std::round(e.pos.x()), std::round(e.pos.y())));
+    QPointF d = e.pos - m_pressPos;
+    if (m_drag == Inside) d += v->snapRectOffset(m_pressRect.translated(d));
     double fixed = ratio();
     if (!fixed && e.shift() && m_pressRect.height() > 0) fixed = m_pressRect.width() / m_pressRect.height();
     QRectF r = m_pressRect;

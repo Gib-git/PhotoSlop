@@ -13,9 +13,11 @@ ToolManager::ToolManager(ColorState* colors, QObject* parent)
 
 void ToolManager::addTool(Tool* tool, int group)
 {
-    while (m_groups.size() <= group) m_groups.append(Group{});
-    m_groups[group].tools.append(tool);
-    if (!m_groups[group].last) m_groups[group].last = tool;
+    if (group >= 0) {
+        while (m_groups.size() <= group) m_groups.append(Group{});
+        m_groups[group].tools.append(tool);
+        if (!m_groups[group].last) m_groups[group].last = tool;
+    }
     m_tools.append(tool);
     connect(tool, &Tool::overlayChanged, this, [this, tool] {
         if (m_view && tool == m_current) m_view->viewport()->update();
@@ -50,6 +52,7 @@ void ToolManager::select(const QString& id) { select(tool(id)); }
 void ToolManager::select(Tool* t)
 {
     if (!t || m_busy) return;
+    if (m_modal && t != m_modal) commitModal();
     m_beforeTemporary = nullptr;
     int g = groupOf(t);
     if (g >= 0 && m_groups[g].last != t) {
@@ -76,6 +79,30 @@ bool ToolManager::selectByShortcut(QChar key, bool cycle)
     return false;
 }
 
+void ToolManager::enterModal(Tool* tool)
+{
+    if (!tool || m_modal) return;
+    m_beforeModal = m_beforeTemporary ? m_beforeTemporary : m_current;
+    m_beforeTemporary = nullptr;
+    m_modal = tool;
+    activate(tool);
+}
+
+void ToolManager::exitModal()
+{
+    if (!m_modal) return;
+    Tool* back = m_beforeModal;
+    m_modal = m_beforeModal = nullptr;
+    m_beforeTemporary = nullptr;
+    activate(back);
+}
+
+void ToolManager::commitModal()
+{
+    if (m_modal) m_modal->commit(m_view);
+    exitModal(); // in case the tool had nothing to commit
+}
+
 void ToolManager::pushTemporary(const QString& id)
 {
     Tool* t = tool(id);
@@ -95,6 +122,7 @@ void ToolManager::popTemporary()
 void ToolManager::setActiveView(CanvasView* view)
 {
     if (view == m_view) return;
+    if (m_modal) commitModal();
     if (m_view && m_current) m_current->deactivated(m_view);
     m_view = view;
     if (m_view && m_current) m_current->activated(m_view);

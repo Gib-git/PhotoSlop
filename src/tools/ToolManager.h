@@ -22,6 +22,7 @@ public:
     explicit ToolManager(ColorState* colors, QObject* parent = nullptr);
 
     // Adds a tool; tools added with the same group index share a toolbox button.
+    // A negative group keeps the tool out of the toolbox (e.g. Free Transform).
     void addTool(Tool* tool, int group);
     const QList<Group>& groups() const { return m_groups; }
     int groupOf(Tool* tool) const;
@@ -33,6 +34,13 @@ public:
     void select(Tool* tool);
     // Letter shortcut: selects the group's last used tool, or cycles with `cycle`.
     bool selectByShortcut(QChar key, bool cycle);
+
+    // Modal tools (Free Transform) take over until they commit or cancel; selecting
+    // another tool or switching documents commits them first.
+    void enterModal(Tool* tool);
+    void exitModal();
+    void commitModal();
+    Tool* modalTool() const { return m_modal; }
 
     void pushTemporary(const QString& id);
     void popTemporary();
@@ -57,6 +65,8 @@ private:
     QList<Tool*> m_tools;
     Tool* m_current = nullptr;
     Tool* m_beforeTemporary = nullptr;
+    Tool* m_modal = nullptr;
+    Tool* m_beforeModal = nullptr;
     QPointer<CanvasView> m_view;
     bool m_busy = false;
 };

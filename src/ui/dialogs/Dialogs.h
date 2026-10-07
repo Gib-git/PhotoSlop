@@ -159,3 +159,30 @@ private:
     QLabel* m_preview;
     QLabel* m_sizeLabel;
 };
+
+// Select > Modify > Border / Smooth / Expand / Contract.
+class ModifySelectionDialog : public QDialog {
+    Q_OBJECT
+public:
+    ModifySelectionDialog(const QString& title, const QString& label, int initial, bool boundsOption,
+                          QWidget* parent = nullptr);
+    int amount() const;
+    bool atCanvasBounds() const;
+
+private:
+    QSpinBox* m_amount;
+    QCheckBox* m_bounds = nullptr;
+};
+
+// View > New Guide.
+class NewGuideDialog : public QDialog {
+    Q_OBJECT
+public:
+    explicit NewGuideDialog(QWidget* parent = nullptr);
+    Qt::Orientation orientation() const;
+    double position() const;
+
+private:
+    class QRadioButton* m_horizontal;
+    QDoubleSpinBox* m_position;
+};

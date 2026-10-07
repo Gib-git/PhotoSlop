@@ -24,7 +24,7 @@ constexpr double kPi = 3.14159265358979323846;
 
 bool checkLayer(const Tool* tool, Document* doc, const QString& toolName)
 {
-    Layer* l = doc->activeLayer();
+    Layer* l = doc->editLayer();
     if (!l) return false;
     if (!l->visible) {
         tool->alert(QStringLiteral("Could not use the %1 because the target layer is hidden.").arg(toolName));
@@ -184,9 +184,9 @@ void GradientTool::mouseRelease(CanvasView* v, const ToolEvent& e)
     if (QLineF(m_start, m_end).length() < 1.0) return;
 
     Document* doc = v->document();
-    const Layer* l = doc->activeLayer();
+    const Layer* l = doc->editLayer();
     const bool preserve = l->lockTransparency && !l->isBackground;
-    PixelEdit edit(doc, doc->activeIndex(), preserve ? QRect() : doc->bounds());
+    PixelEdit edit(doc, doc->editIndex(), preserve ? QRect() : doc->bounds());
     const QRect region = doc->hasSelection() ? doc->selectionBounds() : doc->bounds();
     QImage grad = ImageOps::renderGradient(doc->size(), m_start, m_end, m_type, stops(), m_reverse,
                                            m_dither, m_transparency);
@@ -271,13 +271,13 @@ void PaintBucketTool::mousePress(CanvasView* v, const ToolEvent& e)
     const QPoint px = e.pixel();
     if (!doc->bounds().contains(px)) return;
     if (!checkLayer(this, doc, QStringLiteral("Paint Bucket"))) return;
-    const Layer* l = doc->activeLayer();
+    const Layer* l = doc->editLayer();
     QImage sample = m_allLayers ? doc->composite() : l->toCanvasImage(doc->size());
     QImage mask = ImageOps::floodMask(sample, px, m_tolerance, m_contiguous, m_antialias);
     QRect region = Sel::bounds(mask);
     if (region.isEmpty()) return;
     const bool preserve = l->lockTransparency && !l->isBackground;
-    PixelEdit edit(doc, doc->activeIndex(), preserve ? QRect() : region);
+    PixelEdit edit(doc, doc->editIndex(), preserve ? QRect() : region);
     ImageOps::fillColor(edit.layer(), region, ImageOps::premultiplied(colors()->foreground()), m_mode,
                         m_opacity / 100.f, doc->selection(), preserve, mask);
     edit.markDirty(region);
@@ -324,7 +324,7 @@ void EyedropperTool::sample(CanvasView* v, const ToolEvent& e)
     if (!doc->bounds().contains(c)) return;
     const int half = m_sampleSize / 2;
     const QRect area = QRect(c.x() - half, c.y() - half, m_sampleSize, m_sampleSize) & doc->bounds();
-    const Layer* layer = doc->activeLayer();
+    const Layer* layer = doc->editLayer();
     const QImage& comp = doc->composite();
     quint64 r = 0, g = 0, b = 0, a = 0;
     int n = 0;
