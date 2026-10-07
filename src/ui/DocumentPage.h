@@ -1,0 +1,33 @@
+#pragma once
+
+#include <QWidget>
+
+class CanvasView;
+class Document;
+class QLabel;
+class QLineEdit;
+class ToolManager;
+
+// One document tab: the canvas plus Photoshop's per-document status bar.
+class DocumentPage : public QWidget {
+    Q_OBJECT
+public:
+    DocumentPage(Document* doc, ToolManager* tools, QWidget* parent = nullptr);
+    ~DocumentPage() override;
+    Document* document() const { return m_doc; }
+    CanvasView* view() const { return m_view; }
+    // Title shown on the tab: "name @ 100% (Layer 1, RGB/8) *".
+    QString tabTitle() const;
+
+signals:
+    void titleChanged();
+
+private:
+    void updateStatus();
+    Document* m_doc;
+    CanvasView* m_view;
+    QLineEdit* m_zoom;
+    QLabel* m_info;
+};
+
+QString formatZoom(double zoom);

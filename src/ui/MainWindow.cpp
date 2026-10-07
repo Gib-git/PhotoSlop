@@ -1,0 +1,1675 @@
+#include "ui/MainWindow.h"
+
+#include "app/Theme.h"
+#include "core/ColorState.h"
+#include "core/Commands.h"
+#include "core/Document.h"
+#include "core/DocumentOps.h"
+#include "core/ImageOps.h"
+#include "io/DocumentIO.h"
+#include "tools/FillTools.h"
+#include "tools/NavigationTools.h"
+#include "tools/PaintTools.h"
+#include "tools/SelectionTools.h"
+#include "tools/ToolManager.h"
+#include "tools/TransformTools.h"
+#include "ui/CanvasView.h"
+#include "ui/DocumentPage.h"
+#include "ui/ToolBox.h"
+#include "ui/Workspace.h"
+#include "ui/dialogs/ColorPickerDialog.h"
+#include "ui/dialogs/Dialogs.h"
+#include "ui/panels/LayersPanel.h"
+#include "ui/panels/Panels.h"
+
+#include <QAbstractSpinBox>
+#include <QApplication>
+#include <QClipboard>
+#include <QCloseEvent>
+#include <QComboBox>
+#include <QDialogButtonBox>
+#include <QDockWidget>
+#include <QFileDialog>
+#include <QFileInfo>
+#include <QHeaderView>
+#include <QInputDialog>
+#include <QLabel>
+#include <QLineEdit>
+#include <QMenuBar>
+#include <QMessageBox>
+#include <QMimeData>
+#include <QPlainTextEdit>
+#include <QSettings>
+#include <QStackedWidget>
+#include <QStandardPaths>
+#include <QTabBar>
+#include <QTabWidget>
+#include <QTableWidget>
+#include <QTextEdit>
+#include <QToolBar>
+#include <QToolButton>
+#include <QUndoGroup>
+#include <QUndoStack>
+#include <QVBoxLayout>
+#include <cmath>
+#include <algorithm>
+#include <iterator>
+
+namespace {
+
+constexpr int kStateVersion = 4;
+
+QList<QKeySequence> keys(std::initializer_list<const char*> list)
+{
+    QList<QKeySequence> out;
+    for (const char* k : list) out << QKeySequence(QString::fromLatin1(k));
+    return out;
+}
+
+} // namespace
+
+MainWindow::MainWindow(QWidget* parent)
+    : QMainWindow(parent)
+    , m_colors(new ColorState(this))
+    , m_tools(new ToolManager(m_colors, this))
+    , m_undoGroup(new QUndoGroup(this))
+{
+    setWindowTitle(QStringLiteral("PhotoSlop — %1").arg(kSlogan));
+    setWindowIcon(Theme::icon(QStringLiteral("app")));
+    setAcceptDrops(true);
+    setDockNestingEnabled(true);
+    setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowTabbedDocks | QMainWindow::AllowNestedDocks
+                   | QMainWindow::GroupedDragging);
+    setTabPosition(Qt::AllDockWidgetAreas, QTabWidget::North);
+
+    createTools();
+
+    // Central area: Home screen until a document is opened, then document tabs.
+    m_central = new QStackedWidget(this);
+    m_home = new HomeScreen(m_central);
+    m_tabs = new QTabWidget(m_central);
+    m_tabs->setObjectName(QStringLiteral("DocumentTabs"));
+    m_tabs->setDocumentMode(true);
+    m_tabs->setTabsClosable(true);
+    m_tabs->setMovable(true);
+    m_tabs->tabBar()->setExpanding(false);
+    m_tabs->tabBar()->setElideMode(Qt::ElideMiddle);
+    m_central->addWidget(m_home);
+    m_central->addWidget(m_tabs);
+    setCentralWidget(m_central);
+    connect(m_home, &HomeScreen::newRequested, this, &MainWindow::newDocument);
+    connect(m_home, &HomeScreen::openRequested, this, &MainWindow::openDialog);
+    connect(m_home, &HomeScreen::recentRequested, this, [this](const QString& p) { openFiles({p}); });
+    connect(m_tabs, &QTabWidget::currentChanged, this, &MainWindow::onCurrentChanged);
+    connect(m_tabs, &QTabWidget::tabCloseRequested, this, &MainWindow::closeDocument);
+
+    createToolBars();
+    createDocks();
+    createMenus();
+    createHiddenShortcuts();
+
+    connect(m_tools, &ToolManager::alertRequested, this, &MainWindow::alert);
+    connect(QApplication::clipboard(), &QClipboard::dataChanged, this, [this] {
+        if (!m_settingClipboard) m_clipValid = false;
+    });
+    qApp->installEventFilter(this);
+
+    m_tools->select(QStringLiteral("move"));
+    resize(1440, 900);
+    m_defaultState = saveState(kStateVersion);
+    QSettings s;
+    restoreGeometry(s.value(QStringLiteral("geometry")).toByteArray());
+    restoreState(s.value(QStringLiteral("windowState")).toByteArray(), kStateVersion);
+    refreshRecent();
+    onCurrentChanged();
+}
+
+MainWindow::~MainWindow()
+{
+    qApp->removeEventFilter(this);
+}
+
+// ---------------- Setup ----------------
+
+void MainWindow::createTools()
+{
+    using K = BrushTool::Kind;
+    m_tools->addTool(new MoveTool(m_tools), 0);
+    m_tools->addTool(new MarqueeTool(m_tools, false), 1);
+    m_tools->addTool(new MarqueeTool(m_tools, true), 1);
+    m_tools->addTool(new LassoTool(m_tools, false), 2);
+    m_tools->addTool(new LassoTool(m_tools, true), 2);
+    m_tools->addTool(new CropTool(m_tools), 3);
+    m_tools->addTool(new EyedropperTool(m_tools), 4);
+    m_tools->addTool(new BrushTool(m_tools, K::Brush), 5);
+    m_tools->addTool(new BrushTool(m_tools, K::Pencil), 5);
+    m_tools->addTool(new BrushTool(m_tools, K::Eraser), 6);
+    m_tools->addTool(new GradientTool(m_tools), 7);
+    m_tools->addTool(new PaintBucketTool(m_tools), 7);
+    m_tools->addTool(new HandTool(m_tools), 8);
+    m_tools->addTool(new ZoomTool(m_tools), 9);
+}
+
+void MainWindow::createToolBars()
+{
+    // Options bar (top): tool preset button + per-tool options.
+    m_optionsBar = new QToolBar(QStringLiteral("Options"), this);
+    m_optionsBar->setObjectName(QStringLiteral("OptionsBar"));
+    m_optionsBar->setMovable(false);
+    m_optionsBar->setFloatable(false);
+    m_optionsBar->setIconSize(QSize(20, 20));
+    m_toolPreset = new QToolButton(m_optionsBar);
+    m_toolPreset->setFixedSize(40, 28);
+    m_toolPreset->setIconSize(QSize(20, 20));
+    m_toolPreset->setPopupMode(QToolButton::InstantPopup);
+    m_toolPreset->setToolTip(QStringLiteral("Tool Preset picker"));
+    m_optionsBar->addWidget(m_toolPreset);
+    m_optionsBar->addSeparator();
+    m_optionsStack = new QStackedWidget(m_optionsBar);
+    m_optionsStack->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    m_optionsBar->addWidget(m_optionsStack);
+    addToolBar(Qt::TopToolBarArea, m_optionsBar);
+
+    connect(m_tools, &ToolManager::currentChanged, this, [this](Tool* t) {
+        QWidget* w = m_optionWidgets.value(t);
+        if (!w) {
+            w = t->createOptions(m_optionsStack);
+            m_optionWidgets.insert(t, w);
+            m_optionsStack->addWidget(w);
+        }
+        m_optionsStack->setCurrentWidget(w);
+        m_toolPreset->setIcon(Theme::icon(t->iconName()));
+        if (CanvasView* v = currentView()) v->updateCursor();
+    });
+
+    // Toolbox (left).
+    m_toolsBar = new QToolBar(QStringLiteral("Tools"), this);
+    m_toolsBar->setObjectName(QStringLiteral("ToolsBar"));
+    m_toolsBar->setMovable(false);
+    m_toolsBar->setFloatable(false);
+    m_toolsBar->setOrientation(Qt::Vertical);
+    auto* box = new ToolBox(m_tools, m_colors, m_toolsBar);
+    connect(box, &ToolBox::screenModeRequested, this, &MainWindow::cycleScreenMode);
+    m_toolsBar->addWidget(box);
+    addToolBar(Qt::LeftToolBarArea, m_toolsBar);
+}
+
+QDockWidget* MainWindow::makeDock(const QString& title, const QString& objectName, QWidget* content)
+{
+    auto* dock = new QDockWidget(title, this);
+    dock->setObjectName(objectName);
+    dock->setWidget(content);
+    dock->setFeatures(QDockWidget::DockWidgetClosable | QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable);
+    // Photoshop panels show only their tabs; replace the title bar with a thin grip.
+    auto* grip = new QWidget(dock);
+    grip->setFixedHeight(4);
+    grip->setStyleSheet(QStringLiteral("background: #282828;"));
+    dock->setTitleBarWidget(grip);
+    m_docks.append(dock);
+    return dock;
+}
+
+void MainWindow::createDocks()
+{
+    auto lookup = [this](const QString& id) { return action(id); };
+
+    auto* color = makeDock(QStringLiteral("Color"), QStringLiteral("ColorDock"), new ColorPanel(m_colors));
+    m_swatchesPanel = new SwatchesPanel(m_colors);
+    auto* swatches = makeDock(QStringLiteral("Swatches"), QStringLiteral("SwatchesDock"), m_swatchesPanel);
+    m_propertiesPanel = new PropertiesPanel;
+    auto* props = makeDock(QStringLiteral("Properties"), QStringLiteral("PropertiesDock"), m_propertiesPanel);
+    auto* adjust = makeDock(QStringLiteral("Adjustments"), QStringLiteral("AdjustmentsDock"), new AdjustmentsPanel);
+    m_layersPanel = new LayersPanel;
+    m_layersPanel->setActionLookup(lookup);
+    auto* layers = makeDock(QStringLiteral("Layers"), QStringLiteral("LayersDock"), m_layersPanel);
+    m_channelsPanel = new ChannelsPanel;
+    auto* channels = makeDock(QStringLiteral("Channels"), QStringLiteral("ChannelsDock"), m_channelsPanel);
+    auto* paths = makeDock(QStringLiteral("Paths"), QStringLiteral("PathsDock"),
+                           new PlaceholderPanel(QStringLiteral("Paths will appear here once the Pen and Shape tools arrive.")));
+
+    // Collapsed icon column (History / Navigator / Info), left of the panels.
+    m_strip = new PanelStrip(this);
+    auto* stripDock = new QDockWidget(QStringLiteral("Panel Icons"), this);
+    stripDock->setObjectName(QStringLiteral("PanelStripDock"));
+    stripDock->setWidget(m_strip);
+    stripDock->setFeatures(QDockWidget::NoDockWidgetFeatures);
+    auto* grip = new QWidget(stripDock);
+    grip->setFixedHeight(4);
+    grip->setStyleSheet(QStringLiteral("background: #282828;"));
+    stripDock->setTitleBarWidget(grip);
+
+    // Split first, then tabify: splitting a tabbed dock would add a tab instead.
+    addDockWidget(Qt::RightDockWidgetArea, stripDock);
+    addDockWidget(Qt::RightDockWidgetArea, color);
+    splitDockWidget(stripDock, color, Qt::Horizontal);
+    splitDockWidget(color, props, Qt::Vertical);
+    splitDockWidget(props, layers, Qt::Vertical);
+    tabifyDockWidget(color, swatches);
+    tabifyDockWidget(props, adjust);
+    tabifyDockWidget(layers, channels);
+    tabifyDockWidget(channels, paths);
+    color->raise();
+    props->raise();
+    layers->raise();
+    resizeDocks({color, props, layers}, {170, 190, 420}, Qt::Vertical);
+    resizeDocks({color}, {290}, Qt::Horizontal);
+
+    m_historyPanel = new HistoryPanel(m_undoGroup);
+    m_navigatorPanel = new NavigatorPanel;
+    m_infoPanel = new InfoPanel;
+    m_actions.insert(QStringLiteral("window.history"),
+                     m_strip->addPanel(Theme::icon(QStringLiteral("history")), QStringLiteral("History"), m_historyPanel, QSize(260, 340)));
+    m_actions.insert(QStringLiteral("window.navigator"),
+                     m_strip->addPanel(Theme::icon(QStringLiteral("navigator")), QStringLiteral("Navigator"), m_navigatorPanel, QSize(260, 260)));
+    m_actions.insert(QStringLiteral("window.info"),
+                     m_strip->addPanel(Theme::icon(QStringLiteral("info")), QStringLiteral("Info"), m_infoPanel, QSize(240, 170)));
+    action(QStringLiteral("window.info"))->setShortcut(QKeySequence(Qt::Key_F8));
+    addAction(action(QStringLiteral("window.info")));
+}
+
+QAction* MainWindow::makeAction(const QString& id, const QString& text, const QList<QKeySequence>& ks,
+                                std::function<void()> fn, bool needsDocument)
+{
+    auto* a = new QAction(text, this);
+    a->setShortcuts(ks);
+    a->setShortcutContext(Qt::WindowShortcut);
+    connect(a, &QAction::triggered, this, [fn = std::move(fn)] { fn(); });
+    m_actions.insert(id, a);
+    if (needsDocument) m_docActions.append(a);
+    return a;
+}
+
+QAction* MainWindow::stub(QMenu* menu, const QString& text, const QKeySequence& key)
+{
+    QAction* a = menu->addAction(text);
+    // Shown with its Photoshop shortcut for reference, but not bound until implemented.
+    if (!key.isEmpty())
+        a->setText(text + QLatin1Char('\t') + key.toString(QKeySequence::NativeText));
+    a->setEnabled(false);
+    return a;
+}
+
+void MainWindow::createMenus()
+{
+    QMenuBar* mb = menuBar();
+    auto A = [this](const QString& id) { return action(id); };
+
+    // ---------------- File ----------------
+    QMenu* file = mb->addMenu(QStringLiteral("&File"));
+    file->addAction(makeAction(QStringLiteral("file.new"), QStringLiteral("&New..."), keys({"Ctrl+N"}), [this] { newDocument(); }, false));
+    file->addAction(makeAction(QStringLiteral("file.open"), QStringLiteral("&Open..."), keys({"Ctrl+O"}), [this] { openDialog(); }, false));
+    stub(file, QStringLiteral("Browse in Bridge..."), QKeySequence(QStringLiteral("Ctrl+Alt+O")));
+    file->addAction(makeAction(QStringLiteral("file.openAs"), QStringLiteral("Open As..."), keys({"Ctrl+Alt+Shift+O"}), [this] { openDialog(); }, false));
+    stub(file, QStringLiteral("Open as Smart Object..."));
+    m_recentMenu = file->addMenu(QStringLiteral("Open &Recent"));
+    file->addSeparator();
+    file->addAction(makeAction(QStringLiteral("file.close"), QStringLiteral("&Close"), keys({"Ctrl+W"}), [this] { closeDocument(m_tabs->currentIndex()); }));
+    file->addAction(makeAction(QStringLiteral("file.closeAll"), QStringLiteral("Close All"), keys({"Ctrl+Alt+W"}), [this] { closeAll(); }));
+    file->addAction(makeAction(QStringLiteral("file.closeOthers"), QStringLiteral("Close Others"), keys({"Ctrl+Alt+P"}), [this] {
+        QWidget* keep = m_tabs->currentWidget();
+        for (int i = m_tabs->count() - 1; i >= 0; --i)
+            if (m_tabs->widget(i) != keep && !closeDocument(i)) return;
+    }));
+    stub(file, QStringLiteral("Close and Go to Bridge..."), QKeySequence(QStringLiteral("Ctrl+Shift+W")));
+    file->addAction(makeAction(QStringLiteral("file.save"), QStringLiteral("&Save"), keys({"Ctrl+S"}), [this] { saveDocument(currentDoc(), false); }));
+    file->addAction(makeAction(QStringLiteral("file.saveAs"), QStringLiteral("Save &As..."), keys({"Ctrl+Shift+S"}), [this] { saveDocument(currentDoc(), true); }));
+    file->addAction(makeAction(QStringLiteral("file.saveCopy"), QStringLiteral("Save a Copy..."), keys({"Ctrl+Alt+S"}), [this] { saveDocument(currentDoc(), true, true); }));
+    file->addAction(makeAction(QStringLiteral("file.revert"), QStringLiteral("Revert"), keys({"F12"}), [this] { revert(); }));
+    file->addSeparator();
+    QMenu* exportMenu = file->addMenu(QStringLiteral("&Export"));
+    exportMenu->addAction(makeAction(QStringLiteral("file.quickExport"), QStringLiteral("Quick Export as PNG"), {}, [this] { quickExportPng(); }));
+    exportMenu->addAction(makeAction(QStringLiteral("file.exportAs"), QStringLiteral("Export As..."), keys({"Ctrl+Alt+Shift+W"}), [this] { exportAs(); }));
+    exportMenu->addSeparator();
+    stub(exportMenu, QStringLiteral("Save for Web (Legacy)..."), QKeySequence(QStringLiteral("Ctrl+Alt+Shift+S")));
+    stub(exportMenu, QStringLiteral("Artboards to Files..."));
+    stub(exportMenu, QStringLiteral("Layers to Files..."));
+    stub(file, QStringLiteral("Generate"));
+    stub(file, QStringLiteral("Share..."));
+    file->addSeparator();
+    stub(file, QStringLiteral("Place Embedded..."));
+    stub(file, QStringLiteral("Place Linked..."));
+    stub(file, QStringLiteral("Package..."));
+    file->addSeparator();
+    stub(file, QStringLiteral("Automate"));
+    stub(file, QStringLiteral("Scripts"));
+    stub(file, QStringLiteral("Import"));
+    file->addSeparator();
+    stub(file, QStringLiteral("File Info..."), QKeySequence(QStringLiteral("Ctrl+Alt+Shift+I")));
+    stub(file, QStringLiteral("Version History"));
+    file->addSeparator();
+    stub(file, QStringLiteral("Print..."), QKeySequence(QStringLiteral("Ctrl+P")));
+    stub(file, QStringLiteral("Print One Copy"), QKeySequence(QStringLiteral("Ctrl+Alt+Shift+P")));
+    file->addSeparator();
+    QAction* quit = makeAction(QStringLiteral("file.exit"), QStringLiteral("E&xit"), keys({"Ctrl+Q"}), [this] { close(); }, false);
+    quit->setMenuRole(QAction::QuitRole);
+    file->addAction(quit);
+
+    // ---------------- Edit ----------------
+    QMenu* edit = mb->addMenu(QStringLiteral("&Edit"));
+    QAction* undo = m_undoGroup->createUndoAction(this, QStringLiteral("Undo"));
+    undo->setShortcut(QKeySequence(QStringLiteral("Ctrl+Z")));
+    QAction* redo = m_undoGroup->createRedoAction(this, QStringLiteral("Redo"));
+    redo->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+Z")));
+    m_actions.insert(QStringLiteral("edit.undo"), undo);
+    m_actions.insert(QStringLiteral("edit.redo"), redo);
+    edit->addAction(undo);
+    edit->addAction(redo);
+    edit->addAction(makeAction(QStringLiteral("edit.toggleLast"), QStringLiteral("Toggle Last State"), keys({"Ctrl+Alt+Z"}), [this] {
+        QUndoStack* s = m_undoGroup->activeStack();
+        if (!s) return;
+        // Flip between the current state and the one before it.
+        static thread_local bool undone = false;
+        if (s->canRedo() && undone) {
+            s->redo();
+            undone = false;
+        } else if (s->canUndo()) {
+            s->undo();
+            undone = true;
+        }
+    }));
+    edit->addSeparator();
+    stub(edit, QStringLiteral("Fade..."), QKeySequence(QStringLiteral("Ctrl+Shift+F")));
+    edit->addSeparator();
+    edit->addAction(makeAction(QStringLiteral("edit.cut"), QStringLiteral("Cu&t"), keys({"Ctrl+X"}), [this] { cut(); }));
+    edit->addAction(makeAction(QStringLiteral("edit.copy"), QStringLiteral("&Copy"), keys({"Ctrl+C"}), [this] { copy(false); }));
+    edit->addAction(makeAction(QStringLiteral("edit.copyMerged"), QStringLiteral("Copy Merged"), keys({"Ctrl+Shift+C"}), [this] { copy(true); }));
+    edit->addAction(makeAction(QStringLiteral("edit.paste"), QStringLiteral("&Paste"), keys({"Ctrl+V"}), [this] { paste(false); }, false));
+    QMenu* pasteSpecial = edit->addMenu(QStringLiteral("Paste Special"));
+    pasteSpecial->addAction(makeAction(QStringLiteral("edit.pasteInPlace"), QStringLiteral("Paste in Place"), keys({"Ctrl+Shift+V"}), [this] { paste(true); }));
+    stub(pasteSpecial, QStringLiteral("Paste Into"), QKeySequence(QStringLiteral("Ctrl+Alt+Shift+V")));
+    stub(pasteSpecial, QStringLiteral("Paste Outside"));
+    edit->addAction(makeAction(QStringLiteral("edit.clear"), QStringLiteral("Clear"), keys({"Del", "Backspace"}), [this] { clearOrDelete(); }));
+    edit->addSeparator();
+    stub(edit, QStringLiteral("Search"), QKeySequence(QStringLiteral("Ctrl+F")));
+    stub(edit, QStringLiteral("Check Spelling..."));
+    stub(edit, QStringLiteral("Find and Replace Text..."));
+    edit->addSeparator();
+    edit->addAction(makeAction(QStringLiteral("edit.fill"), QStringLiteral("Fill..."), keys({"Shift+F5"}), [this] { fillDialog(); }));
+    stub(edit, QStringLiteral("Stroke..."));
+    stub(edit, QStringLiteral("Content-Aware Fill..."));
+    stub(edit, QStringLiteral("Generative Fill..."));
+    edit->addSeparator();
+    stub(edit, QStringLiteral("Content-Aware Scale"), QKeySequence(QStringLiteral("Ctrl+Alt+Shift+C")));
+    stub(edit, QStringLiteral("Puppet Warp"));
+    stub(edit, QStringLiteral("Perspective Warp"));
+    stub(edit, QStringLiteral("Free Transform"), QKeySequence(QStringLiteral("Ctrl+T")));
+    stub(edit, QStringLiteral("Transform"));
+    stub(edit, QStringLiteral("Auto-Align Layers..."));
+    stub(edit, QStringLiteral("Auto-Blend Layers..."));
+    edit->addSeparator();
+    stub(edit, QStringLiteral("Define Brush Preset..."));
+    stub(edit, QStringLiteral("Define Pattern..."));
+    stub(edit, QStringLiteral("Define Custom Shape..."));
+    edit->addSeparator();
+    QMenu* purge = edit->addMenu(QStringLiteral("Purge"));
+    purge->addAction(makeAction(QStringLiteral("edit.purgeClipboard"), QStringLiteral("Clipboard"), {}, [this] {
+        QApplication::clipboard()->clear();
+        m_clipValid = false;
+    }, false));
+    purge->addAction(makeAction(QStringLiteral("edit.purgeHistories"), QStringLiteral("Histories"), {}, [this] {
+        if (QMessageBox::warning(this, QStringLiteral("PhotoSlop"), QStringLiteral("This cannot be undone.\nContinue?"),
+                                 QMessageBox::Ok | QMessageBox::Cancel) == QMessageBox::Ok)
+            if (Document* d = currentDoc()) d->undoStack()->clear();
+    }));
+    edit->addSeparator();
+    stub(edit, QStringLiteral("Color Settings..."), QKeySequence(QStringLiteral("Ctrl+Shift+K")));
+    stub(edit, QStringLiteral("Assign Profile..."));
+    stub(edit, QStringLiteral("Convert to Profile..."));
+    edit->addSeparator();
+    edit->addAction(makeAction(QStringLiteral("edit.shortcuts"), QStringLiteral("Keyboard Shortcuts..."), keys({"Ctrl+Alt+Shift+K"}), [this] { showShortcuts(); }, false));
+    stub(edit, QStringLiteral("Menus..."), QKeySequence(QStringLiteral("Ctrl+Alt+Shift+M")));
+    stub(edit, QStringLiteral("Toolbar..."));
+    QAction* prefs = stub(edit, QStringLiteral("Preferences..."), QKeySequence(QStringLiteral("Ctrl+K")));
+    prefs->setMenuRole(QAction::PreferencesRole);
+
+    // ---------------- Image ----------------
+    QMenu* image = mb->addMenu(QStringLiteral("&Image"));
+    QMenu* mode = image->addMenu(QStringLiteral("Mode"));
+    for (const char* m : {"Bitmap", "Grayscale", "Duotone", "Indexed Color..."}) stub(mode, QString::fromLatin1(m));
+    QAction* rgb = mode->addAction(QStringLiteral("RGB Color"));
+    rgb->setCheckable(true);
+    rgb->setChecked(true);
+    for (const char* m : {"CMYK Color", "Lab Color", "Multichannel"}) stub(mode, QString::fromLatin1(m));
+    mode->addSeparator();
+    QAction* bits8 = mode->addAction(QStringLiteral("8 Bits/Channel"));
+    bits8->setCheckable(true);
+    bits8->setChecked(true);
+    stub(mode, QStringLiteral("16 Bits/Channel"));
+    stub(mode, QStringLiteral("32 Bits/Channel"));
+    image->addSeparator();
+    QMenu* adj = image->addMenu(QStringLiteral("Adjustments"));
+    stub(adj, QStringLiteral("Brightness/Contrast..."));
+    stub(adj, QStringLiteral("Levels..."), QKeySequence(QStringLiteral("Ctrl+L")));
+    stub(adj, QStringLiteral("Curves..."), QKeySequence(QStringLiteral("Ctrl+M")));
+    stub(adj, QStringLiteral("Exposure..."));
+    adj->addSeparator();
+    stub(adj, QStringLiteral("Vibrance..."));
+    stub(adj, QStringLiteral("Hue/Saturation..."), QKeySequence(QStringLiteral("Ctrl+U")));
+    stub(adj, QStringLiteral("Color Balance..."), QKeySequence(QStringLiteral("Ctrl+B")));
+    stub(adj, QStringLiteral("Black && White..."), QKeySequence(QStringLiteral("Ctrl+Alt+Shift+B")));
+    stub(adj, QStringLiteral("Photo Filter..."));
+    stub(adj, QStringLiteral("Channel Mixer..."));
+    stub(adj, QStringLiteral("Color Lookup..."));
+    adj->addSeparator();
+    adj->addAction(makeAction(QStringLiteral("image.invert"), QStringLiteral("Invert"), keys({"Ctrl+I"}), [this] {
+        applyPixelFilter(QStringLiteral("Invert"), [](QRgb c) { return qRgba(255 - qRed(c), 255 - qGreen(c), 255 - qBlue(c), qAlpha(c)); });
+    }));
+    stub(adj, QStringLiteral("Posterize..."));
+    stub(adj, QStringLiteral("Threshold..."));
+    stub(adj, QStringLiteral("Gradient Map..."));
+    stub(adj, QStringLiteral("Selective Color..."));
+    adj->addSeparator();
+    stub(adj, QStringLiteral("Shadows/Highlights..."));
+    stub(adj, QStringLiteral("HDR Toning..."));
+    adj->addSeparator();
+    adj->addAction(makeAction(QStringLiteral("image.desaturate"), QStringLiteral("Desaturate"), keys({"Ctrl+Shift+U"}), [this] {
+        applyPixelFilter(QStringLiteral("Desaturate"), [](QRgb c) {
+            // Photoshop's Desaturate uses the average of the max and min channel.
+            const int l = (std::max({qRed(c), qGreen(c), qBlue(c)}) + std::min({qRed(c), qGreen(c), qBlue(c)})) / 2;
+            return qRgba(l, l, l, qAlpha(c));
+        });
+    }));
+    stub(adj, QStringLiteral("Match Color..."));
+    stub(adj, QStringLiteral("Replace Color..."));
+    stub(adj, QStringLiteral("Equalize"));
+    image->addSeparator();
+    stub(image, QStringLiteral("Auto Tone"), QKeySequence(QStringLiteral("Ctrl+Shift+L")));
+    stub(image, QStringLiteral("Auto Contrast"), QKeySequence(QStringLiteral("Ctrl+Alt+Shift+L")));
+    stub(image, QStringLiteral("Auto Color"), QKeySequence(QStringLiteral("Ctrl+Shift+B")));
+    image->addSeparator();
+    image->addAction(makeAction(QStringLiteral("image.imageSize"), QStringLiteral("Image Size..."), keys({"Ctrl+Alt+I"}), [this] { imageSizeDialog(); }));
+    image->addAction(makeAction(QStringLiteral("image.canvasSize"), QStringLiteral("Canvas Size..."), keys({"Ctrl+Alt+C"}), [this] { canvasSizeDialog(); }));
+    QMenu* rot = image->addMenu(QStringLiteral("Image Rotation"));
+    auto rotAct = [&](const QString& id, const QString& text, Ops::Rotation how) {
+        rot->addAction(makeAction(id, text, {}, [this, how] {
+            if (Document* d = currentDoc()) Ops::rotate(d, how);
+        }));
+    };
+    rotAct(QStringLiteral("image.rot180"), QStringLiteral("180°"), Ops::Rotation::Rotate180);
+    rotAct(QStringLiteral("image.rot90cw"), QStringLiteral("90° Clockwise"), Ops::Rotation::Rotate90CW);
+    rotAct(QStringLiteral("image.rot90ccw"), QStringLiteral("90° Counter Clockwise"), Ops::Rotation::Rotate90CCW);
+    stub(rot, QStringLiteral("Arbitrary..."));
+    rot->addSeparator();
+    rotAct(QStringLiteral("image.flipH"), QStringLiteral("Flip Canvas Horizontal"), Ops::Rotation::FlipHorizontal);
+    rotAct(QStringLiteral("image.flipV"), QStringLiteral("Flip Canvas Vertical"), Ops::Rotation::FlipVertical);
+    image->addAction(makeAction(QStringLiteral("image.crop"), QStringLiteral("Crop"), {}, [this] {
+        if (Document* d = currentDoc()) Ops::cropToSelection(d);
+    }));
+    stub(image, QStringLiteral("Trim..."));
+    stub(image, QStringLiteral("Reveal All"));
+    image->addSeparator();
+    image->addAction(makeAction(QStringLiteral("image.duplicate"), QStringLiteral("Duplicate..."), {}, [this] {
+        Document* d = currentDoc();
+        if (!d) return;
+        bool ok = false;
+        QString name = QInputDialog::getText(this, QStringLiteral("Duplicate Image"), QStringLiteral("As:"),
+                                             QLineEdit::Normal, d->title() + QStringLiteral(" copy"), &ok);
+        if (!ok) return;
+        auto* copy = new Document(d->size());
+        DocState s = d->state();
+        for (Layer& l : s.layers) l.id = Layer::nextId();
+        copy->initialize(s);
+        copy->setTitle(name);
+        addDocument(copy);
+    }));
+    stub(image, QStringLiteral("Apply Image..."));
+    stub(image, QStringLiteral("Calculations..."));
+
+    // ---------------- Layer ----------------
+    QMenu* layer = mb->addMenu(QStringLiteral("&Layer"));
+    QMenu* newMenu = layer->addMenu(QStringLiteral("New"));
+    newMenu->addAction(makeAction(QStringLiteral("layer.new"), QStringLiteral("Layer..."), keys({"Ctrl+Shift+N"}), [this] { newLayerDialog(); }));
+    makeAction(QStringLiteral("layer.newQuick"), QStringLiteral("New Layer"), keys({"Ctrl+Alt+Shift+N"}), [this] {
+        if (Document* d = currentDoc()) Ops::newLayer(d);
+    });
+    addAction(A(QStringLiteral("layer.newQuick")));
+    newMenu->addAction(makeAction(QStringLiteral("layer.fromBackground"), QStringLiteral("Layer from Background..."), {}, [this] { layerFromBackground(); }));
+    stub(newMenu, QStringLiteral("Group..."));
+    stub(newMenu, QStringLiteral("Group from Layers..."));
+    newMenu->addSeparator();
+    newMenu->addAction(makeAction(QStringLiteral("layer.viaCopy"), QStringLiteral("Layer via Copy"), keys({"Ctrl+J"}), [this] {
+        QString err;
+        if (Document* d = currentDoc(); d && !Ops::layerViaCopy(d, false, &err) && !err.isEmpty()) alert(err);
+    }));
+    newMenu->addAction(makeAction(QStringLiteral("layer.viaCut"), QStringLiteral("Layer via Cut"), keys({"Ctrl+Shift+J"}), [this] {
+        QString err;
+        if (Document* d = currentDoc(); d && !Ops::layerViaCopy(d, true, &err) && !err.isEmpty()) alert(err);
+    }));
+    layer->addAction(makeAction(QStringLiteral("layer.duplicate"), QStringLiteral("Duplicate Layer..."), {}, [this] { duplicateLayerDialog(); }));
+    layer->addAction(makeAction(QStringLiteral("layer.delete"), QStringLiteral("Delete Layer"), {}, [this] {
+        QString err;
+        if (Document* d = currentDoc(); d && !Ops::deleteLayer(d, &err)) alert(err);
+    }));
+    layer->addSeparator();
+    layer->addAction(makeAction(QStringLiteral("layer.rename"), QStringLiteral("Rename Layer..."), {}, [this] {
+        Document* d = currentDoc();
+        if (!d || !d->activeLayer()) return;
+        bool ok = false;
+        QString n = QInputDialog::getText(this, QStringLiteral("Rename Layer"), QStringLiteral("Name:"), QLineEdit::Normal,
+                                          d->activeLayer()->name, &ok);
+        if (ok) Ops::rename(d, d->activeIndex(), n);
+    }));
+    stub(layer, QStringLiteral("Layer Style"));
+    stub(layer, QStringLiteral("Smart Filter"));
+    layer->addSeparator();
+    stub(layer, QStringLiteral("New Fill Layer"));
+    stub(layer, QStringLiteral("New Adjustment Layer"));
+    layer->addSeparator();
+    stub(layer, QStringLiteral("Layer Mask"));
+    stub(layer, QStringLiteral("Vector Mask"));
+    stub(layer, QStringLiteral("Create Clipping Mask"), QKeySequence(QStringLiteral("Ctrl+Alt+G")));
+    layer->addSeparator();
+    stub(layer, QStringLiteral("Smart Objects"));
+    stub(layer, QStringLiteral("Rasterize"));
+    layer->addSeparator();
+    stub(layer, QStringLiteral("Group Layers"), QKeySequence(QStringLiteral("Ctrl+G")));
+    stub(layer, QStringLiteral("Ungroup Layers"), QKeySequence(QStringLiteral("Ctrl+Shift+G")));
+    layer->addAction(makeAction(QStringLiteral("layer.hide"), QStringLiteral("Hide Layers"), keys({"Ctrl+,"}), [this] {
+        if (Document* d = currentDoc(); d && d->activeLayer())
+            Ops::setVisible(d, d->activeIndex(), !d->activeLayer()->visible);
+    }));
+    layer->addSeparator();
+    QMenu* arrange = layer->addMenu(QStringLiteral("Arrange"));
+    auto arrAct = [&](const QString& id, const QString& text, const char* key, Ops::Arrange how) {
+        arrange->addAction(makeAction(id, text, keys({key}), [this, how] {
+            if (Document* d = currentDoc()) Ops::arrange(d, how);
+        }));
+    };
+    arrAct(QStringLiteral("layer.front"), QStringLiteral("Bring to Front"), "Ctrl+Shift+]", Ops::Arrange::BringToFront);
+    arrAct(QStringLiteral("layer.forward"), QStringLiteral("Bring Forward"), "Ctrl+]", Ops::Arrange::BringForward);
+    arrAct(QStringLiteral("layer.backward"), QStringLiteral("Send Backward"), "Ctrl+[", Ops::Arrange::SendBackward);
+    arrAct(QStringLiteral("layer.back"), QStringLiteral("Send to Back"), "Ctrl+Shift+[", Ops::Arrange::SendToBack);
+    stub(layer, QStringLiteral("Combine Shapes"));
+    stub(layer, QStringLiteral("Align"));
+    stub(layer, QStringLiteral("Distribute"));
+    layer->addSeparator();
+    layer->addAction(makeAction(QStringLiteral("layer.lockAll"), QStringLiteral("Lock Layers..."), keys({"Ctrl+/"}), [this] {
+        Document* d = currentDoc();
+        if (!d || !d->activeLayer() || d->activeLayer()->isBackground) return;
+        const Layer& l = *d->activeLayer();
+        Ops::setLocks(d, d->activeIndex(), l.lockTransparency, l.lockPixels, l.lockPosition, !l.lockAll);
+    }));
+    layer->addSeparator();
+    stub(layer, QStringLiteral("Link Layers"));
+    stub(layer, QStringLiteral("Select Linked Layers"));
+    layer->addSeparator();
+    layer->addAction(makeAction(QStringLiteral("layer.mergeDown"), QStringLiteral("Merge Down"), keys({"Ctrl+E"}), [this] {
+        QString err;
+        if (Document* d = currentDoc(); d && !Ops::mergeDown(d, &err)) alert(err);
+    }));
+    layer->addAction(makeAction(QStringLiteral("layer.mergeVisible"), QStringLiteral("Merge Visible"), keys({"Ctrl+Shift+E"}), [this] {
+        QString err;
+        if (Document* d = currentDoc(); d && !Ops::mergeVisible(d, &err)) alert(err);
+    }));
+    layer->addAction(makeAction(QStringLiteral("layer.flatten"), QStringLiteral("Flatten Image"), {}, [this] {
+        Document* d = currentDoc();
+        if (!d) return;
+        bool hidden = false;
+        for (const Layer& l : d->layers())
+            if (!l.visible) hidden = true;
+        if (hidden && QMessageBox::question(this, QStringLiteral("PhotoSlop"), QStringLiteral("Discard hidden layers?"),
+                                            QMessageBox::Ok | QMessageBox::Cancel) != QMessageBox::Ok)
+            return;
+        Ops::flatten(d);
+    }));
+    stub(layer, QStringLiteral("Matting"));
+
+    // ---------------- Type ----------------
+    QMenu* type = mb->addMenu(QStringLiteral("&Type"));
+    for (const char* t : {"More from Adobe Fonts...", "Panels", "Anti-Alias", "Orientation", "OpenType", "Extrude to 3D",
+                          "Create Work Path", "Convert to Shape", "Rasterize Type Layer", "Convert Text Shape Type",
+                          "Warp Text...", "Match Font...", "Font Preview Size", "Language Options", "Update All Text Layers",
+                          "Manage Missing Fonts", "Paste Lorem Ipsum", "Load Default Type Styles", "Save Default Type Styles"})
+        stub(type, QString::fromLatin1(t) == QLatin1String("More from Adobe Fonts...") ? QStringLiteral("More Fonts...") : QString::fromLatin1(t));
+
+    // ---------------- Select ----------------
+    QMenu* select = mb->addMenu(QStringLiteral("&Select"));
+    select->addAction(makeAction(QStringLiteral("select.all"), QStringLiteral("All"), keys({"Ctrl+A"}), [this] {
+        if (Document* d = currentDoc()) Ops::selectAll(d);
+    }));
+    select->addAction(makeAction(QStringLiteral("select.deselect"), QStringLiteral("Deselect"), keys({"Ctrl+D"}), [this] {
+        if (Document* d = currentDoc()) Ops::deselect(d);
+    }));
+    select->addAction(makeAction(QStringLiteral("select.reselect"), QStringLiteral("Reselect"), keys({"Ctrl+Shift+D"}), [this] {
+        if (Document* d = currentDoc()) Ops::reselect(d);
+    }));
+    select->addAction(makeAction(QStringLiteral("select.inverse"), QStringLiteral("Inverse"), keys({"Ctrl+Shift+I"}), [this] {
+        if (Document* d = currentDoc()) Ops::inverse(d);
+    }));
+    select->addSeparator();
+    stub(select, QStringLiteral("All Layers"), QKeySequence(QStringLiteral("Ctrl+Alt+A")));
+    stub(select, QStringLiteral("Deselect Layers"));
+    stub(select, QStringLiteral("Find Layers"), QKeySequence(QStringLiteral("Ctrl+Alt+Shift+F")));
+    stub(select, QStringLiteral("Isolate Layers"));
+    select->addSeparator();
+    stub(select, QStringLiteral("Color Range..."));
+    stub(select, QStringLiteral("Focus Area..."));
+    stub(select, QStringLiteral("Subject"));
+    stub(select, QStringLiteral("Sky"));
+    stub(select, QStringLiteral("Select and Mask..."), QKeySequence(QStringLiteral("Ctrl+Alt+R")));
+    QMenu* modify = select->addMenu(QStringLiteral("Modify"));
+    stub(modify, QStringLiteral("Border..."));
+    stub(modify, QStringLiteral("Smooth..."));
+    stub(modify, QStringLiteral("Expand..."));
+    stub(modify, QStringLiteral("Contract..."));
+    modify->addAction(makeAction(QStringLiteral("select.feather"), QStringLiteral("Feather..."), keys({"Shift+F6"}), [this] { featherDialog(); }));
+    select->addSeparator();
+    stub(select, QStringLiteral("Grow"));
+    stub(select, QStringLiteral("Similar"));
+    select->addSeparator();
+    stub(select, QStringLiteral("Transform Selection"));
+    select->addSeparator();
+    stub(select, QStringLiteral("Edit in Quick Mask Mode"));
+    select->addSeparator();
+    stub(select, QStringLiteral("Load Selection..."));
+    stub(select, QStringLiteral("Save Selection..."));
+
+    // ---------------- Filter ----------------
+    QMenu* filter = mb->addMenu(QStringLiteral("Fil&ter"));
+    stub(filter, QStringLiteral("Last Filter"), QKeySequence(QStringLiteral("Ctrl+Alt+F")));
+    filter->addSeparator();
+    stub(filter, QStringLiteral("Convert for Smart Filters"));
+    filter->addSeparator();
+    stub(filter, QStringLiteral("Neural Filters..."));
+    stub(filter, QStringLiteral("Filter Gallery..."));
+    stub(filter, QStringLiteral("Adaptive Wide Angle..."), QKeySequence(QStringLiteral("Ctrl+Alt+Shift+A")));
+    stub(filter, QStringLiteral("Camera Raw Filter..."), QKeySequence(QStringLiteral("Ctrl+Shift+A")));
+    stub(filter, QStringLiteral("Lens Correction..."), QKeySequence(QStringLiteral("Ctrl+Shift+R")));
+    stub(filter, QStringLiteral("Liquify..."), QKeySequence(QStringLiteral("Ctrl+Shift+X")));
+    stub(filter, QStringLiteral("Vanishing Point..."), QKeySequence(QStringLiteral("Ctrl+Alt+V")));
+    filter->addSeparator();
+    const QList<QPair<QString, QStringList>> filterGroups = {
+        {QStringLiteral("Blur"), {QStringLiteral("Average"), QStringLiteral("Blur"), QStringLiteral("Blur More"), QStringLiteral("Box Blur..."),
+                                  QStringLiteral("Gaussian Blur..."), QStringLiteral("Lens Blur..."), QStringLiteral("Motion Blur..."),
+                                  QStringLiteral("Radial Blur..."), QStringLiteral("Shape Blur..."), QStringLiteral("Smart Blur..."),
+                                  QStringLiteral("Surface Blur...")}},
+        {QStringLiteral("Blur Gallery"), {QStringLiteral("Field Blur..."), QStringLiteral("Iris Blur..."), QStringLiteral("Tilt-Shift..."),
+                                          QStringLiteral("Path Blur..."), QStringLiteral("Spin Blur...")}},
+        {QStringLiteral("Distort"), {QStringLiteral("Displace..."), QStringLiteral("Pinch..."), QStringLiteral("Polar Coordinates..."),
+                                     QStringLiteral("Ripple..."), QStringLiteral("Shear..."), QStringLiteral("Spherize..."),
+                                     QStringLiteral("Twirl..."), QStringLiteral("Wave..."), QStringLiteral("ZigZag...")}},
+        {QStringLiteral("Noise"), {QStringLiteral("Add Noise..."), QStringLiteral("Despeckle"), QStringLiteral("Dust & Scratches..."),
+                                   QStringLiteral("Median..."), QStringLiteral("Reduce Noise...")}},
+        {QStringLiteral("Pixelate"), {QStringLiteral("Color Halftone..."), QStringLiteral("Crystallize..."), QStringLiteral("Facet"),
+                                      QStringLiteral("Fragment"), QStringLiteral("Mezzotint..."), QStringLiteral("Mosaic..."),
+                                      QStringLiteral("Pointillize...")}},
+        {QStringLiteral("Render"), {QStringLiteral("Flame..."), QStringLiteral("Picture Frame..."), QStringLiteral("Tree..."),
+                                    QStringLiteral("Clouds"), QStringLiteral("Difference Clouds"), QStringLiteral("Fibers..."),
+                                    QStringLiteral("Lens Flare..."), QStringLiteral("Lighting Effects...")}},
+        {QStringLiteral("Sharpen"), {QStringLiteral("Shake Reduction..."), QStringLiteral("Sharpen"), QStringLiteral("Sharpen Edges"),
+                                     QStringLiteral("Sharpen More"), QStringLiteral("Smart Sharpen..."), QStringLiteral("Unsharp Mask...")}},
+        {QStringLiteral("Stylize"), {QStringLiteral("Diffuse..."), QStringLiteral("Emboss..."), QStringLiteral("Extrude..."),
+                                     QStringLiteral("Find Edges"), QStringLiteral("Oil Paint..."), QStringLiteral("Solarize"),
+                                     QStringLiteral("Tiles..."), QStringLiteral("Trace Contour..."), QStringLiteral("Wind...")}},
+        {QStringLiteral("Video"), {QStringLiteral("De-Interlace..."), QStringLiteral("NTSC Colors")}},
+        {QStringLiteral("Other"), {QStringLiteral("Custom..."), QStringLiteral("High Pass..."), QStringLiteral("HSB/HSL"),
+                                   QStringLiteral("Maximum..."), QStringLiteral("Minimum..."), QStringLiteral("Offset...")}},
+    };
+    for (const auto& [groupName, items] : filterGroups) {
+        QMenu* sub = filter->addMenu(groupName);
+        for (const QString& item : items) stub(sub, item);
+    }
+
+    // ---------------- View ----------------
+    QMenu* view = mb->addMenu(QStringLiteral("&View"));
+    stub(view, QStringLiteral("Proof Setup"));
+    stub(view, QStringLiteral("Proof Colors"), QKeySequence(QStringLiteral("Ctrl+Y")));
+    stub(view, QStringLiteral("Gamut Warning"), QKeySequence(QStringLiteral("Ctrl+Shift+Y")));
+    stub(view, QStringLiteral("Pixel Aspect Ratio"));
+    view->addSeparator();
+    view->addAction(makeAction(QStringLiteral("view.zoomIn"), QStringLiteral("Zoom In"), keys({"Ctrl+=", "Ctrl++"}), [this] {
+        if (CanvasView* v = currentView()) v->zoomIn();
+    }));
+    view->addAction(makeAction(QStringLiteral("view.zoomOut"), QStringLiteral("Zoom Out"), keys({"Ctrl+-"}), [this] {
+        if (CanvasView* v = currentView()) v->zoomOut();
+    }));
+    view->addAction(makeAction(QStringLiteral("view.fit"), QStringLiteral("Fit on Screen"), keys({"Ctrl+0"}), [this] {
+        if (CanvasView* v = currentView()) v->fitOnScreen();
+    }));
+    stub(view, QStringLiteral("Fit Layer(s) on Screen"));
+    view->addAction(makeAction(QStringLiteral("view.100"), QStringLiteral("100%"), keys({"Ctrl+1", "Ctrl+Alt+0"}), [this] {
+        if (CanvasView* v = currentView()) v->actualPixels();
+    }));
+    view->addAction(makeAction(QStringLiteral("view.200"), QStringLiteral("200%"), {}, [this] {
+        if (CanvasView* v = currentView()) v->setZoom(2.0);
+    }));
+    stub(view, QStringLiteral("Print Size"));
+    stub(view, QStringLiteral("Flip Horizontal"));
+    view->addSeparator();
+    QMenu* screen = view->addMenu(QStringLiteral("Screen Mode"));
+    screen->addAction(makeAction(QStringLiteral("view.screenStandard"), QStringLiteral("Standard Screen Mode"), {}, [this] { setScreenMode(0); }, false));
+    screen->addAction(makeAction(QStringLiteral("view.screenFullMenu"), QStringLiteral("Full Screen Mode With Menu Bar"), {}, [this] { setScreenMode(1); }, false));
+    screen->addAction(makeAction(QStringLiteral("view.screenFull"), QStringLiteral("Full Screen Mode"), {}, [this] { setScreenMode(2); }, false));
+    view->addSeparator();
+    QAction* extras = makeAction(QStringLiteral("view.extras"), QStringLiteral("Extras"), keys({"Ctrl+H"}), [this] {
+        const bool on = action(QStringLiteral("view.extras"))->isChecked();
+        for (int i = 0; i < m_tabs->count(); ++i)
+            static_cast<DocumentPage*>(m_tabs->widget(i))->view()->setShowSelectionEdges(on);
+    }, false);
+    extras->setCheckable(true);
+    extras->setChecked(true);
+    view->addAction(extras);
+    QMenu* show = view->addMenu(QStringLiteral("Show"));
+    QAction* pixelGrid = makeAction(QStringLiteral("view.pixelGrid"), QStringLiteral("Pixel Grid"), {}, [this] {
+        const bool on = action(QStringLiteral("view.pixelGrid"))->isChecked();
+        for (int i = 0; i < m_tabs->count(); ++i)
+            static_cast<DocumentPage*>(m_tabs->widget(i))->view()->setShowPixelGrid(on);
+    }, false);
+    pixelGrid->setCheckable(true);
+    pixelGrid->setChecked(true);
+    show->addAction(pixelGrid);
+    stub(show, QStringLiteral("Grid"), QKeySequence(QStringLiteral("Ctrl+'")));
+    stub(show, QStringLiteral("Guides"), QKeySequence(QStringLiteral("Ctrl+;")));
+    view->addSeparator();
+    stub(view, QStringLiteral("Rulers"), QKeySequence(QStringLiteral("Ctrl+R")));
+    view->addSeparator();
+    stub(view, QStringLiteral("Snap"), QKeySequence(QStringLiteral("Ctrl+Shift+;")));
+    stub(view, QStringLiteral("Snap To"));
+    view->addSeparator();
+    stub(view, QStringLiteral("Lock Guides"), QKeySequence(QStringLiteral("Ctrl+Alt+;")));
+    stub(view, QStringLiteral("Clear Guides"));
+    stub(view, QStringLiteral("New Guide..."));
+
+    // ---------------- Window ----------------
+    m_windowMenu = mb->addMenu(QStringLiteral("&Window"));
+    QMenu* arrangeWin = m_windowMenu->addMenu(QStringLiteral("Arrange"));
+    stub(arrangeWin, QStringLiteral("Tile All Vertically"));
+    stub(arrangeWin, QStringLiteral("Tile All Horizontally"));
+    arrangeWin->addAction(QStringLiteral("Consolidate All to Tabs"));
+    stub(arrangeWin, QStringLiteral("Float in Window"));
+    QMenu* workspace = m_windowMenu->addMenu(QStringLiteral("Workspace"));
+    QAction* essentials = workspace->addAction(QStringLiteral("Essentials (Default)"));
+    essentials->setCheckable(true);
+    essentials->setChecked(true);
+    workspace->addSeparator();
+    workspace->addAction(makeAction(QStringLiteral("window.resetWorkspace"), QStringLiteral("Reset Essentials"), {}, [this] {
+        restoreState(m_defaultState, kStateVersion);
+        m_toolsBar->show();
+        m_optionsBar->show();
+    }, false));
+    m_windowMenu->addSeparator();
+    stub(m_windowMenu, QStringLiteral("Actions"), QKeySequence(QStringLiteral("Alt+F9")));
+    auto dockAct = [this](const QString& objectName, const char* key) {
+        for (QDockWidget* d : m_docks) {
+            if (d->objectName() != objectName) continue;
+            QAction* a = d->toggleViewAction();
+            if (key) {
+                a->setShortcut(QKeySequence(QString::fromLatin1(key)));
+                addAction(a);
+            }
+            m_windowMenu->addAction(a);
+        }
+    };
+    dockAct(QStringLiteral("AdjustmentsDock"), nullptr);
+    stub(m_windowMenu, QStringLiteral("Brush Settings"), QKeySequence(QStringLiteral("F5")));
+    stub(m_windowMenu, QStringLiteral("Brushes"));
+    dockAct(QStringLiteral("ChannelsDock"), nullptr);
+    stub(m_windowMenu, QStringLiteral("Character"));
+    dockAct(QStringLiteral("ColorDock"), "F6");
+    stub(m_windowMenu, QStringLiteral("Gradients"));
+    stub(m_windowMenu, QStringLiteral("Histogram"));
+    m_windowMenu->addAction(action(QStringLiteral("window.history")));
+    m_windowMenu->addAction(action(QStringLiteral("window.info")));
+    dockAct(QStringLiteral("LayersDock"), "F7");
+    m_windowMenu->addAction(action(QStringLiteral("window.navigator")));
+    stub(m_windowMenu, QStringLiteral("Paragraph"));
+    dockAct(QStringLiteral("PathsDock"), nullptr);
+    stub(m_windowMenu, QStringLiteral("Patterns"));
+    dockAct(QStringLiteral("PropertiesDock"), nullptr);
+    stub(m_windowMenu, QStringLiteral("Shapes"));
+    stub(m_windowMenu, QStringLiteral("Styles"));
+    dockAct(QStringLiteral("SwatchesDock"), nullptr);
+    stub(m_windowMenu, QStringLiteral("Timeline"));
+    m_windowMenu->addSeparator();
+    QAction* optionsToggle = m_optionsBar->toggleViewAction();
+    optionsToggle->setText(QStringLiteral("Options"));
+    m_windowMenu->addAction(optionsToggle);
+    QAction* toolsToggle = m_toolsBar->toggleViewAction();
+    toolsToggle->setText(QStringLiteral("Tools"));
+    m_windowMenu->addAction(toolsToggle);
+    m_windowMenu->addSeparator();
+
+    // ---------------- Help ----------------
+    QMenu* help = mb->addMenu(QStringLiteral("&Help"));
+    QAction* about = help->addAction(QStringLiteral("About PhotoSlop..."));
+    about->setMenuRole(QAction::AboutRole);
+    connect(about, &QAction::triggered, this, &MainWindow::showAbout);
+    help->addAction(A(QStringLiteral("edit.shortcuts")));
+}
+
+void MainWindow::createHiddenShortcuts()
+{
+    // Tool letters: the key selects the group's last tool; Shift+key cycles through the group.
+    for (const auto& grp : m_tools->groups()) {
+        if (grp.tools.isEmpty()) continue;
+        const QChar key = grp.tools.first()->shortcut();
+        QAction* a = makeAction(QStringLiteral("tool.%1").arg(key), grp.tools.first()->name(),
+                                {QKeySequence(QString(key))}, [this, key] { m_tools->selectByShortcut(key, false); }, false);
+        QAction* c = makeAction(QStringLiteral("tool.%1.cycle").arg(key), grp.tools.first()->name(),
+                                {QKeySequence(QStringLiteral("Shift+") + key)}, [this, key] { m_tools->selectByShortcut(key, true); }, false);
+        addAction(a);
+        addAction(c);
+    }
+    addAction(makeAction(QStringLiteral("color.default"), QStringLiteral("Default Foreground/Background Colors"), keys({"D"}),
+                         [this] { m_colors->reset(); }, false));
+    addAction(makeAction(QStringLiteral("color.swap"), QStringLiteral("Switch Foreground/Background Colors"), keys({"X"}),
+                         [this] { m_colors->swap(); }, false));
+    addAction(makeAction(QStringLiteral("view.screenCycle"), QStringLiteral("Cycle Screen Mode"), keys({"F"}),
+                         [this] { cycleScreenMode(); }, false));
+    addAction(makeAction(QStringLiteral("brush.smaller"), QStringLiteral("Decrease Brush Size"), keys({"["}), [this] {
+        if (Tool* t = m_tools->current()) t->adjustSize(-1);
+    }, false));
+    addAction(makeAction(QStringLiteral("brush.larger"), QStringLiteral("Increase Brush Size"), keys({"]"}), [this] {
+        if (Tool* t = m_tools->current()) t->adjustSize(1);
+    }, false));
+    addAction(makeAction(QStringLiteral("brush.softer"), QStringLiteral("Decrease Brush Hardness"), keys({"Shift+[", "{"}), [this] {
+        if (Tool* t = m_tools->current()) t->adjustHardness(-1);
+    }, false));
+    addAction(makeAction(QStringLiteral("brush.harder"), QStringLiteral("Increase Brush Hardness"), keys({"Shift+]", "}"}), [this] {
+        if (Tool* t = m_tools->current()) t->adjustHardness(1);
+    }, false));
+    addAction(makeAction(QStringLiteral("edit.fillForeground"), QStringLiteral("Fill with Foreground Color"),
+                         keys({"Alt+Backspace", "Alt+Del"}), [this] { quickFill(false, false); }));
+    addAction(makeAction(QStringLiteral("edit.fillForegroundPreserve"), QStringLiteral("Fill with Foreground Color (Preserve Transparency)"),
+                         keys({"Alt+Shift+Backspace", "Alt+Shift+Del"}), [this] { quickFill(false, true); }));
+    addAction(makeAction(QStringLiteral("edit.fillBackground"), QStringLiteral("Fill with Background Color"),
+                         keys({"Ctrl+Backspace", "Ctrl+Del"}), [this] { quickFill(true, false); }));
+    addAction(makeAction(QStringLiteral("edit.fillBackgroundPreserve"), QStringLiteral("Fill with Background Color (Preserve Transparency)"),
+                         keys({"Ctrl+Shift+Backspace", "Ctrl+Shift+Del"}), [this] { quickFill(true, true); }));
+}
+
+// ---------------- Documents ----------------
+
+DocumentPage* MainWindow::currentPage() const { return qobject_cast<DocumentPage*>(m_tabs->currentWidget()); }
+Document* MainWindow::currentDoc() const { return currentPage() ? currentPage()->document() : nullptr; }
+CanvasView* MainWindow::currentView() const { return currentPage() ? currentPage()->view() : nullptr; }
+
+void MainWindow::addDocument(Document* doc)
+{
+    auto* page = new DocumentPage(doc, m_tools, m_tabs);
+    page->view()->setShowPixelGrid(action(QStringLiteral("view.pixelGrid"))->isChecked());
+    page->view()->setShowSelectionEdges(action(QStringLiteral("view.extras"))->isChecked());
+    m_undoGroup->addStack(doc->undoStack());
+    const int idx = m_tabs->addTab(page, page->tabTitle());
+    connect(page, &DocumentPage::titleChanged, this, &MainWindow::updateTabTitles);
+    connect(doc, &Document::selectionChanged, this, &MainWindow::updateActions);
+    connect(doc, &Document::layersChanged, this, &MainWindow::updateActions);
+    m_tabs->setCurrentIndex(idx);
+    m_central->setCurrentWidget(m_tabs);
+    onCurrentChanged();
+    page->view()->setFocus();
+}
+
+void MainWindow::newDocument()
+{
+    QSize clip;
+    const QImage ci = QApplication::clipboard()->image();
+    if (!ci.isNull()) clip = ci.size();
+    NewDocumentDialog dlg(QStringLiteral("Untitled-%1").arg(m_untitled + 1), clip, this);
+    if (dlg.exec() != QDialog::Accepted) return;
+    ++m_untitled;
+    const QSize size = dlg.pixelSize();
+    auto* doc = new Document(size);
+    DocState s;
+    s.size = size;
+    s.dpi = dlg.resolution();
+    if (dlg.background() == NewDocumentDialog::Background::Transparent) {
+        s.layers = {Layer::create(QStringLiteral("Layer 1"))};
+    } else {
+        QColor fill = Qt::white;
+        switch (dlg.background()) {
+        case NewDocumentDialog::Background::Black: fill = Qt::black; break;
+        case NewDocumentDialog::Background::BackgroundColor: fill = m_colors->background(); break;
+        case NewDocumentDialog::Background::Custom: fill = dlg.customColor(); break;
+        default: break;
+        }
+        Layer bg = Layer::create(QStringLiteral("Background"));
+        bg.isBackground = true;
+        bg.image = QImage(size, QImage::Format_ARGB32_Premultiplied);
+        bg.image.fill(fill);
+        s.layers = {bg};
+    }
+    doc->initialize(s);
+    if (dlg.background() == NewDocumentDialog::Background::Transparent) doc->nextLayerName(); // "Layer 1" is taken
+    doc->setTitle(dlg.name());
+    addDocument(doc);
+}
+
+void MainWindow::openDialog()
+{
+    QSettings s;
+    const QString dir = s.value(QStringLiteral("lastDir"), QStandardPaths::writableLocation(QStandardPaths::PicturesLocation)).toString();
+    const QStringList files = QFileDialog::getOpenFileNames(this, QStringLiteral("Open"), dir, DocumentIO::openFilter());
+    if (files.isEmpty()) return;
+    s.setValue(QStringLiteral("lastDir"), QFileInfo(files.first()).absolutePath());
+    openFiles(files);
+}
+
+void MainWindow::openFiles(const QStringList& paths)
+{
+    for (const QString& path : paths) {
+        // Re-activate a document that is already open.
+        bool found = false;
+        for (int i = 0; i < m_tabs->count(); ++i) {
+            auto* page = static_cast<DocumentPage*>(m_tabs->widget(i));
+            if (QFileInfo(page->document()->filePath()) == QFileInfo(path)) {
+                m_tabs->setCurrentIndex(i);
+                found = true;
+            }
+        }
+        if (found) continue;
+        QString err;
+        Document* doc = DocumentIO::load(path, &err);
+        if (!doc) {
+            alert(QStringLiteral("Could not open “%1” because %2").arg(QFileInfo(path).fileName(), err));
+            continue;
+        }
+        addRecent(path);
+        addDocument(doc);
+    }
+}
+
+bool MainWindow::closeDocument(int index)
+{
+    auto* page = qobject_cast<DocumentPage*>(m_tabs->widget(index));
+    if (!page) return true;
+    Document* doc = page->document();
+    if (doc->isModified()) {
+        m_tabs->setCurrentIndex(index);
+        auto r = QMessageBox::warning(this, QStringLiteral("PhotoSlop"),
+                                      QStringLiteral("Save changes to the PhotoSlop document “%1” before closing?").arg(doc->title()),
+                                      QMessageBox::Yes | QMessageBox::No | QMessageBox::Cancel, QMessageBox::Yes);
+        if (r == QMessageBox::Cancel) return false;
+        if (r == QMessageBox::Yes && !saveDocument(doc, false)) return false;
+    }
+    if (m_tools->activeView() == page->view()) m_tools->setActiveView(nullptr);
+    m_tabs->removeTab(index);
+    m_undoGroup->removeStack(doc->undoStack());
+    // Detach panels before the document goes away.
+    if (m_tabs->count() == 0) onCurrentChanged();
+    page->deleteLater();
+    onCurrentChanged();
+    return true;
+}
+
+bool MainWindow::closeAll()
+{
+    while (m_tabs->count() > 0)
+        if (!closeDocument(m_tabs->count() - 1)) return false;
+    return true;
+}
+
+bool MainWindow::saveDocument(Document* doc, bool saveAs, bool asCopy)
+{
+    if (!doc) return false;
+    QString path = doc->filePath();
+    const bool native = DocumentIO::isNativePath(path);
+    const bool flatOk = !path.isEmpty() && !native && doc->layerCount() == 1;
+    if (!saveAs && !path.isEmpty() && (native || flatOk)) {
+        // fall through with existing path
+    } else {
+        QSettings s;
+        QString dir = s.value(QStringLiteral("lastDir"), QStandardPaths::writableLocation(QStandardPaths::PicturesLocation)).toString();
+        QString base = QFileInfo(doc->title()).completeBaseName();
+        if (base.isEmpty()) base = doc->title();
+        QString selected = QStringLiteral("PhotoSlop (*.pslop)");
+        path = QFileDialog::getSaveFileName(this, asCopy ? QStringLiteral("Save a Copy") : QStringLiteral("Save As"),
+                                            dir + QLatin1Char('/') + base + QStringLiteral(".pslop"), DocumentIO::saveFilter(), &selected);
+        if (path.isEmpty()) return false;
+        if (QFileInfo(path).suffix().isEmpty()) path += QStringLiteral(".pslop");
+        s.setValue(QStringLiteral("lastDir"), QFileInfo(path).absolutePath());
+    }
+
+    QString err;
+    bool ok;
+    if (DocumentIO::isNativePath(path)) {
+        ok = DocumentIO::saveNative(doc, path, &err);
+    } else {
+        const QByteArray fmt = DocumentIO::formatForPath(path);
+        int quality = -1;
+        if (fmt == "jpeg" || fmt == "webp") {
+            // Photoshop's JPEG Options dialog uses a 0–12 quality scale.
+            bool accepted = false;
+            int q = QInputDialog::getInt(this, QStringLiteral("JPEG Options"), QStringLiteral("Quality (0 = Low, 12 = Maximum):"),
+                                         10, 0, 12, 1, &accepted);
+            if (!accepted) return false;
+            quality = q * 100 / 12;
+        }
+        ok = DocumentIO::exportFlat(doc, path, fmt, quality, &err);
+        // Layered documents saved to flat formats are copies; the original stays unsaved.
+        if (ok && doc->layerCount() > 1) asCopy = true;
+    }
+    if (!ok) {
+        alert(QStringLiteral("Could not save “%1” because %2").arg(QFileInfo(path).fileName(), err));
+        return false;
+    }
+    addRecent(path);
+    if (!asCopy) {
+        doc->setFilePath(path);
+        doc->setTitle(QFileInfo(path).fileName());
+        doc->setClean();
+    }
+    updateTabTitles();
+    return true;
+}
+
+void MainWindow::exportAs()
+{
+    Document* doc = currentDoc();
+    if (!doc) return;
+    ExportDialog dlg(doc, this);
+    if (dlg.exec() != QDialog::Accepted) return;
+    QSettings s;
+    const QString dir = s.value(QStringLiteral("lastDir"), QStandardPaths::writableLocation(QStandardPaths::PicturesLocation)).toString();
+    const QString base = QFileInfo(doc->title()).completeBaseName();
+    QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Export"), dir + QLatin1Char('/') + base + QLatin1Char('.') + dlg.extension());
+    if (path.isEmpty()) return;
+    QString err;
+    if (!DocumentIO::exportFlat(doc, path, dlg.format(), dlg.quality(), &err)) alert(err);
+}
+
+void MainWindow::quickExportPng()
+{
+    Document* doc = currentDoc();
+    if (!doc) return;
+    QSettings s;
+    const QString dir = s.value(QStringLiteral("lastDir"), QStandardPaths::writableLocation(QStandardPaths::PicturesLocation)).toString();
+    QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Quick Export as PNG"),
+                                                dir + QLatin1Char('/') + QFileInfo(doc->title()).completeBaseName() + QStringLiteral(".png"),
+                                                QStringLiteral("PNG (*.png)"));
+    if (path.isEmpty()) return;
+    QString err;
+    if (!DocumentIO::exportFlat(doc, path, "png", -1, &err)) alert(err);
+}
+
+void MainWindow::revert()
+{
+    Document* doc = currentDoc();
+    if (!doc || doc->filePath().isEmpty()) return;
+    QString err;
+    std::unique_ptr<Document> fresh(DocumentIO::load(doc->filePath(), &err));
+    if (!fresh) {
+        alert(err);
+        return;
+    }
+    DocState before = doc->state();
+    DocState after = fresh->state();
+    doc->restoreState(after);
+    doc->pushSnapshot(QStringLiteral("Revert"), before);
+}
+
+void MainWindow::addRecent(const QString& path)
+{
+    QSettings s;
+    QStringList files = s.value(QStringLiteral("recentFiles")).toStringList();
+    files.removeAll(path);
+    files.prepend(path);
+    while (files.size() > 20) files.removeLast();
+    s.setValue(QStringLiteral("recentFiles"), files);
+    refreshRecent();
+}
+
+void MainWindow::refreshRecent()
+{
+    QStringList files = QSettings().value(QStringLiteral("recentFiles")).toStringList();
+    m_recentMenu->clear();
+    for (const QString& f : files) {
+        QAction* a = m_recentMenu->addAction(QFileInfo(f).fileName());
+        a->setToolTip(f);
+        connect(a, &QAction::triggered, this, [this, f] { openFiles({f}); });
+    }
+    m_recentMenu->addSeparator();
+    QAction* clear = m_recentMenu->addAction(QStringLiteral("Clear Recent File List"));
+    connect(clear, &QAction::triggered, this, [this] {
+        QSettings().remove(QStringLiteral("recentFiles"));
+        refreshRecent();
+    });
+    clear->setEnabled(!files.isEmpty());
+    m_home->setRecentFiles(files.mid(0, 8));
+}
+
+void MainWindow::onCurrentChanged()
+{
+    DocumentPage* page = currentPage();
+    Document* doc = page ? page->document() : nullptr;
+    CanvasView* view = page ? page->view() : nullptr;
+    m_central->setCurrentWidget(page ? static_cast<QWidget*>(m_tabs) : m_home);
+    m_tools->setActiveView(view);
+    if (doc) m_undoGroup->setActiveStack(doc->undoStack());
+    else m_undoGroup->setActiveStack(nullptr);
+    m_layersPanel->setDocument(doc);
+    m_propertiesPanel->setDocument(doc);
+    m_propertiesPanel->setActionLookup([this](const QString& id) { return action(id); });
+    m_channelsPanel->setDocument(doc);
+    m_historyPanel->setDocument(doc);
+    m_navigatorPanel->setView(view);
+    m_infoPanel->setView(view);
+    if (view) view->updateCursor();
+    updateTabTitles();
+    updateActions();
+    rebuildWindowMenuDocs();
+}
+
+void MainWindow::updateTabTitles()
+{
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        auto* page = static_cast<DocumentPage*>(m_tabs->widget(i));
+        m_tabs->setTabText(i, page->tabTitle());
+        m_tabs->setTabToolTip(i, page->document()->filePath());
+    }
+    rebuildWindowMenuDocs();
+}
+
+void MainWindow::updateActions()
+{
+    Document* doc = currentDoc();
+    for (QAction* a : std::as_const(m_docActions)) a->setEnabled(doc != nullptr);
+    if (!doc) return;
+    const bool sel = doc->hasSelection();
+    const Layer* l = doc->activeLayer();
+    action(QStringLiteral("select.deselect"))->setEnabled(sel);
+    action(QStringLiteral("select.inverse"))->setEnabled(sel);
+    action(QStringLiteral("select.reselect"))->setEnabled(!doc->lastSelection().isNull());
+    action(QStringLiteral("select.feather"))->setEnabled(sel);
+    action(QStringLiteral("image.crop"))->setEnabled(sel);
+    action(QStringLiteral("edit.cut"))->setEnabled(sel);
+    action(QStringLiteral("layer.viaCut"))->setEnabled(sel);
+    action(QStringLiteral("layer.fromBackground"))->setEnabled(l && l->isBackground);
+    action(QStringLiteral("layer.mergeDown"))->setEnabled(doc->activeIndex() > 0);
+    action(QStringLiteral("layer.delete"))->setEnabled(doc->layerCount() > 1);
+    action(QStringLiteral("layer.flatten"))->setEnabled(doc->layerCount() > 1 || (l && !l->isBackground));
+    action(QStringLiteral("file.revert"))->setEnabled(!doc->filePath().isEmpty());
+}
+
+void MainWindow::rebuildWindowMenuDocs()
+{
+    if (!m_windowMenu) return;
+    for (QAction* a : std::as_const(m_windowDocActions)) {
+        m_windowMenu->removeAction(a);
+        a->deleteLater();
+    }
+    m_windowDocActions.clear();
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        auto* page = static_cast<DocumentPage*>(m_tabs->widget(i));
+        QAction* a = m_windowMenu->addAction(page->document()->title());
+        a->setCheckable(true);
+        a->setChecked(i == m_tabs->currentIndex());
+        connect(a, &QAction::triggered, this, [this, page] { m_tabs->setCurrentWidget(page); });
+        m_windowDocActions.append(a);
+    }
+}
+
+// ---------------- Commands ----------------
+
+void MainWindow::alert(const QString& message)
+{
+    QMessageBox box(QMessageBox::Warning, QStringLiteral("PhotoSlop"), message, QMessageBox::Ok, this);
+    box.exec();
+}
+
+void MainWindow::copy(bool merged)
+{
+    Document* doc = currentDoc();
+    if (!doc) return;
+    QString err;
+    QPoint at;
+    QImage img = Ops::copy(doc, merged, &at, &err);
+    if (img.isNull()) {
+        if (!err.isEmpty()) alert(err);
+        return;
+    }
+    m_settingClipboard = true;
+    QApplication::clipboard()->setImage(img.convertToFormat(QImage::Format_ARGB32));
+    m_settingClipboard = false;
+    m_clipPos = at;
+    m_clipSize = img.size();
+    m_clipValid = true;
+}
+
+void MainWindow::cut()
+{
+    Document* doc = currentDoc();
+    if (!doc || !doc->hasSelection()) return;
+    copy(false);
+    if (!m_clipValid) return;
+    QString err;
+    if (!Ops::clear(doc, m_colors->background(), &err) && !err.isEmpty()) alert(err);
+}
+
+void MainWindow::paste(bool inPlace)
+{
+    const QImage img = QApplication::clipboard()->image();
+    if (img.isNull()) return;
+    Document* doc = currentDoc();
+    if (!doc) {
+        Document* d = DocumentIO::fromImage(img, QStringLiteral("Untitled-%1").arg(++m_untitled));
+        addDocument(d);
+        return;
+    }
+    QPoint pos;
+    if (m_clipValid && img.size() == m_clipSize && (inPlace || QRect(m_clipPos, m_clipSize).intersects(doc->bounds()))) {
+        pos = m_clipPos;
+    } else {
+        // Centre on the visible part of the canvas, as Photoshop does.
+        const QRectF vis = currentView()->visibleCanvasRect();
+        const QPointF c = vis.isEmpty() ? QPointF(doc->width() / 2.0, doc->height() / 2.0) : vis.center();
+        pos = QPoint(int(c.x() - img.width() / 2.0), int(c.y() - img.height() / 2.0));
+    }
+    Ops::paste(doc, img, &pos);
+}
+
+void MainWindow::fillDialog()
+{
+    Document* doc = currentDoc();
+    if (!doc) return;
+    FillDialog dlg(m_colors, this);
+    if (dlg.exec() != QDialog::Accepted) return;
+    QString err;
+    if (!Ops::fill(doc, dlg.color(), dlg.mode(), dlg.opacity(), dlg.preserveTransparency(), &err)) alert(err);
+}
+
+void MainWindow::quickFill(bool background, bool preserve)
+{
+    Document* doc = currentDoc();
+    if (!doc) return;
+    QString err;
+    if (!Ops::fill(doc, background ? m_colors->background() : m_colors->foreground(), BlendMode::Normal, 1.f, preserve, &err))
+        alert(err);
+}
+
+void MainWindow::clearOrDelete()
+{
+    Document* doc = currentDoc();
+    if (!doc) return;
+    QString err;
+    if (doc->hasSelection()) {
+        if (!Ops::clear(doc, m_colors->background(), &err) && !err.isEmpty()) alert(err);
+    } else if (doc->activeLayer() && !doc->activeLayer()->isBackground) {
+        if (!Ops::deleteLayer(doc, &err)) alert(err);
+    }
+}
+
+void MainWindow::newLayerDialog()
+{
+    Document* doc = currentDoc();
+    if (!doc) return;
+    // Preview the next free name without consuming it if the dialog is cancelled.
+    QString name;
+    for (int n = 1;; ++n) {
+        name = QStringLiteral("Layer %1").arg(n);
+        bool taken = false;
+        for (const Layer& l : doc->layers())
+            if (l.name == name) taken = true;
+        if (!taken) break;
+    }
+    NewLayerDialog dlg(name, this);
+    if (dlg.exec() != QDialog::Accepted) return;
+    Ops::newLayer(doc, dlg.name(), dlg.mode(), dlg.opacity());
+}
+
+void MainWindow::duplicateLayerDialog()
+{
+    Document* doc = currentDoc();
+    if (!doc || !doc->activeLayer()) return;
+    bool ok = false;
+    const QString n = QInputDialog::getText(this, QStringLiteral("Duplicate Layer"), QStringLiteral("As:"), QLineEdit::Normal,
+                                            doc->activeLayer()->name + QStringLiteral(" copy"), &ok);
+    if (ok) Ops::duplicateLayer(doc, n);
+}
+
+void MainWindow::layerFromBackground()
+{
+    Document* doc = currentDoc();
+    if (!doc || !doc->activeLayer() || !doc->activeLayer()->isBackground) return;
+    NewLayerDialog dlg(QStringLiteral("Layer 0"), this);
+    if (dlg.exec() != QDialog::Accepted) return;
+    const int idx = doc->activeIndex();
+    doc->modify(QStringLiteral("Layer From Background"), [&] {
+        Layer& l = doc->layerRef(idx);
+        l.isBackground = false;
+        l.name = dlg.name();
+        l.mode = dlg.mode();
+        l.opacity = dlg.opacity();
+    });
+}
+
+void MainWindow::imageSizeDialog()
+{
+    Document* doc = currentDoc();
+    if (!doc) return;
+    ImageSizeDialog dlg(doc, this);
+    if (dlg.exec() != QDialog::Accepted) return;
+    Ops::imageSize(doc, dlg.newSize(), dlg.resolution(), dlg.method());
+    if (CanvasView* v = currentView()) v->fitOnScreen();
+}
+
+void MainWindow::canvasSizeDialog()
+{
+    Document* doc = currentDoc();
+    if (!doc) return;
+    CanvasSizeDialog dlg(doc, m_colors, this);
+    if (dlg.exec() != QDialog::Accepted) return;
+    const QSize n = dlg.newSize();
+    if (n.width() < doc->width() || n.height() < doc->height()) {
+        if (QMessageBox::warning(this, QStringLiteral("PhotoSlop"),
+                                 QStringLiteral("The new canvas size is smaller than the current canvas size; some clipping will occur."),
+                                 QMessageBox::Ok | QMessageBox::Cancel) != QMessageBox::Ok)
+            return;
+    }
+    Ops::canvasSize(doc, n, dlg.anchorOffset(), dlg.extensionColor());
+}
+
+void MainWindow::featherDialog()
+{
+    Document* doc = currentDoc();
+    if (!doc || !doc->hasSelection()) return;
+    bool ok = false;
+    const double r = QInputDialog::getDouble(this, QStringLiteral("Feather Selection"), QStringLiteral("Feather Radius (pixels):"),
+                                             5.0, 0.1, 1000.0, 1, &ok);
+    if (!ok) return;
+    QImage mask = doc->selection().copy();
+    Sel::feather(mask, r);
+    doc->changeSelection(Sel::isEmpty(mask) ? QImage() : mask, QStringLiteral("Feather"));
+}
+
+void MainWindow::applyPixelFilter(const QString& name, const std::function<QRgb(QRgb)>& fn)
+{
+    Document* doc = currentDoc();
+    if (!doc || !doc->activeLayer()) return;
+    const Layer* l = doc->activeLayer();
+    if (l->pixelsLocked()) {
+        alert(QStringLiteral("Could not complete the %1 command because the layer is locked.").arg(name));
+        return;
+    }
+    QRect r = (doc->hasSelection() ? doc->selectionBounds() : doc->bounds()) & l->rect();
+    if (r.isEmpty()) return;
+    PixelEdit edit(doc, doc->activeIndex(), QRect());
+    Layer& layer = edit.layer();
+    const QImage& sel = doc->selection();
+    for (int y = r.top(); y <= r.bottom(); ++y) {
+        auto* row = reinterpret_cast<QRgb*>(layer.image.scanLine(y - layer.offset.y())) + (r.left() - layer.offset.x());
+        const uchar* m = sel.isNull() ? nullptr : sel.constScanLine(y) + r.left();
+        for (int i = 0; i < r.width(); ++i) {
+            if (!qAlpha(row[i]) || (m && !m[i])) continue;
+            const QRgb src = row[i];
+            QRgb out = qPremultiply(fn(qUnpremultiply(src)));
+            if (m && m[i] != 255) {
+                // Blend by selection coverage.
+                out = Blend::byteMul(out, m[i]) + Blend::byteMul(src, 255 - m[i]);
+            }
+            row[i] = out;
+        }
+    }
+    edit.markDirty(r);
+    edit.commit(name);
+}
+
+void MainWindow::showShortcuts()
+{
+    QDialog dlg(this);
+    dlg.setWindowTitle(QStringLiteral("Keyboard Shortcuts"));
+    dlg.resize(620, 640);
+    auto* lay = new QVBoxLayout(&dlg);
+    auto* table = new QTableWidget(&dlg);
+    table->setColumnCount(2);
+    table->setHorizontalHeaderLabels({QStringLiteral("Application Menu Command"), QStringLiteral("Shortcut")});
+    table->horizontalHeader()->setStretchLastSection(true);
+    table->setColumnWidth(0, 360);
+    table->verticalHeader()->hide();
+    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    std::function<void(QMenu*, const QString&)> walk = [&](QMenu* menu, const QString& prefix) {
+        for (QAction* a : menu->actions()) {
+            if (a->isSeparator()) continue;
+            QString text = a->text().section(QLatin1Char('\t'), 0, 0);
+            text.remove(QLatin1Char('&'));
+            if (a->menu()) {
+                walk(a->menu(), prefix + text + QStringLiteral(" > "));
+                continue;
+            }
+            QString key = a->shortcut().toString(QKeySequence::NativeText);
+            if (key.isEmpty()) key = a->text().section(QLatin1Char('\t'), 1);
+            const int row = table->rowCount();
+            table->insertRow(row);
+            table->setItem(row, 0, new QTableWidgetItem(prefix + text));
+            table->setItem(row, 1, new QTableWidgetItem(key));
+        }
+    };
+    for (QAction* a : menuBar()->actions())
+        if (a->menu()) {
+            QString t = a->text();
+            t.remove(QLatin1Char('&'));
+            walk(a->menu(), t + QStringLiteral(" > "));
+        }
+    const QStringList hidden = {QStringLiteral("color.default"), QStringLiteral("color.swap"), QStringLiteral("brush.smaller"),
+                                QStringLiteral("brush.larger"), QStringLiteral("brush.softer"), QStringLiteral("brush.harder"),
+                                QStringLiteral("edit.fillForeground"), QStringLiteral("edit.fillBackground"),
+                                QStringLiteral("view.screenCycle"), QStringLiteral("layer.newQuick")};
+    for (const QString& id : hidden) {
+        QAction* a = action(id);
+        const int row = table->rowCount();
+        table->insertRow(row);
+        table->setItem(row, 0, new QTableWidgetItem(QStringLiteral("Tools > ") + a->text()));
+        table->setItem(row, 1, new QTableWidgetItem(a->shortcut().toString(QKeySequence::NativeText)));
+    }
+    for (const auto& grp : m_tools->groups()) {
+        for (Tool* t : grp.tools) {
+            const int row = table->rowCount();
+            table->insertRow(row);
+            table->setItem(row, 0, new QTableWidgetItem(QStringLiteral("Tools > ") + t->name()));
+            table->setItem(row, 1, new QTableWidgetItem(QString(t->shortcut())));
+        }
+    }
+    lay->addWidget(table);
+    auto* box = new QDialogButtonBox(QDialogButtonBox::Ok, &dlg);
+    connect(box, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    lay->addWidget(box);
+    dlg.exec();
+}
+
+void MainWindow::showAbout()
+{
+    QDialog dlg(this);
+    dlg.setWindowTitle(QStringLiteral("About PhotoSlop"));
+    auto* lay = new QVBoxLayout(&dlg);
+    auto* logo = new QLabel(&dlg);
+    logo->setPixmap(logoPixmap(240, devicePixelRatioF()));
+    logo->setAlignment(Qt::AlignCenter);
+    logo->setStyleSheet(QStringLiteral("background: white; border-radius: 10px; padding: 16px;"));
+    lay->addWidget(logo);
+    auto* text = new QLabel(QStringLiteral("<p align=center><b>PhotoSlop %1</b><br><i>%2</i><br><br>"
+                                           "Built with Qt %3. Not affiliated with Adobe.</p>")
+                                .arg(QApplication::applicationVersion(), kSlogan, QString::fromLatin1(qVersion())),
+                            &dlg);
+    text->setAlignment(Qt::AlignCenter);
+    lay->addWidget(text);
+    auto* box = new QDialogButtonBox(QDialogButtonBox::Ok, &dlg);
+    connect(box, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    lay->addWidget(box);
+    dlg.exec();
+}
+
+void MainWindow::toggleAllPanels(bool docksOnly)
+{
+    if (!m_panelsHidden) {
+        m_hiddenByTab.clear();
+        QList<QWidget*> candidates;
+        for (QDockWidget* d : findChildren<QDockWidget*>()) candidates << d;
+        if (!docksOnly) candidates << m_toolsBar << m_optionsBar;
+        for (QWidget* w : candidates) {
+            if (w->isVisible() && !(qobject_cast<QDockWidget*>(w) && static_cast<QDockWidget*>(w)->isFloating() && docksOnly)) {
+                m_hiddenByTab << w;
+                w->hide();
+            }
+        }
+        m_strip->hideFlyout();
+        m_panelsHidden = true;
+    } else {
+        for (QWidget* w : std::as_const(m_hiddenByTab)) w->show();
+        m_hiddenByTab.clear();
+        m_panelsHidden = false;
+    }
+}
+
+void MainWindow::setScreenMode(int mode)
+{
+    if (mode == m_screenMode) return;
+    if (m_screenMode == 0) m_wasMaximized = isMaximized();
+    if (m_screenMode == 2) {
+        menuBar()->show();
+        if (m_panelsHidden) toggleAllPanels(false);
+    }
+    m_screenMode = mode;
+    switch (mode) {
+    case 0:
+        if (m_wasMaximized) showMaximized();
+        else showNormal();
+        break;
+    case 1:
+        showFullScreen();
+        break;
+    case 2:
+        showFullScreen();
+        if (!m_panelsHidden) toggleAllPanels(false);
+#ifndef Q_OS_MACOS
+        menuBar()->hide();
+#endif
+        break;
+    }
+}
+
+void MainWindow::cycleScreenMode() { setScreenMode((m_screenMode + 1) % 3); }
+
+void MainWindow::handleDigit(int digit)
+{
+    // Typing "4" sets 40%, "0" 100%, and two quick digits ("45") set 45% — like Photoshop.
+    int value;
+    if (m_pendingDigit >= 0 && m_digitTimer.isValid() && m_digitTimer.elapsed() < 600) {
+        value = m_pendingDigit * 10 + digit;
+        if (value == 0) value = 100;
+        m_pendingDigit = -1;
+    } else {
+        value = digit == 0 ? 100 : digit * 10;
+        m_pendingDigit = digit;
+        m_digitTimer.start();
+    }
+    Tool* t = m_tools->current();
+    if (t && t->setOpacityPercent(value)) return;
+    Document* doc = currentDoc();
+    if (doc && doc->activeLayer() && !doc->activeLayer()->isBackground) Ops::setOpacity(doc, doc->activeIndex(), value / 100.f);
+}
+
+bool MainWindow::isTypingTarget() const
+{
+    QWidget* f = QApplication::focusWidget();
+    if (!f) return false;
+    if (qobject_cast<QLineEdit*>(f) || qobject_cast<QAbstractSpinBox*>(f) || qobject_cast<QTextEdit*>(f)
+        || qobject_cast<QPlainTextEdit*>(f))
+        return true;
+    if (auto* cb = qobject_cast<QComboBox*>(f); cb && cb->isEditable()) return true;
+    return false;
+}
+
+bool MainWindow::eventFilter(QObject* obj, QEvent* e)
+{
+    if (e->type() != QEvent::KeyPress && e->type() != QEvent::KeyRelease) return QMainWindow::eventFilter(obj, e);
+    if (QApplication::activeModalWidget() || QApplication::activePopupWidget() || !isActiveWindow() || isTypingTarget())
+        return QMainWindow::eventFilter(obj, e);
+    auto* ke = static_cast<QKeyEvent*>(e);
+    const bool press = e->type() == QEvent::KeyPress;
+    const Qt::KeyboardModifiers mods = ke->modifiers() & ~Qt::KeypadModifier;
+    Tool* cur = m_tools->current();
+    const QString curId = cur ? cur->id() : QString();
+
+    switch (ke->key()) {
+    case Qt::Key_Space:
+        // Hold Space for the Hand tool.
+        if (press && !ke->isAutoRepeat() && !m_tools->hasTemporary() && currentView()) {
+            m_tools->pushTemporary(QStringLiteral("hand"));
+            m_tempFromKey = m_tools->hasTemporary();
+        } else if (!press && !ke->isAutoRepeat() && m_tempFromKey && curId == QLatin1String("hand")) {
+            m_tools->popTemporary();
+            m_tempFromKey = false;
+        }
+        return true;
+    case Qt::Key_Alt:
+        // Hold Alt/Option with painting tools for the Eyedropper.
+        if (press && !ke->isAutoRepeat() && !m_tools->hasTemporary()
+            && (curId == QLatin1String("brush") || curId == QLatin1String("pencil") || curId == QLatin1String("gradient")
+                || curId == QLatin1String("bucket"))) {
+            m_tools->pushTemporary(QStringLiteral("eyedropper"));
+            m_tempFromKey = m_tools->hasTemporary();
+        } else if (!press && m_tempFromKey && curId == QLatin1String("eyedropper")) {
+            m_tools->popTemporary();
+            m_tempFromKey = false;
+        }
+        if (CanvasView* v = currentView()) v->updateCursor();
+        break;
+    case Qt::Key_Control:
+        // Hold Ctrl/Cmd for the Move tool.
+        if (press && !ke->isAutoRepeat() && !m_tools->hasTemporary()
+            && !(curId == QLatin1String("move") || curId == QLatin1String("hand") || curId == QLatin1String("zoom")
+                 || curId == QLatin1String("crop"))) {
+            m_tools->pushTemporary(QStringLiteral("move"));
+            m_tempFromKey = m_tools->hasTemporary();
+        } else if (!press && m_tempFromKey && curId == QLatin1String("move")) {
+            m_tools->popTemporary();
+            m_tempFromKey = false;
+        }
+        break;
+    case Qt::Key_Tab:
+    case Qt::Key_Backtab:
+        if (press && !(mods & (Qt::ControlModifier | Qt::AltModifier))) {
+            toggleAllPanels(ke->key() == Qt::Key_Backtab || (mods & Qt::ShiftModifier));
+            return true;
+        }
+        break;
+    case Qt::Key_Return:
+    case Qt::Key_Enter:
+    case Qt::Key_Escape:
+        if (press && cur && currentView()) {
+            const bool handled = ke->key() == Qt::Key_Escape ? cur->cancel(currentView()) : cur->commit(currentView());
+            if (handled) return true;
+        }
+        break;
+    default:
+        if (press && ke->key() >= Qt::Key_0 && ke->key() <= Qt::Key_9 && mods == Qt::NoModifier && currentDoc()) {
+            handleDigit(ke->key() - Qt::Key_0);
+            return true;
+        }
+        break;
+    }
+    return QMainWindow::eventFilter(obj, e);
+}
+
+void MainWindow::dragEnterEvent(QDragEnterEvent* e)
+{
+    if (e->mimeData()->hasUrls() || e->mimeData()->hasImage()) e->acceptProposedAction();
+}
+
+void MainWindow::dropEvent(QDropEvent* e)
+{
+    QStringList files;
+    for (const QUrl& u : e->mimeData()->urls())
+        if (u.isLocalFile()) files << u.toLocalFile();
+    if (!files.isEmpty()) {
+        openFiles(files);
+    } else if (e->mimeData()->hasImage()) {
+        QImage img = qvariant_cast<QImage>(e->mimeData()->imageData());
+        if (Document* doc = currentDoc()) Ops::paste(doc, img);
+        else addDocument(DocumentIO::fromImage(img, QStringLiteral("Untitled-%1").arg(++m_untitled)));
+    }
+    e->acceptProposedAction();
+}
+
+void MainWindow::closeEvent(QCloseEvent* e)
+{
+    if (!closeAll()) {
+        e->ignore();
+        return;
+    }
+    if (m_screenMode != 0) setScreenMode(0);
+    QSettings s;
+    s.setValue(QStringLiteral("geometry"), saveGeometry());
+    s.setValue(QStringLiteral("windowState"), saveState(kStateVersion));
+    e->accept();
+}
