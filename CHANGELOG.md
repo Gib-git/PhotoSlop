@@ -6,6 +6,8 @@ The current version is in the `VERSION` file. To release, add notes under **Unre
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-07
+
 Stage 3: adjustments and filters.
 
 ### Added
