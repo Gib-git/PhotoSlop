@@ -10,6 +10,17 @@ PhotoSlop is a cross-platform raster image editor for macOS, Linux and Windows. 
 
 It is written in C++20 with Qt 6 (Widgets). PhotoSlop is not affiliated with Adobe. All icons and artwork are original.
 
+![The PhotoSlop workspace with a layered document and an elliptical selection](docs/screenshots/workspace.png)
+
+## Screenshots
+
+| | |
+|---|---|
+| ![Home screen](docs/screenshots/home.png) | ![Free Transform with rulers and guides](docs/screenshots/free-transform.png) |
+| **Home screen** with New file, Open and recent files | **Free Transform**: rotate and scale a layer, with rulers, guides and exact values in the options bar |
+| ![Warp](docs/screenshots/warp.png) | ![Quick Mask](docs/screenshots/quick-mask.png) |
+| **Warp** bends a layer with a 4 × 4 control grid | **Quick Mask** shows the selection as a red overlay you can paint on |
+
 ## Status: Stage 2 (selections and transforms)
 
 | Area | What works |
@@ -106,6 +117,7 @@ src/io/       File loading and saving (.pslop and flat image formats)
 src/tools/    One class per tool, plus the ToolManager (groups, shortcuts, temporary tools)
 src/ui/       Main window, canvas view, rulers, view options, toolbox, panels and dialogs
 resources/    Original SVG icons and the logo
+docs/         README screenshots
 tests/        Core unit tests and GUI tests
 ```
 
