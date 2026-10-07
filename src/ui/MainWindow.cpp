@@ -18,6 +18,7 @@
 #include "ui/DocumentPage.h"
 #include "ui/ToolBox.h"
 #include "ui/Workspace.h"
+#include "ui/dialogs/AdjustmentDialogs.h"
 #include "ui/dialogs/ColorPickerDialog.h"
 #include "ui/dialogs/Dialogs.h"
 #include "ui/panels/LayersPanel.h"
@@ -40,6 +41,7 @@
 #include <QMessageBox>
 #include <QMimeData>
 #include <QPlainTextEdit>
+#include <QRandomGenerator>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QStackedWidget>
@@ -405,7 +407,7 @@ void MainWindow::createMenus()
         }
     }));
     edit->addSeparator();
-    stub(edit, QStringLiteral("Fade..."), QKeySequence(QStringLiteral("Ctrl+Shift+F")));
+    edit->addAction(makeAction(QStringLiteral("edit.fade"), QStringLiteral("Fade..."), keys({"Ctrl+Shift+F"}), [this] { fadeDialog(); }));
     edit->addSeparator();
     edit->addAction(makeAction(QStringLiteral("edit.cut"), QStringLiteral("Cu&t"), keys({"Ctrl+X"}), [this] { cut(); }));
     edit->addAction(makeAction(QStringLiteral("edit.copy"), QStringLiteral("&Copy"), keys({"Ctrl+C"}), [this] { copy(false); }));
@@ -511,24 +513,76 @@ void MainWindow::createMenus()
     stub(mode, QStringLiteral("32 Bits/Channel"));
     image->addSeparator();
     QMenu* adj = image->addMenu(QStringLiteral("Adjustments"));
-    stub(adj, QStringLiteral("Brightness/Contrast..."));
-    stub(adj, QStringLiteral("Levels..."), QKeySequence(QStringLiteral("Ctrl+L")));
-    stub(adj, QStringLiteral("Curves..."), QKeySequence(QStringLiteral("Ctrl+M")));
+    // Holding Alt (Option) opens Levels, Curves, Hue/Saturation and Color Balance with the last settings.
+    auto altHeld = [] { return bool(QApplication::keyboardModifiers() & Qt::AltModifier); };
+    adj->addAction(makeAction(QStringLiteral("image.brightnessContrast"), QStringLiteral("Brightness/Contrast..."), {}, [this] {
+        paramDialog(QStringLiteral("Brightness/Contrast"), false, false, [](ParamDialog& d) {
+            d.addSlider(QStringLiteral("brightness"), QStringLiteral("Brightness:"), -150, 150, 0);
+            d.addSlider(QStringLiteral("contrast"), QStringLiteral("Contrast:"), -50, 100, 0);
+            d.addCheck(QStringLiteral("legacy"), QStringLiteral("Use Legacy"), false);
+        }, [](const QHash<QString, double>& v) {
+            return Adjust::spec(QStringLiteral("Brightness/Contrast"),
+                                Adjust::brightnessContrastMap(int(v[QStringLiteral("brightness")]), int(v[QStringLiteral("contrast")]),
+                                                              v[QStringLiteral("legacy")] != 0));
+        });
+    }));
+    adj->addAction(makeAction(QStringLiteral("image.levels"), QStringLiteral("Levels..."), keys({"Ctrl+L", "Ctrl+Alt+L"}), [this, altHeld] {
+        LevelsDialog dlg(currentDoc(), altHeld(), this);
+        execPreview(dlg);
+    }));
+    adj->addAction(makeAction(QStringLiteral("image.curves"), QStringLiteral("Curves..."), keys({"Ctrl+M", "Ctrl+Alt+M"}), [this, altHeld] {
+        CurvesDialog dlg(currentDoc(), altHeld(), this);
+        execPreview(dlg);
+    }));
     stub(adj, QStringLiteral("Exposure..."));
     adj->addSeparator();
     stub(adj, QStringLiteral("Vibrance..."));
-    stub(adj, QStringLiteral("Hue/Saturation..."), QKeySequence(QStringLiteral("Ctrl+U")));
-    stub(adj, QStringLiteral("Color Balance..."), QKeySequence(QStringLiteral("Ctrl+B")));
-    stub(adj, QStringLiteral("Black && White..."), QKeySequence(QStringLiteral("Ctrl+Alt+Shift+B")));
+    adj->addAction(makeAction(QStringLiteral("image.hueSaturation"), QStringLiteral("Hue/Saturation..."), keys({"Ctrl+U", "Ctrl+Alt+U"}),
+                              [this, altHeld] {
+        HueSaturationDialog dlg(currentDoc(), altHeld(), this);
+        execPreview(dlg);
+    }));
+    adj->addAction(makeAction(QStringLiteral("image.colorBalance"), QStringLiteral("Color Balance..."), keys({"Ctrl+B", "Ctrl+Alt+B"}),
+                              [this, altHeld] {
+        ColorBalanceDialog dlg(currentDoc(), altHeld(), this);
+        execPreview(dlg);
+    }));
+    adj->addAction(makeAction(QStringLiteral("image.blackWhite"), QStringLiteral("Black && White..."), keys({"Ctrl+Alt+Shift+B"}), [this] {
+        paramDialog(QStringLiteral("Black and White"), false, false, [](ParamDialog& d) {
+            const Adjust::BlackWhite def;
+            const char* names[6] = {"Reds:", "Yellows:", "Greens:", "Cyans:", "Blues:", "Magentas:"};
+            for (int i = 0; i < 6; ++i)
+                d.addSlider(QStringLiteral("w%1").arg(i), QString::fromLatin1(names[i]), -200, 300, def.weights[i], 0, QStringLiteral("%"));
+            d.addCheck(QStringLiteral("tint"), QStringLiteral("Tint"), false);
+            d.addSlider(QStringLiteral("hue"), QStringLiteral("Hue:"), 0, 360, def.tintHue, 0, QStringLiteral("°"));
+            d.addSlider(QStringLiteral("saturation"), QStringLiteral("Saturation:"), 0, 100, def.tintSaturation, 0, QStringLiteral("%"));
+        }, [](const QHash<QString, double>& v) {
+            Adjust::BlackWhite bw;
+            for (int i = 0; i < 6; ++i) bw.weights[i] = int(v[QStringLiteral("w%1").arg(i)]);
+            bw.tint = v[QStringLiteral("tint")] != 0;
+            bw.tintHue = int(v[QStringLiteral("hue")]);
+            bw.tintSaturation = int(v[QStringLiteral("saturation")]);
+            return Adjust::spec(QStringLiteral("Black & White"), Adjust::blackWhiteMap(bw));
+        });
+    }));
     stub(adj, QStringLiteral("Photo Filter..."));
     stub(adj, QStringLiteral("Channel Mixer..."));
     stub(adj, QStringLiteral("Color Lookup..."));
     adj->addSeparator();
     adj->addAction(makeAction(QStringLiteral("image.invert"), QStringLiteral("Invert"), keys({"Ctrl+I"}), [this] {
-        applyPixelFilter(QStringLiteral("Invert"), [](QRgb c) { return qRgba(255 - qRed(c), 255 - qGreen(c), 255 - qBlue(c), qAlpha(c)); });
+        applySpec(Adjust::spec(QStringLiteral("Invert"), Adjust::invertMap()));
     }));
-    stub(adj, QStringLiteral("Posterize..."));
-    stub(adj, QStringLiteral("Threshold..."));
+    adj->addAction(makeAction(QStringLiteral("image.posterize"), QStringLiteral("Posterize..."), {}, [this] {
+        paramDialog(QStringLiteral("Posterize"), false, false, [](ParamDialog& d) {
+            d.addSlider(QStringLiteral("levels"), QStringLiteral("Levels:"), 2, 255, 4, 0, QString(), 64);
+        }, [](const QHash<QString, double>& v) {
+            return Adjust::spec(QStringLiteral("Posterize"), Adjust::posterizeMap(int(v[QStringLiteral("levels")])));
+        });
+    }));
+    adj->addAction(makeAction(QStringLiteral("image.threshold"), QStringLiteral("Threshold..."), {}, [this] {
+        ThresholdDialog dlg(currentDoc(), this);
+        execPreview(dlg);
+    }));
     stub(adj, QStringLiteral("Gradient Map..."));
     stub(adj, QStringLiteral("Selective Color..."));
     adj->addSeparator();
@@ -536,19 +590,18 @@ void MainWindow::createMenus()
     stub(adj, QStringLiteral("HDR Toning..."));
     adj->addSeparator();
     adj->addAction(makeAction(QStringLiteral("image.desaturate"), QStringLiteral("Desaturate"), keys({"Ctrl+Shift+U"}), [this] {
-        applyPixelFilter(QStringLiteral("Desaturate"), [](QRgb c) {
-            // Photoshop's Desaturate uses the average of the max and min channel.
-            const int l = (std::max({qRed(c), qGreen(c), qBlue(c)}) + std::min({qRed(c), qGreen(c), qBlue(c)})) / 2;
-            return qRgba(l, l, l, qAlpha(c));
-        });
+        applySpec(Adjust::spec(QStringLiteral("Desaturate"), Adjust::desaturateMap()));
     }));
     stub(adj, QStringLiteral("Match Color..."));
     stub(adj, QStringLiteral("Replace Color..."));
     stub(adj, QStringLiteral("Equalize"));
     image->addSeparator();
-    stub(image, QStringLiteral("Auto Tone"), QKeySequence(QStringLiteral("Ctrl+Shift+L")));
-    stub(image, QStringLiteral("Auto Contrast"), QKeySequence(QStringLiteral("Ctrl+Alt+Shift+L")));
-    stub(image, QStringLiteral("Auto Color"), QKeySequence(QStringLiteral("Ctrl+Shift+B")));
+    image->addAction(makeAction(QStringLiteral("image.autoTone"), QStringLiteral("Auto Tone"), keys({"Ctrl+Shift+L"}),
+                                [this] { autoAdjust(Adjust::AutoMode::Tone, QStringLiteral("Auto Tone")); }));
+    image->addAction(makeAction(QStringLiteral("image.autoContrast"), QStringLiteral("Auto Contrast"), keys({"Ctrl+Alt+Shift+L"}),
+                                [this] { autoAdjust(Adjust::AutoMode::Contrast, QStringLiteral("Auto Contrast")); }));
+    image->addAction(makeAction(QStringLiteral("image.autoColor"), QStringLiteral("Auto Color"), keys({"Ctrl+Shift+B"}),
+                                [this] { autoAdjust(Adjust::AutoMode::Color, QStringLiteral("Auto Color")); }));
     image->addSeparator();
     image->addAction(makeAction(QStringLiteral("image.imageSize"), QStringLiteral("Image Size..."), keys({"Ctrl+Alt+I"}), [this] { imageSizeDialog(); }));
     image->addAction(makeAction(QStringLiteral("image.canvasSize"), QStringLiteral("Canvas Size..."), keys({"Ctrl+Alt+C"}), [this] { canvasSizeDialog(); }));
@@ -754,7 +807,9 @@ void MainWindow::createMenus()
 
     // ---------------- Filter ----------------
     QMenu* filter = mb->addMenu(QStringLiteral("Fil&ter"));
-    stub(filter, QStringLiteral("Last Filter"), QKeySequence(QStringLiteral("Ctrl+Alt+F")));
+    filter->addAction(makeAction(QStringLiteral("filter.last"), QStringLiteral("Last Filter"), keys({"Ctrl+Alt+F"}), [this] {
+        if (m_lastFilter) applySpec(m_lastFilter(), m_lastFilter);
+    }));
     filter->addSeparator();
     stub(filter, QStringLiteral("Convert for Smart Filters"));
     filter->addSeparator();
@@ -793,9 +848,83 @@ void MainWindow::createMenus()
         {QStringLiteral("Other"), {QStringLiteral("Custom..."), QStringLiteral("High Pass..."), QStringLiteral("HSB/HSL"),
                                    QStringLiteral("Maximum..."), QStringLiteral("Minimum..."), QStringLiteral("Offset...")}},
     };
+    // Implemented filters: fixed ones apply at once, the others open a dialog.
+    auto fixedFilter = [this](Filters::Spec (*make)()) { return [this, make] { applySpec(make(), make); }; };
+    auto radiusSlider = [](ParamDialog& d, double def) {
+        d.addSlider(QStringLiteral("radius"), QStringLiteral("Radius:"), 0.1, 1000, def, 1, QStringLiteral("Pixels"), 250);
+    };
+    using Values = QHash<QString, double>;
+    const QHash<QString, std::function<void()>> filterActions = {
+        {QStringLiteral("Blur"), fixedFilter(&Filters::blurSpec)},
+        {QStringLiteral("Blur More"), fixedFilter(&Filters::blurMoreSpec)},
+        {QStringLiteral("Box Blur..."), [this] {
+             paramDialog(QStringLiteral("Box Blur"), true, true, [](ParamDialog& d) {
+                 d.addSlider(QStringLiteral("radius"), QStringLiteral("Radius:"), 1, 2000, 5, 0, QStringLiteral("Pixels"), 250);
+             }, [](const Values& v) { return Filters::boxBlurSpec(int(v[QStringLiteral("radius")])); });
+         }},
+        {QStringLiteral("Gaussian Blur..."), [this, radiusSlider] {
+             paramDialog(QStringLiteral("Gaussian Blur"), true, true, [radiusSlider](ParamDialog& d) { radiusSlider(d, 1.0); },
+                         [](const Values& v) { return Filters::gaussianBlurSpec(v[QStringLiteral("radius")]); });
+         }},
+        {QStringLiteral("Motion Blur..."), [this] {
+             paramDialog(QStringLiteral("Motion Blur"), true, true, [](ParamDialog& d) {
+                 d.addSlider(QStringLiteral("angle"), QStringLiteral("Angle:"), -360, 360, 0, 0, QStringLiteral("°"));
+                 d.addSlider(QStringLiteral("distance"), QStringLiteral("Distance:"), 1, 2000, 10, 0, QStringLiteral("Pixels"), 500);
+             }, [](const Values& v) {
+                 return Filters::motionBlurSpec(v[QStringLiteral("angle")], int(v[QStringLiteral("distance")]));
+             });
+         }},
+        {QStringLiteral("Add Noise..."), [this] {
+             paramDialog(QStringLiteral("Add Noise"), false, true, [](ParamDialog& d) {
+                 d.addSlider(QStringLiteral("amount"), QStringLiteral("Amount:"), 0.1, 400, 12.5, 1, QStringLiteral("%"), 100);
+                 d.addChoice(QStringLiteral("gaussian"), QStringLiteral("Distribution"), {QStringLiteral("Uniform"), QStringLiteral("Gaussian")}, 0);
+                 d.addCheck(QStringLiteral("mono"), QStringLiteral("Monochromatic"), false);
+                 // One noise pattern per dialog, so the preview matches the result.
+                 d.addHidden(QStringLiteral("seed"), QRandomGenerator::global()->generate());
+             }, [](const Values& v) {
+                 return Filters::addNoiseSpec(v[QStringLiteral("amount")], v[QStringLiteral("gaussian")] != 0,
+                                              v[QStringLiteral("mono")] != 0, quint32(v[QStringLiteral("seed")]));
+             });
+         }},
+        {QStringLiteral("Median..."), [this] {
+             paramDialog(QStringLiteral("Median"), true, true, [](ParamDialog& d) {
+                 d.addSlider(QStringLiteral("radius"), QStringLiteral("Radius:"), 1, 500, 1, 0, QStringLiteral("Pixels"), 100);
+             }, [](const Values& v) { return Filters::medianSpec(int(v[QStringLiteral("radius")])); });
+         }},
+        {QStringLiteral("Mosaic..."), [this] {
+             paramDialog(QStringLiteral("Mosaic"), true, true, [](ParamDialog& d) {
+                 d.addSlider(QStringLiteral("cell"), QStringLiteral("Cell Size:"), 2, 200, 10, 0, QStringLiteral("square"));
+             }, [](const Values& v) { return Filters::mosaicSpec(int(v[QStringLiteral("cell")])); });
+         }},
+        {QStringLiteral("Sharpen"), fixedFilter(&Filters::sharpenSpec)},
+        {QStringLiteral("Sharpen More"), fixedFilter(&Filters::sharpenMoreSpec)},
+        {QStringLiteral("Unsharp Mask..."), [this] {
+             paramDialog(QStringLiteral("Unsharp Mask"), false, true, [](ParamDialog& d) {
+                 d.addSlider(QStringLiteral("amount"), QStringLiteral("Amount:"), 1, 500, 100, 0, QStringLiteral("%"));
+                 d.addSlider(QStringLiteral("radius"), QStringLiteral("Radius:"), 0.1, 1000, 1.0, 1, QStringLiteral("Pixels"), 250);
+                 d.addSlider(QStringLiteral("threshold"), QStringLiteral("Threshold:"), 0, 255, 0, 0, QStringLiteral("levels"));
+             }, [](const Values& v) {
+                 return Filters::unsharpMaskSpec(v[QStringLiteral("amount")], v[QStringLiteral("radius")], int(v[QStringLiteral("threshold")]));
+             });
+         }},
+        {QStringLiteral("High Pass..."), [this, radiusSlider] {
+             paramDialog(QStringLiteral("High Pass"), false, true, [radiusSlider](ParamDialog& d) { radiusSlider(d, 10.0); },
+                         [](const Values& v) { return Filters::highPassSpec(v[QStringLiteral("radius")]); });
+         }},
+    };
     for (const auto& [groupName, items] : filterGroups) {
         QMenu* sub = filter->addMenu(groupName);
-        for (const QString& item : items) stub(sub, item);
+        for (const QString& item : items) {
+            const auto it = filterActions.constFind(item);
+            if (it == filterActions.constEnd()) {
+                stub(sub, item);
+                continue;
+            }
+            QString id = item;
+            id.remove(QStringLiteral("...")).remove(QLatin1Char(' '));
+            id[0] = id[0].toLower();
+            sub->addAction(makeAction(QStringLiteral("filter.") + id, item, {}, *it));
+        }
     }
 
     // ---------------- View ----------------
@@ -1276,6 +1405,10 @@ void MainWindow::updateActions()
     action(QStringLiteral("layer.delete"))->setEnabled(doc->layerCount() > 1);
     action(QStringLiteral("layer.flatten"))->setEnabled(doc->layerCount() > 1 || (l && !l->isBackground));
     action(QStringLiteral("file.revert"))->setEnabled(!doc->filePath().isEmpty());
+    action(QStringLiteral("filter.last"))->setEnabled(bool(m_lastFilter));
+    const bool fade = canFade();
+    action(QStringLiteral("edit.fade"))->setEnabled(fade);
+    action(QStringLiteral("edit.fade"))->setText(fade ? QStringLiteral("Fade %1...").arg(m_fade.name) : QStringLiteral("Fade..."));
 }
 
 void MainWindow::rebuildWindowMenuDocs()
@@ -1554,36 +1687,110 @@ void MainWindow::syncViewActions()
     }
 }
 
-void MainWindow::applyPixelFilter(const QString& name, const std::function<QRgb(QRgb)>& fn)
+bool MainWindow::execPreview(PreviewDialog& dlg)
+{
+    if (!dlg.isReady()) {
+        alert(dlg.error());
+        return false;
+    }
+    if (dlg.exec() != QDialog::Accepted) return false;
+    rememberFade(dlg.spec().name, dlg.applied());
+    return true;
+}
+
+void MainWindow::applySpec(const Filters::Spec& spec, const SpecRecipe& recipe)
 {
     Document* doc = currentDoc();
-    if (!doc || !doc->editLayer()) return;
-    const Layer* l = doc->editLayer();
-    if (l->pixelsLocked()) {
-        alert(QStringLiteral("Could not complete the %1 command because the layer is locked.").arg(name));
+    if (!doc) return;
+    QString err;
+    Filters::Applied applied;
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    const bool ok = Filters::apply(doc, spec, &err, &applied);
+    QApplication::restoreOverrideCursor();
+    if (!ok) {
+        alert(err);
         return;
     }
-    QRect r = (doc->hasSelection() ? doc->selectionBounds() : doc->bounds()) & l->rect();
-    if (r.isEmpty()) return;
-    PixelEdit edit(doc, doc->editIndex(), QRect());
-    Layer& layer = edit.layer();
-    const QImage& sel = doc->selection();
-    for (int y = r.top(); y <= r.bottom(); ++y) {
-        auto* row = reinterpret_cast<QRgb*>(layer.image.scanLine(y - layer.offset.y())) + (r.left() - layer.offset.x());
-        const uchar* m = sel.isNull() ? nullptr : sel.constScanLine(y) + r.left();
-        for (int i = 0; i < r.width(); ++i) {
-            if (!qAlpha(row[i]) || (m && !m[i])) continue;
-            const QRgb src = row[i];
-            QRgb out = qPremultiply(fn(qUnpremultiply(src)));
-            if (m && m[i] != 255) {
-                // Blend by selection coverage.
-                out = Blend::byteMul(out, m[i]) + Blend::byteMul(src, 255 - m[i]);
-            }
-            row[i] = out;
+    if (recipe) setLastFilter(spec.name, recipe);
+    rememberFade(spec.name, applied);
+}
+
+void MainWindow::paramDialog(const QString& title, bool spreads, bool isFilter, const std::function<void(ParamDialog&)>& setup,
+                             const ParamBuilder& build)
+{
+    Document* doc = currentDoc();
+    if (!doc) return;
+    const bool useLast = isFilter || (QApplication::keyboardModifiers() & Qt::AltModifier);
+    ParamDialog dlg(doc, title, spreads, build, this);
+    setup(dlg);
+    if (useLast) dlg.useLastValues();
+    dlg.ready();
+    if (!execPreview(dlg) || !isFilter) return;
+    const QHash<QString, double> values = dlg.values();
+    setLastFilter(dlg.spec().name, [build, values] {
+        QHash<QString, double> v = values;
+        // Each repeat gets fresh noise.
+        if (v.contains(QStringLiteral("seed"))) v[QStringLiteral("seed")] = QRandomGenerator::global()->generate();
+        return build(v);
+    });
+}
+
+void MainWindow::setLastFilter(const QString& name, const SpecRecipe& recipe)
+{
+    m_lastFilter = recipe;
+    // The menu item names the filter it repeats.
+    action(QStringLiteral("filter.last"))->setText(name);
+    updateActions();
+}
+
+void MainWindow::autoAdjust(Adjust::AutoMode mode, const QString& name)
+{
+    Document* doc = currentDoc();
+    if (!doc) return;
+    Adjust::Levels levels;
+    {
+        // A throwaway session reads the pixels the command will change.
+        Filters::Session probe(doc, name, false);
+        if (!probe.isValid()) {
+            alert(probe.error());
+            return;
         }
+        levels = Adjust::autoLevels(Adjust::histogram(probe.originalTarget(), probe.selectionTarget()), mode);
     }
-    edit.markDirty(r);
-    edit.commit(name);
+    applySpec(Adjust::spec(name, Adjust::levelsMap(levels)));
+}
+
+void MainWindow::rememberFade(const QString& name, const Filters::Applied& applied)
+{
+    Document* doc = currentDoc();
+    if (!doc) return;
+    QUndoStack* stack = doc->undoStack();
+    m_fade = {doc, stack->index(), stack->index() > 0 ? stack->command(stack->index() - 1) : nullptr, name, applied};
+    updateActions();
+}
+
+bool MainWindow::canFade()
+{
+    Document* doc = currentDoc();
+    if (!doc || m_fade.doc != doc || m_fade.index < 1 || !m_fade.command) return false;
+    // Only straight after the command, on the same layer.
+    QUndoStack* stack = doc->undoStack();
+    if (stack->index() != m_fade.index || stack->command(m_fade.index - 1) != m_fade.command) return false;
+    const Layer* l = doc->editLayer();
+    return l && l->id == m_fade.applied.layerId;
+}
+
+void MainWindow::fadeDialog()
+{
+    if (!canFade()) return;
+    FadeDialog dlg(currentDoc(), m_fade.name, m_fade.applied, this);
+    if (!dlg.isReady()) {
+        alert(dlg.error());
+        return;
+    }
+    // A fade cannot be faded again.
+    if (dlg.exec() == QDialog::Accepted) m_fade = {};
+    updateActions();
 }
 
 void MainWindow::showShortcuts()

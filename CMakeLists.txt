@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets Svg Test)
+find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets Svg Concurrent Test)
 qt_standard_project_setup()
 
 if(MSVC)
@@ -23,7 +23,7 @@ file(GLOB_RECURSE CORE_SOURCES CONFIGURE_DEPENDS
     src/io/*.cpp src/io/*.h)
 add_library(photoslop_core STATIC ${CORE_SOURCES})
 target_include_directories(photoslop_core PUBLIC src)
-target_link_libraries(photoslop_core PUBLIC Qt6::Gui)
+target_link_libraries(photoslop_core PUBLIC Qt6::Gui Qt6::Concurrent)
 
 # ---- UI library (everything except main.cpp, so GUI tests can link it) ----
 file(GLOB_RECURSE UI_SOURCES CONFIGURE_DEPENDS

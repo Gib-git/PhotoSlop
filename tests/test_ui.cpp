@@ -11,6 +11,7 @@
 #include "ui/MainWindow.h"
 #include "ui/Ruler.h"
 #include "ui/ViewOptions.h"
+#include "ui/dialogs/AdjustmentDialogs.h"
 #include "ui/dialogs/ColorPickerDialog.h"
 #include "ui/dialogs/Dialogs.h"
 
@@ -93,6 +94,27 @@ class TestUi : public QObject {
         view()->actualPixels();
         view()->resize(600, 400);
         QCoreApplication::processEvents();
+    }
+
+    // Triggers an action that opens a modal dialog of type D and runs `fn` on it inside exec().
+    // Any other modal window (an alert) is closed so the test cannot hang.
+    template <typename D>
+    bool withDialog(const QString& actionId, const std::function<void(D*)>& fn)
+    {
+        bool seen = false;
+        QTimer::singleShot(0, w.get(), [&] {
+            QWidget* m = QApplication::activeModalWidget();
+            if (auto* d = qobject_cast<D*>(m)) {
+                seen = true;
+                fn(d);
+                if (d->isVisible()) d->reject();
+            } else if (m) {
+                m->close();
+            }
+        });
+        w->action(actionId)->trigger();
+        QCoreApplication::processEvents();
+        return seen;
     }
 
 private slots:
@@ -309,6 +331,22 @@ private slots:
         NewGuideDialog gd(w.get());
         check(gd, QStringLiteral("newguide"));
         QCOMPARE(gd.orientation(), Qt::Horizontal);
+        LevelsDialog lv(doc(), false, w.get());
+        check(lv, QStringLiteral("levels"));
+        CurvesDialog cv(doc(), false, w.get());
+        check(cv, QStringLiteral("curves"));
+        HueSaturationDialog hs(doc(), false, w.get());
+        check(hs, QStringLiteral("huesat"));
+        ColorBalanceDialog cb(doc(), false, w.get());
+        check(cb, QStringLiteral("colorbalance"));
+        ThresholdDialog th(doc(), w.get());
+        check(th, QStringLiteral("threshold"));
+        ParamDialog gb(doc(), QStringLiteral("Gaussian Blur"), true,
+                       [](const ParamDialog::Values& v) { return Filters::gaussianBlurSpec(v[QStringLiteral("radius")]); }, w.get());
+        gb.addSlider(QStringLiteral("radius"), QStringLiteral("Radius:"), 0.1, 1000, 1.0, 1, QStringLiteral("Pixels"), 250);
+        gb.ready();
+        check(gb, QStringLiteral("gaussian"));
+        QCOMPARE(doc()->undoStack()->count(), 0);
         if (!shots.isEmpty()) w->grab().save(shots + QStringLiteral("/window.png"));
     }
 
@@ -633,6 +671,148 @@ private slots:
         QVERIFY(w->action(QStringLiteral("select.grow"))->isEnabled());
         w->action(QStringLiteral("select.grow"))->trigger();
         QCOMPARE(doc()->selectionBounds(), doc()->bounds()); // all white
+    }
+
+    void levelsPreviewOkAndCancel()
+    {
+        openWhite();
+        const int count = doc()->undoStack()->count();
+        QColor preview;
+        QVERIFY(withDialog<LevelsDialog>(QStringLiteral("image.levels"), [&](LevelsDialog* d) {
+            Adjust::Levels lv;
+            lv.channels[0].outWhite = 128;
+            d->setLevels(lv);
+            d->waitForPreview();
+            preview = pixel(10, 10);
+            d->accept();
+        }));
+        QCOMPARE(preview, QColor(128, 128, 128));
+        QCOMPARE(pixel(10, 10), QColor(128, 128, 128));
+        QCOMPARE(doc()->undoStack()->count(), count + 1);
+        QCOMPARE(doc()->undoStack()->text(count), QStringLiteral("Levels"));
+        // Cancel restores the layer and adds no history.
+        QVERIFY(withDialog<LevelsDialog>(QStringLiteral("image.levels"), [&](LevelsDialog* d) {
+            QCOMPARE(d->levels(), Adjust::Levels()); // starts from defaults
+            Adjust::Levels lv;
+            lv.channels[0].outWhite = 0;
+            d->setLevels(lv);
+            d->waitForPreview();
+            preview = pixel(10, 10);
+            d->reject();
+        }));
+        QCOMPARE(preview, QColor(0, 0, 0));
+        QCOMPARE(pixel(10, 10), QColor(128, 128, 128));
+        QCOMPARE(doc()->undoStack()->count(), count + 1);
+        // Preview off shows the original until OK.
+        QVERIFY(withDialog<HueSaturationDialog>(QStringLiteral("image.hueSaturation"), [&](HueSaturationDialog* d) {
+            d->setPreviewEnabled(false);
+            Adjust::HueSaturation hs;
+            hs.ranges[0].lightness = 100;
+            d->setSettings(hs);
+            QCoreApplication::processEvents();
+            preview = pixel(10, 10);
+            d->accept();
+        }));
+        QCOMPARE(preview, QColor(128, 128, 128));
+        QCOMPARE(pixel(10, 10), QColor(Qt::white));
+    }
+
+    void gaussianBlurLastFilterAndFade()
+    {
+        openWhite();
+        squareLayer(QRect(50, 50, 40, 40));
+        QVERIFY(!w->action(QStringLiteral("edit.fade"))->isEnabled());
+        const int count = doc()->undoStack()->count();
+        QVERIFY(withDialog<ParamDialog>(QStringLiteral("filter.gaussianBlur"), [&](ParamDialog* d) {
+            d->setValue(QStringLiteral("radius"), 3.0);
+            d->waitForPreview();
+            d->accept();
+        }));
+        QCOMPARE(doc()->undoStack()->text(count), QStringLiteral("Gaussian Blur"));
+        const QRgb once = doc()->activeLayer()->pixelAt(QPoint(48, 70));
+        QVERIFY(qAlpha(once) > 0 && qAlpha(once) < 255);
+        // Last Filter repeats it with the same radius, without a dialog.
+        QAction* last = w->action(QStringLiteral("filter.last"));
+        QVERIFY(last->isEnabled());
+        QCOMPARE(last->text(), QStringLiteral("Gaussian Blur"));
+        last->trigger();
+        QCOMPARE(doc()->undoStack()->count(), count + 2);
+        QVERIFY(doc()->activeLayer()->pixelAt(QPoint(48, 70)) != once);
+        // Fading it to 0% gives back the single blur.
+        QAction* fade = w->action(QStringLiteral("edit.fade"));
+        QVERIFY(fade->isEnabled());
+        QCOMPARE(fade->text(), QStringLiteral("Fade Gaussian Blur..."));
+        QVERIFY(withDialog<FadeDialog>(QStringLiteral("edit.fade"), [&](FadeDialog* d) {
+            d->setOpacity(0);
+            d->waitForPreview();
+            d->accept();
+        }));
+        QCOMPARE(doc()->undoStack()->text(count + 2), QStringLiteral("Fade Gaussian Blur"));
+        QCOMPARE(doc()->activeLayer()->pixelAt(QPoint(48, 70)), once);
+        QVERIFY(!fade->isEnabled());
+        // The filter remembers its radius next time.
+        QVERIFY(withDialog<ParamDialog>(QStringLiteral("filter.gaussianBlur"), [&](ParamDialog* d) {
+            QCOMPARE(d->value(QStringLiteral("radius")), 3.0);
+        }));
+        QCOMPARE(doc()->undoStack()->count(), count + 3);
+    }
+
+    void curvesEditorAddsPointByDragging()
+    {
+        openWhite();
+        Ops::newLayer(doc());
+        Ops::selectAll(doc());
+        QVERIFY(Ops::fill(doc(), QColor(128, 128, 128), BlendMode::Normal, 1.f, false));
+        Ops::deselect(doc());
+        CurvesDialog d(doc(), false, w.get());
+        QVERIFY(d.isReady());
+        d.show();
+        CurveEditor* e = d.editor();
+        auto toWidget = [e](double x, double y) {
+            return QPoint(int(5 + x / 255.0 * (e->width() - 10)), int(5 + (255 - y) / 255.0 * (e->height() - 10)));
+        };
+        QTest::mousePress(e, Qt::LeftButton, {}, toWidget(128, 128));
+        QTest::mouseMove(e, toWidget(128, 200));
+        QTest::mouseRelease(e, Qt::LeftButton, {}, toWidget(128, 200));
+        QCOMPARE(d.curves().channels[0].size(), 3);
+        QVERIFY(std::abs(d.curves().channels[0][1].y() - 200) <= 2);
+        d.waitForPreview();
+        QVERIFY(std::abs(pixel(10, 10).red() - 200) <= 3);
+        // Dragging it off the graph removes it.
+        QTest::mousePress(e, Qt::LeftButton, {}, toWidget(128, 200));
+        QTest::mouseMove(e, QPoint(e->width() + 40, e->height() / 2));
+        QTest::mouseRelease(e, Qt::LeftButton, {}, QPoint(e->width() + 40, e->height() / 2));
+        QCOMPARE(d.curves().channels[0].size(), 2);
+        d.reject();
+        QCOMPARE(pixel(10, 10), QColor(128, 128, 128));
+    }
+
+    void adjustmentOnLockedLayerAlerts()
+    {
+        openWhite();
+        Ops::newLayer(doc());
+        Ops::setLocks(doc(), doc()->activeIndex(), false, true, false, false);
+        const int count = doc()->undoStack()->count();
+        // The alert is closed by withDialog; no Levels dialog opens.
+        QVERIFY(!withDialog<LevelsDialog>(QStringLiteral("image.levels"), [](LevelsDialog*) {}));
+        QVERIFY(!withDialog<ParamDialog>(QStringLiteral("filter.gaussianBlur"), [](ParamDialog*) {}));
+        QCOMPARE(doc()->undoStack()->count(), count);
+    }
+
+    void autoContrastStretches()
+    {
+        openWhite();
+        Ops::selectAll(doc());
+        QVERIFY(Ops::fill(doc(), QColor(100, 100, 100), BlendMode::Normal, 1.f, false));
+        QPainterPath path;
+        path.addRect(0, 0, 100, 150);
+        doc()->changeSelection(Sel::pathMask(doc()->size(), path, false), QStringLiteral("Rectangular Marquee"));
+        QVERIFY(Ops::fill(doc(), QColor(150, 150, 150), BlendMode::Normal, 1.f, false));
+        Ops::deselect(doc());
+        w->action(QStringLiteral("image.autoContrast"))->trigger();
+        QCOMPARE(pixel(10, 10), QColor(Qt::white));
+        QCOMPARE(pixel(150, 10), QColor(Qt::black));
+        QCOMPARE(doc()->undoStack()->text(doc()->undoStack()->index() - 1), QStringLiteral("Auto Contrast"));
     }
 
     void invertAdjustment()

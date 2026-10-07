@@ -1,7 +1,9 @@
+#include "core/Adjustments.h"
 #include "core/BlendMode.h"
 #include "core/Commands.h"
 #include "core/Document.h"
 #include "core/DocumentOps.h"
+#include "core/Filters.h"
 #include "core/ImageOps.h"
 #include "core/Selection.h"
 #include "core/Transform.h"
@@ -402,6 +404,342 @@ private slots:
         std::unique_ptr<Document> loaded(DocumentIO::load(path, &err));
         QVERIFY2(loaded, qPrintable(err));
         QCOMPARE(loaded->guides(), doc->guides());
+    }
+    // ---------------- Stage 3: adjustments and filters ----------------
+
+    static QRgb mapped(const Adjust::PixelMap& map, QRgb c)
+    {
+        map(&c, 1);
+        return c;
+    }
+
+    static QImage solid(QSize size, QRgb c)
+    {
+        QImage img(size, QImage::Format_ARGB32_Premultiplied);
+        img.fill(qPremultiply(c));
+        return img;
+    }
+
+    void levelsLut()
+    {
+        Adjust::LevelsChannel c;
+        QCOMPARE(Adjust::levelsLut(c), Adjust::identityLut());
+        c.inBlack = 50;
+        c.inWhite = 200;
+        Adjust::Lut l = Adjust::levelsLut(c);
+        QCOMPARE(int(l[50]), 0);
+        QCOMPARE(int(l[30]), 0);
+        QCOMPARE(int(l[200]), 255);
+        QCOMPARE(int(l[125]), 128);
+        c = {};
+        c.gamma = 2.0; // brightens the midtones
+        QCOMPARE(int(Adjust::levelsLut(c)[64]), 128);
+        c = {};
+        c.outBlack = 20;
+        c.outWhite = 220;
+        l = Adjust::levelsLut(c);
+        QCOMPARE(int(l[0]), 20);
+        QCOMPARE(int(l[255]), 220);
+        // The RGB channel applies after the colour channels.
+        Adjust::Levels lv;
+        lv.channels[1].inWhite = 128; // red doubles
+        lv.channels[0].outWhite = 128; // then everything halves
+        QCOMPARE(mapped(Adjust::levelsMap(lv), qRgb(100, 100, 100)), qRgb(100, 50, 50));
+    }
+
+    void autoLevelsStretches()
+    {
+        QImage img(100, 1, QImage::Format_ARGB32_Premultiplied);
+        for (int x = 0; x < 100; ++x) img.setPixel(x, 0, qRgb(50 + x, 60 + x, 70 + x));
+        const Adjust::Histogram h = Adjust::histogram(img);
+        QCOMPARE(h.count, quint64(100));
+        Adjust::Levels tone = Adjust::autoLevels(h, Adjust::AutoMode::Tone, 0.0);
+        QCOMPARE(tone.channels[1].inBlack, 50);
+        QCOMPARE(tone.channels[1].inWhite, 149);
+        QCOMPARE(tone.channels[3].inBlack, 70);
+        Adjust::Levels contrast = Adjust::autoLevels(h, Adjust::AutoMode::Contrast, 0.0);
+        QCOMPARE(contrast.channels[0].inBlack, 50);
+        QCOMPARE(contrast.channels[0].inWhite, 169);
+        QCOMPARE(contrast.channels[1], Adjust::LevelsChannel());
+        // Clipping ignores the extreme pixels.
+        Adjust::Levels clipped = Adjust::autoLevels(h, Adjust::AutoMode::Tone, 0.05);
+        QCOMPARE(clipped.channels[1].inBlack, 55);
+        QCOMPARE(clipped.channels[1].inWhite, 144);
+    }
+
+    void histogramHonoursCoverage()
+    {
+        QImage img = solid(QSize(10, 10), qRgb(200, 100, 0));
+        QImage mask(10, 10, QImage::Format_Grayscale8);
+        mask.fill(0);
+        for (int y = 0; y < 5; ++y) memset(mask.scanLine(y), 255, 10);
+        const Adjust::Histogram h = Adjust::histogram(img, mask);
+        QCOMPARE(h.count, quint64(50));
+        QCOMPARE(h.channels[1][200], 50u);
+        QCOMPARE(h.channels[3][0], 50u);
+    }
+
+    void curvesLut()
+    {
+        QCOMPARE(Adjust::curveLut(Adjust::identityCurve()), Adjust::identityLut());
+        const Adjust::Lut l = Adjust::curveLut({QPointF(0, 0), QPointF(128, 200), QPointF(255, 255)});
+        QCOMPARE(int(l[128]), 200);
+        QCOMPARE(int(l[0]), 0);
+        QCOMPARE(int(l[255]), 255);
+        for (int v = 1; v < 256; ++v) QVERIFY(l[v] >= l[v - 1]);
+        // Flat beyond the end points.
+        const Adjust::Lut cut = Adjust::curveLut({QPointF(50, 0), QPointF(200, 255)});
+        QCOMPARE(int(cut[20]), 0);
+        QCOMPARE(int(cut[230]), 255);
+        QCOMPARE(int(cut[125]), 128);
+        // An inverted curve inverts.
+        Adjust::Curves c;
+        c.channels[0] = {QPointF(0, 255), QPointF(255, 0)};
+        QCOMPARE(mapped(Adjust::curvesMap(c), qRgb(10, 20, 30)), qRgb(245, 235, 225));
+    }
+
+    void simpleAdjustments()
+    {
+        QCOMPARE(mapped(Adjust::invertMap(), qRgba(10, 20, 30, 40)), qRgba(245, 235, 225, 40));
+        QCOMPARE(mapped(Adjust::desaturateMap(), qRgb(200, 100, 0)), qRgb(100, 100, 100));
+        QCOMPARE(mapped(Adjust::posterizeMap(2), qRgb(100, 130, 255)), qRgb(0, 255, 255));
+        QCOMPARE(mapped(Adjust::thresholdMap(128), qRgb(200, 200, 200)), qRgb(255, 255, 255));
+        QCOMPARE(mapped(Adjust::thresholdMap(128), qRgb(255, 0, 0)), qRgb(0, 0, 0));
+        // Brightness/Contrast at zero changes nothing; modern brightness keeps black and white.
+        QCOMPARE(mapped(Adjust::brightnessContrastMap(0, 0, false), qRgb(12, 130, 250)), qRgb(12, 130, 250));
+        const auto bright = Adjust::brightnessContrastMap(100, 0, false);
+        QCOMPARE(mapped(bright, qRgb(0, 255, 128)), qRgb(0, 255, qBlue(mapped(bright, qRgb(0, 0, 128)))));
+        QVERIFY(qBlue(mapped(bright, qRgb(0, 0, 128))) > 170);
+        QCOMPARE(mapped(Adjust::brightnessContrastMap(20, 0, true), qRgb(0, 100, 250)), qRgb(20, 120, 255));
+        const QRgb contrasty = mapped(Adjust::brightnessContrastMap(0, 80, false), qRgb(40, 128, 215));
+        QVERIFY(qRed(contrasty) < 40 && qBlue(contrasty) > 215);
+    }
+
+    void hueSaturation()
+    {
+        Adjust::HueSaturation hs;
+        QCOMPARE(mapped(Adjust::hueSaturationMap(hs), qRgb(12, 34, 56)), qRgb(12, 34, 56));
+        hs.ranges[0].hue = 120;
+        QCOMPARE(mapped(Adjust::hueSaturationMap(hs), qRgb(255, 0, 0)), qRgb(0, 255, 0));
+        hs = {};
+        hs.ranges[0].saturation = -100;
+        const QRgb grey = mapped(Adjust::hueSaturationMap(hs), qRgb(200, 50, 50));
+        QCOMPARE(qRed(grey), qGreen(grey));
+        hs = {};
+        hs.ranges[0].lightness = 100;
+        QCOMPARE(mapped(Adjust::hueSaturationMap(hs), qRgb(10, 200, 30)), qRgb(255, 255, 255));
+        // Editing the Reds leaves blues and greys alone.
+        hs = {};
+        hs.ranges[1].hue = 120;
+        QCOMPARE(mapped(Adjust::hueSaturationMap(hs), qRgb(255, 0, 0)), qRgb(0, 255, 0));
+        QCOMPARE(mapped(Adjust::hueSaturationMap(hs), qRgb(0, 0, 255)), qRgb(0, 0, 255));
+        QCOMPARE(mapped(Adjust::hueSaturationMap(hs), qRgb(90, 90, 90)), qRgb(90, 90, 90));
+        // Colorize tints by lightness.
+        hs = {};
+        hs.colorize = true;
+        hs.ranges[0].hue = 240;
+        hs.ranges[0].saturation = 100;
+        const QRgb tinted = mapped(Adjust::hueSaturationMap(hs), qRgb(128, 128, 128));
+        QVERIFY(qBlue(tinted) > 250 && qRed(tinted) < 5);
+    }
+
+    void colorBalance()
+    {
+        Adjust::ColorBalance cb;
+        QCOMPARE(mapped(Adjust::colorBalanceMap(cb), qRgb(30, 128, 220)), qRgb(30, 128, 220));
+        cb.values[1][0] = 100; // midtones toward red
+        cb.preserveLuminosity = false;
+        const QRgb warm = mapped(Adjust::colorBalanceMap(cb), qRgb(128, 128, 128));
+        QVERIFY(qRed(warm) > 180);
+        QCOMPARE(qGreen(warm), 128);
+        cb.preserveLuminosity = true;
+        double h, s, l0, l1;
+        Adjust::rgbToHsl(128, 128, 128, h, s, l0);
+        const QRgb kept = mapped(Adjust::colorBalanceMap(cb), qRgb(128, 128, 128));
+        Adjust::rgbToHsl(qRed(kept), qGreen(kept), qBlue(kept), h, s, l1);
+        QVERIFY(std::abs(l0 - l1) < 0.01);
+        QVERIFY(qRed(kept) > qGreen(kept));
+    }
+
+    void blackAndWhite()
+    {
+        Adjust::BlackWhite bw;
+        const auto map = Adjust::blackWhiteMap(bw);
+        QCOMPARE(mapped(map, qRgb(255, 255, 255)), qRgb(255, 255, 255));
+        QCOMPARE(mapped(map, qRgb(255, 0, 0)), qRgb(102, 102, 102));   // reds 40%
+        QCOMPARE(mapped(map, qRgb(255, 255, 0)), qRgb(153, 153, 153)); // yellows 60%
+        QCOMPARE(mapped(map, qRgb(0, 0, 255)), qRgb(51, 51, 51));      // blues 20%
+        bw.tint = true;
+        const QRgb t = mapped(Adjust::blackWhiteMap(bw), qRgb(128, 128, 128));
+        QVERIFY(qRed(t) > qBlue(t)); // the default tint is warm
+    }
+
+    void gaussianBlurPreservesFlatAndSpreads()
+    {
+        // A flat image stays flat (edges repeat) for both the kernel and box-pass paths.
+        const QImage flat = solid(QSize(40, 30), qRgb(90, 120, 200));
+        for (double r : {1.0, 8.0}) QCOMPARE(Filters::gaussianBlur(flat, r), flat);
+        QImage dot = solid(QSize(41, 41), qRgb(0, 0, 0));
+        dot.setPixel(20, 20, qRgb(255, 255, 255));
+        for (double r : {1.0, 5.0}) {
+            const QImage b = Filters::gaussianBlur(dot, r);
+            QVERIFY(qRed(b.pixel(20, 20)) < 255);
+            QVERIFY(qRed(b.pixel(21, 20)) > 0);
+            QCOMPARE(qRed(b.pixel(19, 20)), qRed(b.pixel(21, 20)));
+            QCOMPARE(qRed(b.pixel(20, 17)), qRed(b.pixel(23, 20)));
+            QCOMPARE(qRed(b.pixel(0, 0)), 0);
+        }
+        // Transparent pixels pick up coverage, and premultiplied colour stays within alpha.
+        QImage half(20, 20, QImage::Format_ARGB32_Premultiplied);
+        half.fill(Qt::transparent);
+        for (int y = 0; y < 20; ++y)
+            for (int x = 0; x < 10; ++x) half.setPixel(x, y, qRgb(255, 0, 0));
+        const QImage hb = Filters::gaussianBlur(half, 2.0);
+        const QRgb edge = hb.pixel(10, 10);
+        QVERIFY(qAlpha(edge) > 0 && qAlpha(edge) < 255);
+        QCOMPARE(qRed(edge), qAlpha(edge));
+    }
+
+    void blursAndSharpen()
+    {
+        QImage bar = solid(QSize(31, 31), qRgb(0, 0, 0));
+        for (int y = 0; y < 31; ++y) bar.setPixel(15, y, qRgb(255, 255, 255));
+        // A vertical motion blur leaves a vertical bar alone; a horizontal one spreads it.
+        QCOMPARE(Filters::motionBlur(bar, 90, 10), bar);
+        const QImage h = Filters::motionBlur(bar, 0, 10);
+        QVERIFY(qRed(h.pixel(18, 15)) > 0);
+        QCOMPARE(qRed(h.pixel(25, 15)), 0);
+        QCOMPARE(Filters::boxBlur(solid(QSize(9, 9), qRgb(7, 8, 9)), 3), solid(QSize(9, 9), qRgb(7, 8, 9)));
+        // Unsharp mask raises contrast at an edge; a high threshold leaves it alone.
+        QImage edge = solid(QSize(20, 20), qRgb(100, 100, 100));
+        for (int y = 0; y < 20; ++y)
+            for (int x = 10; x < 20; ++x) edge.setPixel(x, y, qRgb(150, 150, 150));
+        const QImage sharp = Filters::unsharpMask(edge, 100, 2, 0);
+        QVERIFY(qRed(sharp.pixel(9, 5)) < 100);
+        QVERIFY(qRed(sharp.pixel(10, 5)) > 150);
+        QCOMPARE(qRed(sharp.pixel(0, 5)), 100);
+        QCOMPARE(Filters::unsharpMask(edge, 100, 2, 60), edge);
+        const QImage hp = Filters::highPass(edge, 3);
+        QCOMPARE(qRed(hp.pixel(0, 5)), 128);
+        QVERIFY(qRed(hp.pixel(10, 5)) > 128);
+    }
+
+    void noiseMedianMosaic()
+    {
+        const QImage grey = solid(QSize(32, 32), qRgb(128, 128, 128));
+        const QImage n1 = Filters::addNoise(grey, 25, false, true, QPoint(), 7);
+        QCOMPARE(Filters::addNoise(grey, 25, false, true, QPoint(), 7), n1); // deterministic
+        QVERIFY(Filters::addNoise(grey, 25, false, true, QPoint(), 8) != n1);
+        bool changed = false;
+        for (int x = 0; x < 32; ++x) {
+            const QRgb p = n1.pixel(x, 3);
+            QCOMPARE(qRed(p), qBlue(p)); // monochromatic
+            changed |= qRed(p) != 128;
+        }
+        QVERIFY(changed);
+        // The same canvas position gets the same noise, whatever the crop.
+        QCOMPARE(Filters::addNoise(grey.copy(4, 4, 8, 8), 25, true, false, QPoint(4, 4), 7).pixel(0, 0),
+                 Filters::addNoise(grey, 25, true, false, QPoint(), 7).pixel(4, 4));
+        QImage clear(4, 4, QImage::Format_ARGB32_Premultiplied);
+        clear.fill(Qt::transparent);
+        QCOMPARE(Filters::addNoise(clear, 100, true, false, QPoint(), 1), clear);
+
+        QImage speck = grey;
+        speck.setPixel(10, 10, qRgb(255, 255, 255));
+        QCOMPARE(Filters::median(speck, 1), grey);
+
+        QImage ramp(8, 4, QImage::Format_ARGB32_Premultiplied);
+        for (int y = 0; y < 4; ++y)
+            for (int x = 0; x < 8; ++x) ramp.setPixel(x, y, qRgb(x * 10, 0, 0));
+        const QImage m = Filters::mosaic(ramp, 4, QPoint());
+        QCOMPARE(qRed(m.pixel(0, 0)), 15);
+        QCOMPARE(qRed(m.pixel(3, 3)), 15);
+        QCOMPARE(qRed(m.pixel(4, 0)), 55);
+        // Cells line up with the canvas, not the crop.
+        const QImage shifted = Filters::mosaic(ramp.copy(2, 0, 6, 4), 4, QPoint(2, 0));
+        QCOMPARE(qRed(shifted.pixel(0, 0)), 25); // canvas x 2..3
+        QCOMPARE(qRed(shifted.pixel(2, 0)), 55); // canvas x 4..7
+    }
+
+    void cancelStopsFilters()
+    {
+        Filters::CancelFlag cancel{true};
+        QVERIFY(Filters::gaussianBlur(solid(QSize(64, 64), qRgb(1, 2, 3)), 5, &cancel).isNull());
+        QVERIFY(Filters::median(solid(QSize(64, 64), qRgb(1, 2, 3)), 2, &cancel).isNull());
+    }
+
+    void sessionAppliesInsideSelection()
+    {
+        std::unique_ptr<Document> doc(makeDoc());
+        doc->changeSelection(rectMask(doc->size(), QRect(10, 10, 20, 10)), "Rectangular Marquee");
+        const int before = doc->undoStack()->count();
+        QString err;
+        QVERIFY(Filters::apply(doc.get(), Adjust::spec("Invert", Adjust::invertMap()), &err));
+        QCOMPARE(doc->undoStack()->count(), before + 1);
+        QCOMPARE(doc->undoStack()->text(before), QStringLiteral("Invert"));
+        QCOMPARE(doc->layers()[0].pixelAt(QPoint(15, 15)), qRgb(0, 0, 0));
+        QCOMPARE(doc->layers()[0].pixelAt(QPoint(5, 5)), qRgb(255, 255, 255));
+        doc->undoStack()->undo();
+        QCOMPARE(doc->layers()[0].pixelAt(QPoint(15, 15)), qRgb(255, 255, 255));
+    }
+
+    void sessionPreviewAndCancel()
+    {
+        std::unique_ptr<Document> doc(makeDoc());
+        {
+            Filters::Session s(doc.get(), "Levels", false);
+            QVERIFY(s.isValid());
+            QCOMPARE(s.target(), doc->bounds());
+            const Filters::Spec spec = Adjust::spec("Invert", Adjust::invertMap());
+            s.show(Filters::Session::render(s.input(), spec));
+            QCOMPARE(doc->layers()[0].pixelAt(QPoint(3, 3)), qRgb(0, 0, 0)); // previewed
+            s.showOriginal();
+            QCOMPARE(doc->layers()[0].pixelAt(QPoint(3, 3)), qRgb(255, 255, 255));
+            s.show(Filters::Session::render(s.input(), spec));
+        } // destroyed without commit
+        QCOMPARE(doc->layers()[0].pixelAt(QPoint(3, 3)), qRgb(255, 255, 255));
+        QCOMPARE(doc->undoStack()->count(), 0);
+    }
+
+    void sessionSpreadsAndLocks()
+    {
+        std::unique_ptr<Document> doc(makeDoc());
+        Ops::newLayer(doc.get());
+        doc->changeSelection(rectMask(doc->size(), QRect(20, 20, 10, 10)), "Rectangular Marquee");
+        QVERIFY(Ops::fill(doc.get(), Qt::black, BlendMode::Normal, 1.f, false));
+        Ops::deselect(doc.get());
+        // Adjustments refuse an empty area; blurs spread past the layer's pixels.
+        Ops::newLayer(doc.get());
+        QString err;
+        QVERIFY(!Filters::apply(doc.get(), Adjust::spec("Invert", Adjust::invertMap()), &err));
+        QVERIFY(err.contains("empty"));
+        Ops::deleteLayer(doc.get());
+        const QRect before = doc->activeLayer()->rect();
+        QVERIFY(Filters::apply(doc.get(), Filters::gaussianBlurSpec(2.0), &err));
+        QVERIFY(doc->activeLayer()->rect().contains(before.adjusted(-3, -3, 3, 3)));
+        QVERIFY(qAlpha(doc->activeLayer()->pixelAt(QPoint(18, 25))) > 0);
+        doc->undoStack()->undo();
+        QCOMPARE(qAlpha(doc->activeLayer()->pixelAt(QPoint(18, 25))), 0);
+        // Locked transparency keeps the alpha.
+        Ops::setLocks(doc.get(), doc->activeIndex(), true, false, false, false);
+        QVERIFY(Filters::apply(doc.get(), Filters::gaussianBlurSpec(2.0), &err));
+        QCOMPARE(qAlpha(doc->activeLayer()->pixelAt(QPoint(18, 25))), 0);
+        QCOMPARE(qAlpha(doc->activeLayer()->pixelAt(QPoint(20, 25))), 255);
+        // Locked pixels refuse.
+        Ops::setLocks(doc.get(), doc->activeIndex(), false, true, false, false);
+        QVERIFY(!Filters::apply(doc.get(), Filters::gaussianBlurSpec(2.0), &err));
+        QVERIFY(err.contains("locked"));
+    }
+
+    void sessionFeatheredSelectionBlends()
+    {
+        std::unique_ptr<Document> doc(makeDoc(QSize(8, 8)));
+        QImage mask(8, 8, QImage::Format_Grayscale8);
+        mask.fill(128);
+        doc->changeSelection(mask, "Feather");
+        QVERIFY(Filters::apply(doc.get(), Adjust::spec("Invert", Adjust::invertMap())));
+        const int v = qRed(doc->layers()[0].pixelAt(QPoint(4, 4)));
+        QVERIFY(v > 120 && v < 135);
     }
 };
 

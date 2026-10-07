@@ -20,8 +20,10 @@ It is written in C++20 with Qt 6 (Widgets). PhotoSlop is not affiliated with Ado
 | **Home screen** with New file, Open and recent files | **Free Transform**: rotate and scale a layer, with rulers, guides and exact values in the options bar |
 | ![Warp](docs/screenshots/warp.png) | ![Quick Mask](docs/screenshots/quick-mask.png) |
 | **Warp** bends a layer with a 4 × 4 control grid | **Quick Mask** shows the selection as a red overlay you can paint on |
+| ![Curves](docs/screenshots/curves.png) | |
+| **Curves** with a histogram, previewing live on the canvas | |
 
-## Status: Stage 2 (selections and transforms)
+## Status: Stage 3 (adjustments and filters)
 
 | Area | What works |
 |---|---|
@@ -38,12 +40,16 @@ It is written in C++20 with Qt 6 (Widgets). PhotoSlop is not affiliated with Ado
 | Rulers, guides, grid | Rulers (pixels, inches, cm, mm or percent; right-click to change). Drag a guide out of a ruler (Alt flips its direction), move guides with the Move tool and drag them off the window to delete; New Guide, Clear Guides, Lock Guides; guides are saved in `.pslop` files and undoable. Grid every inch with four subdivisions. Extras (Ctrl+H) hides them all |
 | Snapping | Snap (Ctrl+Shift+;) to guides, the grid and document bounds while drawing marquees, cropping, moving layers and selections, and transforming |
 | Edit | History panel (50 states), Undo/Redo, Toggle Last State, Cut/Copy/Copy Merged/Paste/Paste in Place, Fill dialog, Clear |
-| Image | Image Size, Canvas Size (with anchor), rotate 90°/180°, flip canvas, Crop to selection, Duplicate, Invert, Desaturate |
+| Image | Image Size, Canvas Size (with anchor), rotate 90°/180°, flip canvas, Crop to selection, Duplicate |
+| Adjustments | Levels (per channel, with histogram, draggable input and output sliders, Auto), Curves (per channel, click to add points, drag off the graph or press Delete to remove, Auto), Hue/Saturation (Master plus six colour ranges, Colorize), Color Balance (shadows, midtones and highlights, Preserve Luminosity), Brightness/Contrast (with Use Legacy), Black & White (six colour sliders, Tint), Threshold, Posterize, Invert, Desaturate. Image ▸ Auto Tone, Auto Contrast and Auto Color. Hold Alt (Option) when opening Levels, Curves, Hue/Saturation or Color Balance to start from the last settings |
+| Filters | Blur, Blur More, Box Blur, Gaussian Blur, Motion Blur; Add Noise (uniform or gaussian, monochromatic), Median; Mosaic; Sharpen, Sharpen More, Unsharp Mask; High Pass. Filter dialogs remember their settings. Filter ▸ Last Filter repeats the last one with the same settings |
+| Live preview | Adjustment and filter dialogs preview on the canvas as you drag, computed on all CPU cores in the background; the Preview box compares before and after. Everything works inside the selection (feathered edges blend), honours Lock Transparency, and also edits the Quick Mask. Blurs can spread into transparent areas |
+| Fade | Edit ▸ Fade (Ctrl+Shift+F), right after a filter or adjustment, mixes it back with opacity and a blend mode |
 | Colour | Foreground/background colours, Photoshop-style Color Picker (HSB / RGB / CMYK / hex), Color panel, Swatches panel |
 
 Menu items for later stages are already in the menus, greyed out, with their Photoshop shortcuts shown.
 
-What differs from Photoshop in this stage: Quick Selection uses colour similarity and edge strength rather than a trained model; Warp offers the custom grid only (no Arc, Bulge and other presets); Transform ▸ Again repeats the last transform's matrix rather than its parameters; Snap To ▸ Layers and Slices are not implemented yet.
+What differs from Photoshop so far: Quick Selection uses colour similarity and edge strength rather than a trained model; Warp offers the custom grid only (no Arc, Bulge and other presets); Transform ▸ Again repeats the last transform's matrix rather than its parameters; Snap To ▸ Layers and Slices are not implemented yet. Adjustments are applied directly to the pixels: adjustment layers and the Adjustments panel arrive with Stage 4. Adjustment dialogs have no saved presets, and filter dialogs preview on the canvas only (no thumbnail inside the dialog). The colour maths follow Photoshop's behaviour closely but are not pixel-identical.
 
 ## Keyboard shortcuts
 
@@ -66,7 +72,11 @@ The shortcuts match Photoshop on every platform. Wherever Windows and Linux use 
 | Feather | Shift+F6 | ⇧F6 |
 | Rulers / Grid / Guides | Ctrl+R / Ctrl+' / Ctrl+; | ⌘R / ⌘' / ⌘; |
 | Snap / Lock Guides / Extras | Ctrl+Shift+; / Ctrl+Alt+; / Ctrl+H | ⇧⌘; / ⌥⌘; / ⌘H |
+| Levels / Curves / Hue/Saturation / Color Balance | Ctrl+L / Ctrl+M / Ctrl+U / Ctrl+B (add Alt for the last settings) | ⌘L / ⌘M / ⌘U / ⌘B (add ⌥ for the last settings) |
+| Black & White | Ctrl+Alt+Shift+B | ⌥⇧⌘B |
 | Invert / Desaturate | Ctrl+I / Ctrl+Shift+U | ⌘I / ⇧⌘U |
+| Auto Tone / Auto Contrast / Auto Color | Ctrl+Shift+L / Ctrl+Alt+Shift+L / Ctrl+Shift+B | ⇧⌘L / ⌥⇧⌘L / ⇧⌘B |
+| Last Filter / Fade | Ctrl+Alt+F / Ctrl+Shift+F | ⌥⌘F / ⇧⌘F |
 | Zoom In / Out / Fit / 100% | Ctrl+= / Ctrl+- / Ctrl+0 / Ctrl+1 | ⌘= / ⌘- / ⌘0 / ⌘1 |
 | Tools | V M L W C I B E G H Z (Shift+letter cycles a tool group) | same |
 | Default colours / Swap colours | D / X | same |
@@ -119,7 +129,7 @@ build\PhotoSlop.exe
 ```sh
 ctest --test-dir build --output-on-failure
 ```
-`test_core` covers blend maths, undo/redo, selections and Select ▸ Modify, transform and warp resampling, Quick Mask, guides, merging, crop/rotate and file round-trips. `test_ui` drives the real main window with simulated mouse input to check every tool, Free Transform, Quick Mask, rulers, guides and snapping. On a headless machine, run it with `QT_QPA_PLATFORM=offscreen`.
+`test_core` covers blend maths, undo/redo, selections and Select ▸ Modify, transform and warp resampling, Quick Mask, guides, merging, crop/rotate, file round-trips, and every adjustment and filter (including selection, lock and cancel handling). `test_ui` drives the real main window with simulated mouse input to check every tool, Free Transform, Quick Mask, rulers, guides, snapping, the live-preview dialogs, Last Filter and Fade. On a headless machine, run it with `QT_QPA_PLATFORM=offscreen`.
 
 ### Versions and releases
 
@@ -132,7 +142,7 @@ The version number lives in the `VERSION` file; CMake reads it and the app shows
 ## Project layout
 
 ```
-src/core/     Document model: layers, blend modes, compositing, selections, transforms and warps, undo commands, document operations
+src/core/     Document model: layers, blend modes, compositing, selections, transforms and warps, adjustments, filters, undo commands, document operations
 src/io/       File loading and saving (.pslop and flat image formats)
 src/tools/    One class per tool, plus the ToolManager (groups, shortcuts, temporary tools)
 src/ui/       Main window, canvas view, rulers, view options, toolbox, panels and dialogs
@@ -146,8 +156,8 @@ tests/        Core unit tests and GUI tests
 ## Roadmap
 
 1. **Core editor**: done.
-2. **Selections and transforms**: done (this release).
-3. **Adjustments and filters**: Levels, Curves, Hue/Saturation, Color Balance, Gaussian Blur, Unsharp Mask, Add Noise and more, with live preview.
+2. **Selections and transforms**: done.
+3. **Adjustments and filters**: done (this release).
 4. **Layer power features**: masks, clipping masks, groups, adjustment layers, layer styles, Type tool, Shape tools, Clone Stamp, Healing, Dodge/Burn.
 5. **Pro and platform**: PSD import/export, 16/32-bit and CMYK/Lab modes, GPU canvas, an editable shortcut editor, Preferences, and installers for every platform.
 

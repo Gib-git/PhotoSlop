@@ -6,6 +6,18 @@ The current version is in the `VERSION` file. To release, add notes under **Unre
 
 ## [Unreleased]
 
+Stage 3: adjustments and filters.
+
+### Added
+- Image ▸ Adjustments: Levels, Curves, Hue/Saturation, Color Balance, Brightness/Contrast, Black & White, Threshold and Posterize, with histograms and Photoshop's shortcuts. Hold Alt (Option) to reopen Levels, Curves, Hue/Saturation or Color Balance with the last settings.
+- Image ▸ Auto Tone, Auto Contrast and Auto Color.
+- Filters: Blur, Blur More, Box Blur, Gaussian Blur, Motion Blur, Add Noise, Median, Mosaic, Sharpen, Sharpen More, Unsharp Mask and High Pass.
+- Filter ▸ Last Filter (Ctrl+Alt+F) and Edit ▸ Fade (Ctrl+Shift+F).
+- Live canvas preview for every adjustment and filter dialog, rendered on all CPU cores in the background.
+
+### Changed
+- Invert and Desaturate now use the shared filter engine, so they can be faded.
+
 ## [0.2.0] - 2026-10-07
 
 Stage 2: selections and transforms.

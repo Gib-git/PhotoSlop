@@ -7,6 +7,8 @@
 #include <QPointer>
 #include <functional>
 
+#include "core/Adjustments.h"
+#include "core/Filters.h"
 #include "ui/ViewOptions.h"
 
 class CanvasView;
@@ -20,12 +22,15 @@ class HomeScreen;
 class InfoPanel;
 class LayersPanel;
 class NavigatorPanel;
+class ParamDialog;
+class PreviewDialog;
 class PanelStrip;
 class PropertiesPanel;
 class QDockWidget;
 class QMenu;
 class QStackedWidget;
 class QTabWidget;
+class QUndoCommand;
 class QToolBar;
 class QToolButton;
 class QUndoGroup;
@@ -102,7 +107,22 @@ private:
     void newGuideDialog();
     QAction* viewToggle(const QString& id, const QString& text, const QList<QKeySequence>& keys, bool ViewOptions::*field);
     void syncViewActions();
-    void applyPixelFilter(const QString& name, const std::function<QRgb(QRgb)>& fn);
+    // Adjustments and filters
+    using SpecRecipe = std::function<Filters::Spec()>;
+    using ParamBuilder = std::function<Filters::Spec(const QHash<QString, double>&)>;
+    // Runs an adjustment or filter dialog; on OK the change can be faded. True when applied.
+    bool execPreview(PreviewDialog& dlg);
+    // Applies a spec at once. With a recipe, it becomes the Last Filter.
+    void applySpec(const Filters::Spec& spec, const SpecRecipe& recipe = SpecRecipe());
+    // A dialog of sliders and options. Filters remember their values and become the Last
+    // Filter; adjustments start from defaults unless Alt is held.
+    void paramDialog(const QString& title, bool spreads, bool isFilter, const std::function<void(ParamDialog&)>& setup,
+                     const ParamBuilder& build);
+    void setLastFilter(const QString& name, const SpecRecipe& recipe);
+    void autoAdjust(Adjust::AutoMode mode, const QString& name);
+    void rememberFade(const QString& name, const Filters::Applied& applied);
+    bool canFade();
+    void fadeDialog();
     void showShortcuts();
     void showAbout();
     void toggleAllPanels(bool docksOnly);
@@ -155,6 +175,15 @@ private:
     QSize m_clipSize;
     bool m_clipValid = false;
     bool m_settingClipboard = false;
+
+    SpecRecipe m_lastFilter;
+    struct FadeState {
+        QPointer<Document> doc;
+        int index = -1;
+        const QUndoCommand* command = nullptr;
+        QString name;
+        Filters::Applied applied;
+    } m_fade;
 
     QElapsedTimer m_digitTimer;
     int m_pendingDigit = -1;
