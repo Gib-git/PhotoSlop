@@ -6,6 +6,7 @@
 #include <QDialog>
 #include <QFutureWatcher>
 #include <QHash>
+#include <QPointer>
 #include <QTimer>
 #include <array>
 #include <functional>
@@ -132,13 +133,20 @@ private:
 // Base for adjustment and filter dialogs: controls on the left, OK / Cancel / Preview on the
 // right, and a live preview on the canvas rendered on worker threads. OK commits one history
 // state; Cancel restores the layer.
+//
+// Given an adjustment layer's index, an adjustment dialog edits that layer's settings instead
+// of pixels (the Properties of an adjustment layer).
 class PreviewDialog : public QDialog {
     Q_OBJECT
 public:
     ~PreviewDialog() override;
 
     // False when the edit layer cannot be changed; show error() instead of exec().
-    bool isReady() const { return m_session && m_session->isValid(); }
+    bool isReady() const { return m_layer >= 0 || (m_session && m_session->isValid()); }
+    // Editing an adjustment layer rather than pixels.
+    bool editsLayer() const { return m_layer >= 0; }
+    // The settings as an adjustment layer (null for filters).
+    virtual std::shared_ptr<const Adjust::LayerSettings> layerSettings() const { return nullptr; }
     QString error() const { return m_error; }
     // The spec for the current settings.
     virtual Filters::Spec spec() const = 0;
@@ -155,7 +163,10 @@ public:
 
 protected:
     PreviewDialog(Document* doc, const QString& title, bool spreads, QWidget* parent,
-                  const QRect& target = QRect());
+                  const QRect& target = QRect(), int adjustmentLayer = -1);
+    // Histogram of what the adjustment works on: the target pixels, or for an adjustment
+    // layer, everything below it.
+    Adjust::Histogram sourceHistogram() const;
     QVBoxLayout* content() const { return m_content; }
     // Adds a button to the right-hand column, under OK and Cancel.
     QPushButton* addButton(const QString& text);
@@ -168,8 +179,12 @@ private:
     void finished();
     void stopWorker(bool keepCurrent);
     void finish(bool commit);
+    void showLayerSettings(const std::shared_ptr<const Adjust::LayerSettings>& s);
 
     std::unique_ptr<Filters::Session> m_session;
+    QPointer<Document> m_doc;
+    int m_layer = -1;
+    std::shared_ptr<const Adjust::LayerSettings> m_layerBefore;
     QString m_error;
     QFutureWatcher<QImage> m_watcher;
     std::shared_ptr<Filters::CancelFlag> m_cancel;
@@ -190,7 +205,11 @@ public:
     using Values = QHash<QString, double>;
     using Builder = std::function<Filters::Spec(const Values&)>;
 
-    ParamDialog(Document* doc, const QString& title, bool spreads, Builder builder, QWidget* parent = nullptr);
+    ParamDialog(Document* doc, const QString& title, bool spreads, Builder builder, QWidget* parent = nullptr,
+                int adjustmentLayer = -1);
+    // How the values become adjustment layer settings.
+    void setLayerBuilder(std::function<Adjust::LayerSettings(const Values&)> b) { m_layerBuilder = std::move(b); }
+    std::shared_ptr<const Adjust::LayerSettings> layerSettings() const override;
 
     SliderField* addSlider(const QString& key, const QString& label, double min, double max, double value,
                            int decimals = 0, const QString& unit = QString(), double sliderMax = 0);
@@ -213,6 +232,7 @@ public:
 private:
     QString m_title;
     Builder m_builder;
+    std::function<Adjust::LayerSettings(const Values&)> m_layerBuilder;
     Values m_values;
     QHash<QString, std::function<void(double)>> m_setters;
     static QHash<QString, Values> s_last;
@@ -221,7 +241,8 @@ private:
 class LevelsDialog : public PreviewDialog {
     Q_OBJECT
 public:
-    LevelsDialog(Document* doc, bool useLast, QWidget* parent = nullptr);
+    LevelsDialog(Document* doc, bool useLast, QWidget* parent = nullptr, int adjustmentLayer = -1);
+    std::shared_ptr<const Adjust::LayerSettings> layerSettings() const override;
     Filters::Spec spec() const override;
     Adjust::Levels levels() const { return m_levels; }
     void setLevels(const Adjust::Levels& levels);
@@ -250,7 +271,8 @@ private:
 class CurvesDialog : public PreviewDialog {
     Q_OBJECT
 public:
-    CurvesDialog(Document* doc, bool useLast, QWidget* parent = nullptr);
+    CurvesDialog(Document* doc, bool useLast, QWidget* parent = nullptr, int adjustmentLayer = -1);
+    std::shared_ptr<const Adjust::LayerSettings> layerSettings() const override;
     Filters::Spec spec() const override;
     Adjust::Curves curves() const { return m_curves; }
     void setCurves(const Adjust::Curves& curves);
@@ -274,7 +296,8 @@ private:
 class HueSaturationDialog : public PreviewDialog {
     Q_OBJECT
 public:
-    HueSaturationDialog(Document* doc, bool useLast, QWidget* parent = nullptr);
+    HueSaturationDialog(Document* doc, bool useLast, QWidget* parent = nullptr, int adjustmentLayer = -1);
+    std::shared_ptr<const Adjust::LayerSettings> layerSettings() const override;
     Filters::Spec spec() const override;
     Adjust::HueSaturation settings() const { return m_hs; }
     void setSettings(const Adjust::HueSaturation& hs);
@@ -298,7 +321,8 @@ private:
 class ColorBalanceDialog : public PreviewDialog {
     Q_OBJECT
 public:
-    ColorBalanceDialog(Document* doc, bool useLast, QWidget* parent = nullptr);
+    ColorBalanceDialog(Document* doc, bool useLast, QWidget* parent = nullptr, int adjustmentLayer = -1);
+    std::shared_ptr<const Adjust::LayerSettings> layerSettings() const override;
     Filters::Spec spec() const override;
     Adjust::ColorBalance settings() const { return m_cb; }
     void setSettings(const Adjust::ColorBalance& cb);
@@ -319,7 +343,8 @@ private:
 class ThresholdDialog : public PreviewDialog {
     Q_OBJECT
 public:
-    ThresholdDialog(Document* doc, QWidget* parent = nullptr);
+    ThresholdDialog(Document* doc, QWidget* parent = nullptr, int adjustmentLayer = -1);
+    std::shared_ptr<const Adjust::LayerSettings> layerSettings() const override;
     Filters::Spec spec() const override;
     int level() const;
     void setLevel(int level);

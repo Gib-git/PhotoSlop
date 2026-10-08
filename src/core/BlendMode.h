@@ -33,6 +33,7 @@ enum class BlendMode : int {
     Saturation,
     Color,
     Luminosity,
+    PassThrough, // groups only: children blend straight into what is below
     Count
 };
 

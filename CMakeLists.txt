@@ -57,6 +57,7 @@ enable_testing()
 qt_add_executable(test_core tests/test_core.cpp)
 target_link_libraries(test_core PRIVATE photoslop_core Qt6::Test)
 add_test(NAME test_core COMMAND test_core)
+set_tests_properties(test_core PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 qt_add_executable(test_ui tests/test_ui.cpp)
 qt_add_resources(test_ui "test_resources"

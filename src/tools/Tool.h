@@ -50,6 +50,8 @@ public:
     virtual void mouseRelease(CanvasView*, const ToolEvent&) {}
     virtual void mouseDoubleClick(CanvasView*, const ToolEvent&) {}
     virtual bool keyPress(CanvasView*, QKeyEvent*) { return false; }
+    // True to receive this key ahead of the application's shortcuts (text entry).
+    virtual bool wantsKey(const QKeyEvent*) const { return false; }
     virtual void paintOverlay(QPainter&, CanvasView*) {}
     virtual QCursor cursor(CanvasView*, Qt::KeyboardModifiers) const { return Qt::ArrowCursor; }
     // Brush outline diameter in canvas pixels (0 = none).

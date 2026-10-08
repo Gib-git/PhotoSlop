@@ -1,6 +1,10 @@
 #include "core/Layer.h"
 
+#include "core/LayerStyle.h"
+#include "core/VectorLayers.h"
+
 #include <QPainter>
+#include <cstring>
 #include <atomic>
 #include <algorithm>
 #include <iterator>
@@ -95,9 +99,59 @@ void Layer::trimToContent()
     offset += r.topLeft();
 }
 
+bool Layer::hasStyle() const { return style && style->active(); }
+
+int Layer::maskAt(const QPoint& canvasPt) const
+{
+    if (!mask || !maskEnabled) return 255;
+    return maskValue(mask->pixelAt(canvasPt), maskDefault);
+}
+
+void Layer::maskRow(int y, int x0, int count, uint8_t* out) const
+{
+    if (!mask || !maskEnabled) {
+        memset(out, 255, size_t(count));
+        return;
+    }
+    const Layer& m = *mask;
+    const int def = maskDefault;
+    const int my = y - m.offset.y();
+    if (m.image.isNull() || my < 0 || my >= m.image.height()) {
+        memset(out, def, size_t(count));
+        return;
+    }
+    const auto* row = reinterpret_cast<const QRgb*>(m.image.constScanLine(my));
+    const int w = m.image.width();
+    for (int i = 0; i < count; ++i) {
+        const int mx = x0 + i - m.offset.x();
+        out[i] = uint8_t(mx < 0 || mx >= w ? def : maskValue(row[mx], def));
+    }
+}
+
+void Layer::translate(const QPoint& delta)
+{
+    if (delta.isNull()) return;
+    offset += delta;
+    if (mask && maskLinked) mask->offset += delta;
+    if (isVector()) Vector::translateData(*this, QPointF(delta));
+}
+
+void Layer::renewIds()
+{
+    id = nextId();
+    if (mask) mask->id = nextId();
+}
+
 bool sameLayer(const Layer& a, const Layer& b)
 {
-    return a.id == b.id && a.image.cacheKey() == b.image.cacheKey() && a.offset == b.offset
-        && a.visible == b.visible && a.opacity == b.opacity && a.fill == b.fill
-        && a.mode == b.mode && a.isBackground == b.isBackground;
+    if (a.id != b.id || a.image.cacheKey() != b.image.cacheKey() || a.offset != b.offset || a.visible != b.visible
+        || a.opacity != b.opacity || a.fill != b.fill || a.mode != b.mode || a.isBackground != b.isBackground
+        || a.kind != b.kind || a.parent != b.parent || a.clipped != b.clipped || a.adjustment != b.adjustment
+        || a.style != b.style || a.text != b.text || a.shape != b.shape)
+        return false;
+    if (bool(a.mask) != bool(b.mask)) return false;
+    if (a.mask
+        && (a.maskDefault != b.maskDefault || a.maskEnabled != b.maskEnabled || !sameLayer(*a.mask, *b.mask)))
+        return false;
+    return true;
 }

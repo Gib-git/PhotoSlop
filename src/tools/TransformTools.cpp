@@ -1,8 +1,10 @@
 #include "tools/TransformTools.h"
 
 #include "core/ColorState.h"
+#include "core/Compositor.h"
 #include "core/DocumentOps.h"
 #include "core/ImageOps.h"
+#include "core/LayerTree.h"
 #include "core/Selection.h"
 #include "tools/ToolManager.h"
 #include "ui/CanvasView.h"
@@ -33,6 +35,7 @@ QWidget* MoveTool::createOptions(QWidget* parent)
     lay->addWidget(autoSel);
     auto* target = new QComboBox(w);
     target->addItems({QStringLiteral("Layer"), QStringLiteral("Group")});
+    connect(target, &QComboBox::currentIndexChanged, this, [this](int i) { m_autoSelectGroup = i == 1; });
     lay->addWidget(target);
     lay->addWidget(makeVSeparator(w));
     auto* transform = new QCheckBox(QStringLiteral("Show Transform Controls"), w);
@@ -49,23 +52,21 @@ QCursor MoveTool::cursor(CanvasView*, Qt::KeyboardModifiers) const
 
 bool MoveTool::begin(Document* doc)
 {
-    Layer* l = doc->activeLayer();
-    if (!l) return false;
-    if (doc->hasSelection()) {
-        if (l->pixelsLocked() || !l->visible) {
-            alert(QStringLiteral("Could not use the move tool because the target layer is %1.")
-                      .arg(l->visible ? QStringLiteral("locked") : QStringLiteral("hidden")));
-            return false;
-        }
-    } else if (l->positionLocked()) {
+    Layer* active = doc->activeLayer();
+    if (!active) return false;
+    m_floating = doc->hasSelection();
+    if (m_floating) {
+        if (!m_manager->preparePixelEdit(doc, QStringLiteral("Could not use the move tool"))) return false;
+    } else if (active->positionLocked()) {
         alert(QStringLiteral("Could not use the move tool because the layer is locked."));
         return false;
     }
     m_before = doc->state();
     m_delta = QPoint();
-    m_floating = doc->hasSelection();
     if (m_floating) {
-        // Lift the selected pixels into a floating image and clear them from the layer.
+        // Lift the selected pixels (of the layer or its mask) into a floating image.
+        m_index = doc->editIndex();
+        Layer* l = &doc->layerRef(m_index);
         if (!l->isBackground) l->ensureCovers(doc->bounds());
         const QRect r = doc->selectionBounds();
         m_float = QImage(r.size(), QImage::Format_ARGB32_Premultiplied);
@@ -89,10 +90,18 @@ bool MoveTool::begin(Document* doc)
         m_snapRect = r;
         moveTo(doc, QPoint());
     } else {
-        m_origOffset = l->offset;
-        Layer content = *l;
-        content.trimToContent();
-        m_snapRect = content.rect();
+        // The whole layer moves, with a group's contents and linked masks.
+        m_index = doc->activeIndex();
+        m_subStart = Tree::subtreeStart(doc->layers(), m_index);
+        m_origLayers = doc->layers().mid(m_subStart, m_index - m_subStart + 1);
+        m_prevExtent = Compositor::extent(doc->layers(), m_index, doc->bounds());
+        QRect content;
+        for (const Layer& l : m_origLayers) {
+            Layer probe = l;
+            probe.trimToContent();
+            content |= probe.rect();
+        }
+        m_snapRect = content;
     }
     m_active = true;
     return true;
@@ -100,15 +109,20 @@ bool MoveTool::begin(Document* doc)
 
 void MoveTool::moveTo(Document* doc, const QPoint& delta)
 {
-    Layer* l = doc->activeLayer();
-    const int idx = doc->activeIndex();
     if (!m_floating) {
-        QRect old = l->rect();
-        l->offset = m_origOffset + delta;
-        doc->notifyLayerPixels(idx, old | l->rect());
+        for (int i = 0; i < m_origLayers.size(); ++i) {
+            Layer& l = doc->layerRef(m_subStart + i);
+            l = m_origLayers[i];
+            l.translate(delta);
+        }
+        const QRect ext = Compositor::extent(doc->layers(), m_index, doc->bounds());
+        doc->notifyLayerPixels(m_index, m_prevExtent | ext);
+        m_prevExtent = ext;
         m_delta = delta;
         return;
     }
+    Layer* l = &doc->layerRef(m_index);
+    const int idx = m_index;
     // Restore the previously covered area, then stamp the floating pixels.
     const QRect lr = l->rect();
     QRect restore = m_prevRect & lr;
@@ -140,6 +154,7 @@ void MoveTool::finish(Document* doc, const QString& text)
     m_float = QImage();
     m_cleared = QImage();
     m_selOrig = QImage();
+    m_origLayers.clear();
     m_before = DocState();
 }
 
@@ -147,13 +162,18 @@ void MoveTool::mousePress(CanvasView* v, const ToolEvent& e)
 {
     Document* doc = v->document();
     if (m_autoSelect) {
+        // The top visible layer with pixels under the pointer (or its outermost group).
         const QPoint px = e.pixel();
+        const QList<Layer>& layers = doc->layers();
         for (int i = doc->layerCount() - 1; i >= 0; --i) {
-            const Layer& l = doc->layerAt(i);
-            if (l.visible && qAlpha(l.pixelAt(px)) > 0) {
-                doc->setActiveIndex(i);
-                break;
-            }
+            const Layer& l = layers[i];
+            if (l.isGroup() || l.kind == LayerKind::Adjustment || !Tree::effectivelyVisible(layers, i)) continue;
+            if (qAlpha(l.pixelAt(px)) == 0 || l.maskAt(px) == 0) continue;
+            int pick = i;
+            if (m_autoSelectGroup)
+                for (int p = Tree::parentIndex(layers, i); p >= 0; p = Tree::parentIndex(layers, p)) pick = p;
+            doc->setActiveIndex(pick);
+            break;
         }
     }
     if (!begin(doc)) return;

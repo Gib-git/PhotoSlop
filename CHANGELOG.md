@@ -6,6 +6,27 @@ The current version is in the `VERSION` file. To release, add notes under **Unre
 
 ## [Unreleased]
 
+Stage 4: layer power features.
+
+### Added
+- Layer groups: New Group, Group Layers (Ctrl+G), Ungroup (Ctrl+Shift+G), nesting, Pass Through and other blend modes, group opacity and masks, collapsible rows, dragging layers into and out of groups, Merge Group.
+- Layer masks: Reveal/Hide All, Reveal/Hide Selection, Delete, Apply, Disable, Link and Load Selection; click the mask thumbnail to paint on it with any tool, filter or adjustment.
+- Clipping masks (Ctrl+Alt+G).
+- Adjustment layers for Brightness/Contrast, Levels, Curves, Hue/Saturation, Color Balance, Black & White, Invert, Posterize and Threshold, from the Layer menu, the Adjustments panel or the Layers panel; Layer Content Options reopens their settings.
+- Layer styles: Stroke, Color Overlay, Outer Glow and Drop Shadow with Blending Options and a live preview; Copy, Paste, Clear and Hide All Effects; Rasterize ▸ Layer Style.
+- Type tool (T) for editable point text, with font, style, size, anti-aliasing, alignment and colour.
+- Shape tools (U): Rectangle (rounded corners), Ellipse, Polygon (star) and Line, as editable shape layers with fill and stroke.
+- Clone Stamp (S), Healing Brush and Spot Healing Brush (J), History Brush (Y), Dodge, Burn and Sponge (O), and Blur, Sharpen and Smudge.
+- History panel: Set Source for History Brush.
+- Layer ▸ Rasterize (Type, Shape, Layer Style, Layer) and Type ▸ Rasterize Type Layer; painting, filters and adjustments on a type or shape layer offer to rasterize it.
+- A context-aware Properties panel.
+- `.pslop` files store groups, masks, clipping, adjustment, type and shape layers and styles (older files still open).
+
+### Changed
+- The compositor is rewritten around the layer tree and renders on all CPU cores.
+- Free Transform, canvas rotation, Image Size and Canvas Size keep type and shape layers as vectors.
+- The Move tool moves whole groups and linked masks, and Auto-Select can pick the group.
+
 ## [0.3.0] - 2026-10-07
 
 Stage 3: adjustments and filters.

@@ -1,8 +1,10 @@
 #include "ui/panels/Panels.h"
 
 #include "app/Theme.h"
+#include "core/Adjustments.h"
 #include "core/ColorState.h"
 #include "core/Document.h"
+#include "core/VectorLayers.h"
 #include "ui/CanvasView.h"
 #include "ui/ToolBox.h"
 #include "ui/Widgets.h"
@@ -13,6 +15,7 @@
 #include <QHBoxLayout>
 #include <QHelpEvent>
 #include <QLabel>
+#include <QMenu>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPushButton>
@@ -486,12 +489,31 @@ HistoryPanel::HistoryPanel(QUndoGroup* group, QWidget* parent)
     root->setContentsMargins(0, 0, 0, 0);
     m_view = new QUndoView(group, this);
     m_view->setEmptyLabel(QStringLiteral("Open"));
+    m_view->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_view, &QWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
+        const QModelIndex idx = m_view->indexAt(pos);
+        if (!m_doc || !idx.isValid()) return;
+        QMenu menu(this);
+        QAction* a = menu.addAction(QStringLiteral("Set Source for History Brush"));
+        a->setCheckable(true);
+        a->setChecked(idx.row() == m_source);
+        if (menu.exec(m_view->viewport()->mapToGlobal(pos)) == a) setHistoryBrushSource(idx.row());
+    });
     root->addWidget(m_view);
 }
 
 void HistoryPanel::setDocument(Document* doc)
 {
+    if (doc != m_doc) m_source = 0;
+    m_doc = doc;
     m_view->setEmptyLabel(doc && doc->filePath().isEmpty() ? QStringLiteral("New") : QStringLiteral("Open"));
+}
+
+void HistoryPanel::setHistoryBrushSource(int state)
+{
+    if (!m_doc) return;
+    m_source = state;
+    m_doc->setHistorySource(m_doc->stateAt(state));
 }
 
 // ---------------- PropertiesPanel ----------------
@@ -505,20 +527,14 @@ PropertiesPanel::PropertiesPanel(QWidget* parent)
     m_title->setStyleSheet(QStringLiteral("font-weight: bold;"));
     m_body = new QLabel(this);
     m_body->setTextFormat(Qt::RichText);
+    m_body->setWordWrap(true);
     root->addWidget(m_title);
     root->addWidget(m_body);
-    auto* actions = new QHBoxLayout;
-    for (const char* id : {"image.imageSize", "image.canvasSize"}) {
-        auto* b = new QPushButton(this);
-        b->setProperty("actionId", QString::fromLatin1(id));
-        b->setStyleSheet(QStringLiteral("QPushButton { min-width: 0; padding: 3px 8px; }"));
-        connect(b, &QPushButton::clicked, this, [this, b] {
-            if (m_lookup)
-                if (QAction* a = m_lookup(b->property("actionId").toString())) a->trigger();
-        });
-        actions->addWidget(b);
-    }
-    root->addLayout(actions);
+    m_buttons = new QWidget(this);
+    auto* column = new QVBoxLayout(m_buttons);
+    column->setContentsMargins(0, 0, 0, 0);
+    column->setSpacing(4);
+    root->addWidget(m_buttons);
     root->addStretch();
     refresh();
 }
@@ -526,12 +542,37 @@ PropertiesPanel::PropertiesPanel(QWidget* parent)
 void PropertiesPanel::setActionLookup(std::function<QAction*(const QString&)> lookup)
 {
     m_lookup = std::move(lookup);
-    for (auto* b : findChildren<QPushButton*>()) {
-        if (QAction* a = m_lookup(b->property("actionId").toString())) {
-            QString t = a->text();
-            t.remove(QLatin1Char('&'));
-            b->setText(t);
-        }
+    m_buttonIds.clear();
+    refresh();
+}
+
+void PropertiesPanel::setButtons(const QStringList& ids)
+{
+    if (ids == m_buttonIds) return;
+    m_buttonIds = ids;
+    auto* column = static_cast<QVBoxLayout*>(m_buttons->layout());
+    while (QLayoutItem* it = column->takeAt(0)) {
+        delete it->widget();
+        delete it;
+    }
+    for (const QString& id : ids) {
+        QAction* a = m_lookup ? m_lookup(id) : nullptr;
+        if (!a) continue;
+        auto* b = new QPushButton(m_buttons);
+        QString t = a->text();
+        t.remove(QLatin1Char('&'));
+        b->setText(t);
+        b->setStyleSheet(QStringLiteral("QPushButton { min-width: 0; padding: 3px 8px; }"));
+        b->setEnabled(a->isEnabled());
+        connect(b, &QPushButton::clicked, this, [a] { a->trigger(); });
+        // Follow the action's state (and toggled names such as Disable/Enable Layer Mask).
+        connect(a, &QAction::changed, b, [a, b] {
+            QString text = a->text();
+            text.remove(QLatin1Char('&'));
+            b->setText(text);
+            b->setEnabled(a->isEnabled());
+        });
+        column->addWidget(b, 0, Qt::AlignLeft);
     }
 }
 
@@ -542,6 +583,7 @@ void PropertiesPanel::setDocument(Document* doc)
     if (doc) {
         connect(doc, &Document::layersChanged, this, &PropertiesPanel::refresh);
         connect(doc, &Document::activeLayerChanged, this, &PropertiesPanel::refresh);
+        connect(doc, &Document::editTargetChanged, this, &PropertiesPanel::refresh);
         connect(doc, &Document::sizeChanged, this, &PropertiesPanel::refresh);
     }
     refresh();
@@ -549,32 +591,85 @@ void PropertiesPanel::setDocument(Document* doc)
 
 void PropertiesPanel::refresh()
 {
-    for (auto* b : findChildren<QPushButton*>()) b->setVisible(m_doc);
     if (!m_doc) {
         m_title->setText(QStringLiteral("No Properties"));
         m_body->clear();
+        setButtons({});
         return;
     }
     const Layer* l = m_doc->activeLayer();
-    QString body = QStringLiteral("<p><b>Canvas</b></p><table cellspacing=4>"
-                                  "<tr><td>W:</td><td>%1 px</td><td>&nbsp;&nbsp;H:</td><td>%2 px</td></tr>"
-                                  "<tr><td>Resolution:</td><td colspan=3>%3 Pixels/Inch</td></tr>"
-                                  "<tr><td>Mode:</td><td colspan=3>RGB Color, 8 Bits/Channel</td></tr></table>")
-                       .arg(m_doc->width())
-                       .arg(m_doc->height())
-                       .arg(m_doc->dpi());
-    if (l && !l->isBackground) {
-        const QRect r = l->rect();
-        body += QStringLiteral("<p><b>Transform</b></p><table cellspacing=4>"
-                               "<tr><td>W:</td><td>%1 px</td><td>&nbsp;&nbsp;H:</td><td>%2 px</td></tr>"
-                               "<tr><td>X:</td><td>%3 px</td><td>&nbsp;&nbsp;Y:</td><td>%4 px</td></tr></table>")
-                    .arg(r.width())
-                    .arg(r.height())
-                    .arg(r.x())
-                    .arg(r.y());
+    const QString canvas = QStringLiteral("<p><b>Canvas</b></p><table cellspacing=4>"
+                                          "<tr><td>W:</td><td>%1 px</td><td>&nbsp;&nbsp;H:</td><td>%2 px</td></tr>"
+                                          "<tr><td>Resolution:</td><td colspan=3>%3 Pixels/Inch</td></tr>"
+                                          "<tr><td>Mode:</td><td colspan=3>RGB Color, 8 Bits/Channel</td></tr></table>")
+                               .arg(m_doc->width())
+                               .arg(m_doc->height())
+                               .arg(m_doc->dpi());
+    auto transform = [](const QRect& r) {
+        return QStringLiteral("<p><b>Transform</b></p><table cellspacing=4>"
+                              "<tr><td>W:</td><td>%1 px</td><td>&nbsp;&nbsp;H:</td><td>%2 px</td></tr>"
+                              "<tr><td>X:</td><td>%3 px</td><td>&nbsp;&nbsp;Y:</td><td>%4 px</td></tr></table>")
+            .arg(r.width())
+            .arg(r.height())
+            .arg(r.x())
+            .arg(r.y());
+    };
+    if (!l || l->isBackground) {
+        m_title->setText(QStringLiteral("Document"));
+        m_body->setText(canvas);
+        setButtons({QStringLiteral("image.imageSize"), QStringLiteral("image.canvasSize")});
+        return;
     }
-    m_title->setText(l && !l->isBackground ? QStringLiteral("Pixel Layer") : QStringLiteral("Document"));
-    m_body->setText(body);
+    if (m_doc->editingMask()) {
+        m_title->setText(QStringLiteral("Masks"));
+        m_body->setText(QStringLiteral("<p><b>Layer Mask</b></p><p>Paint black to hide and white to reveal. "
+                                       "Click the layer thumbnail in the Layers panel to edit the pixels again.</p>"));
+        setButtons({QStringLiteral("layer.maskToggle"), QStringLiteral("layer.maskApply"), QStringLiteral("layer.maskDelete"),
+                    QStringLiteral("layer.maskLoadSelection")});
+        return;
+    }
+    switch (l->kind) {
+    case LayerKind::Adjustment:
+        m_title->setText(l->adjustment ? l->adjustment->name() : QStringLiteral("Adjustment"));
+        m_body->setText(QStringLiteral("<p>Adjustment layer: it changes the layers below without altering their pixels. "
+                                       "Paint on its mask to limit where it applies.</p>"));
+        setButtons({QStringLiteral("layer.contentOptions"), QStringLiteral("layer.clipping")});
+        return;
+    case LayerKind::Group:
+        m_title->setText(QStringLiteral("Group"));
+        m_body->setText(QStringLiteral("<p>Blend mode: %1</p>").arg(Blend::name(l->mode)));
+        setButtons({QStringLiteral("layer.ungroup"), QStringLiteral("layer.mergeDown")});
+        return;
+    case LayerKind::Text: {
+        const TextData& t = *l->text;
+        m_title->setText(QStringLiteral("Type Layer"));
+        m_body->setText(transform(l->rect())
+                        + QStringLiteral("<p><b>Character</b></p><p>%1, %2 px%3<br>Color: %4</p>")
+                              .arg(t.font().family())
+                              .arg(t.size)
+                              .arg(t.bold || t.italic ? QStringLiteral(", ") + QString(t.bold ? QStringLiteral("Bold ") : QString())
+                                                            + QString(t.italic ? QStringLiteral("Italic") : QString())
+                                                      : QString())
+                              .arg(t.color.name().toUpper()));
+        setButtons({QStringLiteral("type.rasterize"), QStringLiteral("layer.styleBlending")});
+        return;
+    }
+    case LayerKind::Shape: {
+        const ShapeData& s = *l->shape;
+        m_title->setText(QStringLiteral("Live Shape Properties"));
+        m_body->setText(transform(s.path.boundingRect().toAlignedRect())
+                        + QStringLiteral("<p><b>Appearance</b></p><p>Fill: %1<br>Stroke: %2</p>")
+                              .arg(s.fillEnabled ? s.fillColor.name().toUpper() : QStringLiteral("None"))
+                              .arg(s.strokeEnabled ? QStringLiteral("%1, %2 px").arg(s.strokeColor.name().toUpper()).arg(s.strokeWidth)
+                                                   : QStringLiteral("None")));
+        setButtons({QStringLiteral("layer.rasterizeShape"), QStringLiteral("layer.styleBlending")});
+        return;
+    }
+    case LayerKind::Pixel: break;
+    }
+    m_title->setText(QStringLiteral("Pixel Layer"));
+    m_body->setText(transform(l->rect()));
+    setButtons({QStringLiteral("layer.styleBlending"), QStringLiteral("layer.maskRevealAll")});
 }
 
 // ---------------- ChannelsPanel ----------------
@@ -670,14 +765,33 @@ AdjustmentsPanel::AdjustmentsPanel(QWidget* parent)
     root->addWidget(new QLabel(QStringLiteral("Add an adjustment"), this));
     auto* grid = new QGridLayout;
     grid->setSpacing(2);
-    const char* names[] = {"Brightness/Contrast", "Levels", "Curves", "Exposure", "Vibrance", "Hue/Saturation",
-                           "Color Balance", "Black & White", "Photo Filter", "Channel Mixer", "Color Lookup",
-                           "Invert", "Posterize", "Threshold", "Gradient Map", "Selective Color"};
-    for (int i = 0; i < 16; ++i) {
-        auto* b = makeIconButton(QStringLiteral("adjustment"), QString::fromLatin1(names[i]), this, false, 26);
+    const struct { const char* name; const char* action; } items[] = {
+        {"Brightness/Contrast", "layer.newAdjustment.brightnessContrast"}, {"Levels", "layer.newAdjustment.levels"},
+        {"Curves", "layer.newAdjustment.curves"}, {"Exposure", nullptr}, {"Vibrance", nullptr},
+        {"Hue/Saturation", "layer.newAdjustment.hueSaturation"}, {"Color Balance", "layer.newAdjustment.colorBalance"},
+        {"Black & White", "layer.newAdjustment.blackWhite"}, {"Photo Filter", nullptr}, {"Channel Mixer", nullptr},
+        {"Color Lookup", nullptr}, {"Invert", "layer.newAdjustment.invert"}, {"Posterize", "layer.newAdjustment.posterize"},
+        {"Threshold", "layer.newAdjustment.threshold"}, {"Gradient Map", nullptr}, {"Selective Color", nullptr},
+    };
+    int i = 0;
+    for (const auto& it : items) {
+        auto* b = makeIconButton(QStringLiteral("adjustment"), QString::fromLatin1(it.name), this, false, 26);
         b->setEnabled(false);
+        if (it.action) m_buttons.append({b, QString::fromLatin1(it.action)});
         grid->addWidget(b, i / 8, i % 8);
+        ++i;
     }
     root->addLayout(grid);
     root->addStretch();
+}
+
+void AdjustmentsPanel::setActionLookup(std::function<QAction*(const QString&)> lookup)
+{
+    for (const auto& [button, id] : m_buttons) {
+        QAction* a = lookup(id);
+        if (!a) continue;
+        connect(button, &QToolButton::clicked, a, &QAction::trigger);
+        connect(a, &QAction::changed, button, [button, a] { button->setEnabled(a->isEnabled()); });
+        button->setEnabled(a->isEnabled());
+    }
 }

@@ -117,9 +117,14 @@ class HistoryPanel : public QWidget {
 public:
     HistoryPanel(QUndoGroup* group, QWidget* parent = nullptr);
     void setDocument(Document* doc);
+    // History > context menu: the History Brush paints from this state (0 = as opened).
+    void setHistoryBrushSource(int state);
+    int historyBrushSource() const { return m_source; }
 
 private:
     class QUndoView* m_view;
+    QPointer<Document> m_doc;
+    int m_source = 0;
 };
 
 class PropertiesPanel : public QWidget {
@@ -131,9 +136,12 @@ public:
 
 private:
     void refresh();
+    void setButtons(const QStringList& actionIds);
     QPointer<Document> m_doc;
     QLabel* m_title;
     QLabel* m_body;
+    QWidget* m_buttons;
+    QStringList m_buttonIds;
     std::function<QAction*(const QString&)> m_lookup;
 };
 
@@ -160,8 +168,13 @@ public:
     PlaceholderPanel(const QString& text, QWidget* parent = nullptr);
 };
 
+// Buttons that add adjustment layers (Layer > New Adjustment Layer).
 class AdjustmentsPanel : public QWidget {
     Q_OBJECT
 public:
     explicit AdjustmentsPanel(QWidget* parent = nullptr);
+    void setActionLookup(std::function<QAction*(const QString&)> lookup);
+
+private:
+    QList<QPair<class QToolButton*, QString>> m_buttons;
 };

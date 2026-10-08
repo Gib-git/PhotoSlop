@@ -1,9 +1,11 @@
 #include "core/Document.h"
 
 #include "core/Commands.h"
+#include "core/Compositor.h"
 #include "core/Selection.h"
 
 #include <QMetaObject>
+#include <QSignalBlocker>
 #include <QUndoStack>
 #include <cstring>
 #include <algorithm>
@@ -38,7 +40,10 @@ void Document::setActiveIndex(int index)
     index = std::clamp(index, 0, int(m_layers.size()) - 1);
     if (index == m_active) return;
     m_active = index;
+    // A newly selected layer is targeted by its pixels, as in Photoshop's default.
+    m_maskTarget = false;
     emit activeLayerChanged();
+    emit editTargetChanged();
 }
 
 Layer* Document::activeLayer()
@@ -47,12 +52,77 @@ Layer* Document::activeLayer()
     return &m_layers[std::clamp(m_active, 0, int(m_layers.size()) - 1)];
 }
 
+const Layer& Document::layerAt(int index) const
+{
+    if (index == kQuickMaskIndex) return m_qmLayer;
+    if (isMaskIndex(index)) return *m_layers[maskOwner(index)].mask;
+    return m_layers[index];
+}
+
+Layer& Document::layerRef(int index)
+{
+    if (index == kQuickMaskIndex) return m_qmLayer;
+    if (isMaskIndex(index)) return *m_layers[maskOwner(index)].mask;
+    return m_layers[index];
+}
+
+int Document::editIndex() const
+{
+    if (m_quickMask) return kQuickMaskIndex;
+    if (m_layers.isEmpty()) return m_active;
+    const int a = std::clamp(m_active, 0, int(m_layers.size()) - 1);
+    const Layer& l = m_layers[a];
+    if (l.mask && (m_maskTarget || l.kind == LayerKind::Adjustment)) return maskIndex(a);
+    return a;
+}
+
+Layer* Document::editLayer()
+{
+    if (m_layers.isEmpty() && !m_quickMask) return nullptr;
+    return &layerRef(editIndex());
+}
+
+void Document::setMaskTargeted(bool on)
+{
+    if (on == m_maskTarget) return;
+    m_maskTarget = on;
+    emit editTargetChanged();
+}
+
 int Document::indexOfId(quint64 id) const
 {
     if (m_quickMask && id == m_qmLayer.id) return kQuickMaskIndex;
-    for (int i = 0; i < m_layers.size(); ++i)
+    for (int i = 0; i < m_layers.size(); ++i) {
         if (m_layers[i].id == id) return i;
+        if (m_layers[i].mask && m_layers[i].mask->id == id) return maskIndex(i);
+    }
     return -1;
+}
+
+QString Document::nextName(const QString& prefix) const
+{
+    for (int n = 1;; ++n) {
+        const QString name = QStringLiteral("%1 %2").arg(prefix).arg(n);
+        bool taken = false;
+        for (const Layer& l : m_layers)
+            if (l.name == name) taken = true;
+        if (!taken) return name;
+    }
+}
+
+DocState Document::stateAt(int undoIndex)
+{
+    const int current = m_undo->index();
+    undoIndex = std::clamp(undoIndex, 0, m_undo->count());
+    if (undoIndex == current) return state();
+    // Step the history there and back without telling anyone.
+    const QSignalBlocker blockDoc(this);
+    const QSignalBlocker blockStack(m_undo);
+    m_undo->setIndex(undoIndex);
+    DocState s = state();
+    m_undo->setIndex(current);
+    invalidate();
+    return s;
 }
 
 QString Document::nextLayerName()
@@ -218,21 +288,7 @@ QRgb Document::compositePixel(const QPoint& pt)
 
 void Document::recomposite(const QRect& r)
 {
-    for (int y = r.top(); y <= r.bottom(); ++y)
-        memset(m_composite.scanLine(y) + r.left() * 4, 0, size_t(r.width()) * 4);
-
-    for (const Layer& l : m_layers) {
-        if (!l.visible || l.image.isNull()) continue;
-        QRect lr = l.rect() & r;
-        if (lr.isEmpty()) continue;
-        const float op = l.opacity * l.fill;
-        for (int y = lr.top(); y <= lr.bottom(); ++y) {
-            auto* dst = reinterpret_cast<uint32_t*>(m_composite.scanLine(y)) + lr.left();
-            auto* src = reinterpret_cast<const uint32_t*>(l.image.constScanLine(y - l.offset.y()))
-                + (lr.left() - l.offset.x());
-            Blend::compositeRow(dst, src, lr.width(), l.mode, op, nullptr, lr.left(), y);
-        }
-    }
+    Compositor::renderParallel(m_layers, m_composite, r);
 }
 
 void Document::updatePyramid(const QRect& r)
@@ -295,7 +351,7 @@ void Document::restoreState(const DocState& s)
             }
             if (!sameLayer(m_layers[i], s.layers[i])) {
                 layersDiffer = true;
-                dirty |= m_layers[i].rect() | s.layers[i].rect();
+                dirty |= Compositor::extent(m_layers, i, bounds()) | Compositor::extent(s.layers, i, bounds());
             }
         }
     } else {
@@ -309,6 +365,10 @@ void Document::restoreState(const DocState& s)
     m_dpi = s.dpi;
     m_layers = s.layers;
     m_active = std::clamp(s.active, 0, std::max(0, int(m_layers.size()) - 1));
+    if (m_maskTarget && (m_layers.isEmpty() || !m_layers[m_active].mask)) {
+        m_maskTarget = false;
+        emit editTargetChanged();
+    }
 
     if (sizeChange) {
         reallocate();
@@ -359,12 +419,16 @@ void Document::pushSnapshot(const QString& text, const DocState& before, int mer
         for (int i = 0; !structure && i < m_layers.size(); ++i) {
             if (before.layers[i].id != m_layers[i].id) structure = true;
             else if (!sameLayer(before.layers[i], m_layers[i]))
-                dirty |= before.layers[i].rect() | m_layers[i].rect();
+                dirty |= Compositor::extent(before.layers, i, bounds()) | Compositor::extent(m_layers, i, bounds());
         }
         if (structure) dirty = bounds();
         if (!dirty.isEmpty()) invalidate(dirty);
         emit layersChanged();
         if (before.active != m_active || structure) emit activeLayerChanged();
+    }
+    if (m_maskTarget && (m_layers.isEmpty() || !m_layers[std::clamp(m_active, 0, int(m_layers.size()) - 1)].mask)) {
+        m_maskTarget = false;
+        emit editTargetChanged();
     }
     if (before.selection.cacheKey() != m_selection.cacheKey()
         || before.selection.isNull() != m_selection.isNull()) {
@@ -396,6 +460,8 @@ void Document::initialize(const DocState& s)
     m_quickMask = s.quickMask;
     m_qmLayer = s.quickMaskLayer;
     m_qmOverlay = QImage();
+    m_maskTarget = false;
+    m_historySource = s;
     reallocate();
     invalidate();
     m_undo->clear();

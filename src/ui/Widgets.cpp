@@ -1,10 +1,12 @@
 #include "ui/Widgets.h"
 
 #include "app/Theme.h"
+#include "ui/dialogs/ColorPickerDialog.h"
 
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QMouseEvent>
+#include <QPainter>
 #include <QSignalBlocker>
 #include <QSlider>
 #include <QStandardItemModel>
@@ -122,6 +124,72 @@ void BlendModeCombo::setMode(BlendMode mode)
 {
     QSignalBlocker b(this);
     setCurrentIndex(findData(int(mode)));
+}
+
+void BlendModeCombo::setPassThroughAllowed(bool allowed)
+{
+    const int at = findData(int(BlendMode::PassThrough));
+    if (allowed == (at >= 0)) return;
+    QSignalBlocker b(this);
+    if (allowed) {
+        insertItem(0, Blend::name(BlendMode::PassThrough), int(BlendMode::PassThrough));
+    } else {
+        removeItem(at);
+    }
+}
+
+// ---------------- ColorButton ----------------
+
+ColorButton::ColorButton(const QString& pickerTitle, QWidget* parent)
+    : QToolButton(parent)
+    , m_title(pickerTitle)
+{
+    setFixedSize(30, 22);
+    setToolTip(pickerTitle);
+}
+
+void ColorButton::setColor(const QColor& c)
+{
+    m_color = c;
+    update();
+}
+
+void ColorButton::setNone(bool none)
+{
+    m_none = none;
+    update();
+}
+
+void ColorButton::paintEvent(QPaintEvent*)
+{
+    QPainter p(this);
+    const QRect r = rect().adjusted(3, 3, -4, -4);
+    p.fillRect(r, m_none ? QColor(Qt::white) : m_color);
+    p.setPen(QColor(0x1e, 0x1e, 0x1e));
+    p.drawRect(r);
+    if (m_none) {
+        p.setRenderHint(QPainter::Antialiasing);
+        p.setPen(QPen(QColor(220, 30, 30), 2));
+        p.drawLine(r.bottomLeft(), r.topRight());
+    }
+}
+
+void ColorButton::mousePressEvent(QMouseEvent* e)
+{
+    if (e->button() != Qt::LeftButton) return;
+    if (m_optional && (e->modifiers() & Qt::ShiftModifier)) {
+        setNone(!m_none);
+        emit noneChanged(m_none);
+        return;
+    }
+    const QColor c = ColorPickerDialog::getColor(m_color, m_title, this);
+    if (!c.isValid()) return;
+    m_color = c;
+    const bool wasNone = m_none;
+    m_none = false;
+    update();
+    if (wasNone) emit noneChanged(false);
+    emit colorChanged(c);
 }
 
 // ---------------- helpers ----------------

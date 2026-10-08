@@ -3,6 +3,7 @@
 #include "core/BlendMode.h"
 #include "core/Commands.h"
 #include "core/Document.h"
+#include "core/DocumentOps.h"
 
 #include <QThread>
 #include <QtConcurrent/QtConcurrentMap>
@@ -539,14 +540,8 @@ Spec mosaicSpec(int cellSize)
 Session::Session(Document* doc, const QString& name, bool spreads, const QRect& target)
 {
     Layer* l = doc->editLayer();
-    if (!l) {
-        m_error = QStringLiteral("Could not complete the %1 command because there is no layer to edit.").arg(name);
-        return;
-    }
-    if (l->pixelsLocked()) {
-        m_error = QStringLiteral("Could not complete the %1 command because the layer is locked.").arg(name);
-        return;
-    }
+    m_error = Ops::editTargetError(doc, QStringLiteral("Could not complete the %1 command").arg(name));
+    if (!m_error.isEmpty()) return;
     QRect area = target;
     if (!area.isValid()) {
         area = (doc->hasSelection() ? doc->selectionBounds() : doc->bounds()) & doc->bounds();

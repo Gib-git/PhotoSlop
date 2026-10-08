@@ -53,8 +53,37 @@ public:
     explicit BlendModeCombo(QWidget* parent = nullptr, bool includeClearBehind = false);
     BlendMode mode() const;
     void setMode(BlendMode mode); // does not emit
+    // Groups add Pass Through at the top of the list.
+    void setPassThroughAllowed(bool allowed);
 signals:
     void modeChanged(BlendMode mode);
+};
+
+// A colour swatch that opens the Color Picker when clicked. With `optional`, a "None" entry
+// (shown as a red slash) is allowed: Shift-click toggles it.
+class ColorButton : public QToolButton {
+    Q_OBJECT
+public:
+    explicit ColorButton(const QString& pickerTitle, QWidget* parent = nullptr);
+    QColor color() const { return m_color; }
+    void setColor(const QColor& c); // does not emit
+    bool isNone() const { return m_none; }
+    void setNone(bool none);        // does not emit
+    void setOptional(bool optional) { m_optional = optional; }
+
+signals:
+    void colorChanged(const QColor& c);
+    void noneChanged(bool none);
+
+protected:
+    void paintEvent(QPaintEvent* e) override;
+    void mousePressEvent(QMouseEvent* e) override;
+
+private:
+    QString m_title;
+    QColor m_color = Qt::black;
+    bool m_none = false;
+    bool m_optional = false;
 };
 
 // Flat icon-only tool button used throughout the panels and options bar.

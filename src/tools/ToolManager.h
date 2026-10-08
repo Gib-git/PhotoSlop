@@ -3,10 +3,12 @@
 #include <QList>
 #include <QObject>
 #include <QPointer>
+#include <functional>
 
 #include "ui/CanvasView.h"
 
 class ColorState;
+class Document;
 class Tool;
 
 // Owns all tools, the current selection, tool groups (toolbox flyouts) and
@@ -42,6 +44,13 @@ public:
     void commitModal();
     Tool* modalTool() const { return m_modal; }
 
+    // Asks whether a text or shape layer may be rasterized (and does it); set by the window.
+    using RasterizePrompt = std::function<bool(Document* doc, int index)>;
+    void setRasterizePrompt(RasterizePrompt prompt) { m_rasterizePrompt = std::move(prompt); }
+    // Call before changing the edit target's pixels. Offers to rasterize text and shape
+    // layers, and alerts with "<prefix> because ..." when the target cannot be changed.
+    bool preparePixelEdit(Document* doc, const QString& prefix);
+
     void pushTemporary(const QString& id);
     void popTemporary();
     bool hasTemporary() const { return m_beforeTemporary != nullptr; }
@@ -69,4 +78,5 @@ private:
     Tool* m_beforeModal = nullptr;
     QPointer<CanvasView> m_view;
     bool m_busy = false;
+    RasterizePrompt m_rasterizePrompt;
 };

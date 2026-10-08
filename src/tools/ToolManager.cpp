@@ -1,5 +1,7 @@
 #include "tools/ToolManager.h"
 
+#include "core/Document.h"
+#include "core/DocumentOps.h"
 #include "tools/Tool.h"
 #include "ui/CanvasView.h"
 #include <algorithm>
@@ -126,4 +128,19 @@ void ToolManager::setActiveView(CanvasView* view)
     if (m_view && m_current) m_current->deactivated(m_view);
     m_view = view;
     if (m_view && m_current) m_current->activated(m_view);
+}
+
+bool ToolManager::preparePixelEdit(Document* doc, const QString& prefix)
+{
+    if (!doc) return false;
+    const int idx = doc->editIndex();
+    if (idx >= 0 && doc->layerAt(idx).isVector()) {
+        if (!m_rasterizePrompt || !m_rasterizePrompt(doc, idx)) return false;
+    }
+    const QString err = Ops::editTargetError(doc, prefix);
+    if (!err.isEmpty()) {
+        emit alertRequested(err);
+        return false;
+    }
+    return true;
 }

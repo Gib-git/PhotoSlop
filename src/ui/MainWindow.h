@@ -11,6 +11,8 @@
 #include "core/Filters.h"
 #include "ui/ViewOptions.h"
 
+class AdjustmentsPanel;
+struct LayerStyle;
 class CanvasView;
 class ChannelsPanel;
 class ColorState;
@@ -102,6 +104,12 @@ private:
     void featherDialog();
     void modifySelectionDialog(int how);
     void toggleQuickMask();
+    // Layer > Layer Style (page is a LayerStyleDialog::Page).
+    void layerStyleDialog(int page);
+    // Adds an adjustment layer and opens its settings; Cancel removes it again.
+    void newAdjustmentLayer(Adjust::Kind kind);
+    // Opens the settings of the adjustment layer at `index`; true when OK was pressed.
+    bool editAdjustmentLayer(int index);
     void startTransform(bool selectionOnly, int mode);
     void quickTransform(const std::function<void()>& apply);
     void newGuideDialog();
@@ -112,6 +120,9 @@ private:
     using ParamBuilder = std::function<Filters::Spec(const QHash<QString, double>&)>;
     // Runs an adjustment or filter dialog; on OK the change can be faded. True when applied.
     bool execPreview(PreviewDialog& dlg);
+    // Before a pixel command: offers to rasterize a text or shape layer, alerts when the
+    // target cannot change. True to go ahead.
+    bool prepareTarget(const QString& command);
     // Applies a spec at once. With a recipe, it becomes the Last Filter.
     void applySpec(const Filters::Spec& spec, const SpecRecipe& recipe = SpecRecipe());
     // A dialog of sliders and options. Filters remember their values and become the Last
@@ -150,6 +161,7 @@ private:
 
     LayersPanel* m_layersPanel = nullptr;
     PropertiesPanel* m_propertiesPanel = nullptr;
+    AdjustmentsPanel* m_adjustmentsPanel = nullptr;
     ChannelsPanel* m_channelsPanel = nullptr;
     HistoryPanel* m_historyPanel = nullptr;
     NavigatorPanel* m_navigatorPanel = nullptr;
@@ -177,6 +189,7 @@ private:
     bool m_settingClipboard = false;
 
     SpecRecipe m_lastFilter;
+    std::shared_ptr<const LayerStyle> m_copiedStyle;
     struct FadeState {
         QPointer<Document> doc;
         int index = -1;

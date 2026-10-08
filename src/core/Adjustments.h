@@ -2,10 +2,12 @@
 
 #include "core/Filters.h"
 
+#include <QJsonObject>
 #include <QList>
 #include <QPointF>
 #include <array>
 #include <functional>
+#include <memory>
 
 // Image > Adjustments: colour corrections as pixel maps, plus the histograms their dialogs show.
 namespace Adjust {
@@ -102,6 +104,36 @@ struct BlackWhite {
     int tintSaturation = 20;
 };
 PixelMap blackWhiteMap(const BlackWhite& bw);
+
+// ---- Adjustment layers ----
+// The settings of a non-destructive adjustment layer: which adjustment it is and its values.
+// `map` is built once by finalize(); layers share settings through a pointer to const.
+enum class Kind { BrightnessContrast, Levels, Curves, HueSaturation, ColorBalance, BlackWhite, Invert, Posterize, Threshold };
+struct LayerSettings {
+    Kind kind = Kind::Levels;
+    int brightness = 0;
+    int contrast = 0;
+    bool legacy = false;
+    Levels levels;
+    Curves curves;
+    HueSaturation hueSaturation;
+    ColorBalance colorBalance;
+    BlackWhite blackWhite;
+    int posterizeLevels = 4;
+    int thresholdLevel = 128;
+    PixelMap map;
+
+    // "Levels", "Hue/Saturation"... (layer names add a number: "Levels 1").
+    QString name() const;
+    PixelMap buildMap() const;
+    // Settings with defaults and their map, ready to share.
+    static std::shared_ptr<const LayerSettings> make(Kind kind);
+    std::shared_ptr<const LayerSettings> finalized() const;
+
+    QJsonObject toJson() const;
+    static std::shared_ptr<const LayerSettings> fromJson(const QJsonObject& o);
+};
+QString kindName(Kind kind);
 
 // ---- HSL helpers (h in degrees, s and l in 0..1) ----
 void rgbToHsl(int r, int g, int b, double& h, double& s, double& l);

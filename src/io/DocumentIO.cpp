@@ -1,14 +1,20 @@
 #include "io/DocumentIO.h"
 
+#include "core/Adjustments.h"
 #include "core/Document.h"
 #include "core/ImageOps.h"
+#include "core/LayerStyle.h"
+#include "core/VectorLayers.h"
 
 #include <QBuffer>
 #include <QColorSpace>
 #include <QDataStream>
 #include <QFileInfo>
+#include <QHash>
 #include <QImageReader>
 #include <QImageWriter>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QSaveFile>
 #include <cmath>
 #include <algorithm>
@@ -18,7 +24,73 @@ namespace DocumentIO {
 
 namespace {
 constexpr quint32 kMagic = 0x50534C50; // "PSLP"
-constexpr quint32 kVersion = 2; // 2 added guides
+constexpr quint32 kVersion = 3; // 2 added guides, 3 groups, masks, adjustment/text/shape layers and styles
+QByteArray toPng(const QImage& img)
+{
+    QByteArray png;
+    if (!img.isNull()) {
+        QBuffer buf(&png);
+        buf.open(QIODevice::WriteOnly);
+        img.convertToFormat(QImage::Format_ARGB32).save(&buf, "PNG");
+    }
+    return png;
+}
+
+QImage fromPng(const QByteArray& png)
+{
+    if (png.isEmpty()) return QImage();
+    QImage img;
+    img.loadFromData(png, "PNG");
+    return img.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+}
+
+// Everything a version 3 layer adds, as JSON. Parents are stored as list indices.
+QByteArray layerExtra(const Layer& l, const QHash<quint64, int>& indexOf)
+{
+    QJsonObject o;
+    o.insert(QStringLiteral("kind"), int(l.kind));
+    o.insert(QStringLiteral("parent"), l.parent ? indexOf.value(l.parent, -1) : -1);
+    o.insert(QStringLiteral("expanded"), l.expanded);
+    o.insert(QStringLiteral("clipped"), l.clipped);
+    if (l.mask)
+        o.insert(QStringLiteral("mask"), QJsonObject{{QStringLiteral("default"), int(l.maskDefault)},
+                                                     {QStringLiteral("enabled"), l.maskEnabled},
+                                                     {QStringLiteral("linked"), l.maskLinked}});
+    if (l.adjustment) o.insert(QStringLiteral("adjustment"), l.adjustment->toJson());
+    if (l.style) o.insert(QStringLiteral("style"), l.style->toJson());
+    if (l.text) o.insert(QStringLiteral("text"), l.text->toJson());
+    if (l.shape) o.insert(QStringLiteral("shape"), l.shape->toJson());
+    return QJsonDocument(o).toJson(QJsonDocument::Compact);
+}
+
+// Applies the JSON extras; returns the parent's list index (or -1).
+int applyExtra(Layer& l, const QByteArray& json)
+{
+    const QJsonObject o = QJsonDocument::fromJson(json).object();
+    l.kind = LayerKind(std::clamp(o.value(QStringLiteral("kind")).toInt(), 0, int(LayerKind::Shape)));
+    l.expanded = o.value(QStringLiteral("expanded")).toBool(true);
+    l.clipped = o.value(QStringLiteral("clipped")).toBool();
+    if (o.contains(QStringLiteral("mask"))) {
+        const QJsonObject m = o.value(QStringLiteral("mask")).toObject();
+        l.maskDefault = quint8(std::clamp(m.value(QStringLiteral("default")).toInt(255), 0, 255));
+        l.maskEnabled = m.value(QStringLiteral("enabled")).toBool(true);
+        l.maskLinked = m.value(QStringLiteral("linked")).toBool(true);
+        l.mask.set(Layer::create(QStringLiteral("Layer Mask")));
+    }
+    if (o.contains(QStringLiteral("adjustment")))
+        l.adjustment = Adjust::LayerSettings::fromJson(o.value(QStringLiteral("adjustment")).toObject());
+    if (o.contains(QStringLiteral("style")))
+        l.style = std::make_shared<const LayerStyle>(LayerStyle::fromJson(o.value(QStringLiteral("style")).toObject()));
+    if (o.contains(QStringLiteral("text")))
+        l.text = std::make_shared<const TextData>(TextData::fromJson(o.value(QStringLiteral("text")).toObject()));
+    if (o.contains(QStringLiteral("shape")))
+        l.shape = std::make_shared<const ShapeData>(ShapeData::fromJson(o.value(QStringLiteral("shape")).toObject()));
+    if (l.kind == LayerKind::Adjustment && !l.adjustment) l.adjustment = Adjust::LayerSettings::make(Adjust::Kind::Levels);
+    if (l.kind == LayerKind::Text && !l.text) l.kind = LayerKind::Pixel;
+    if (l.kind == LayerKind::Shape && !l.shape) l.kind = LayerKind::Pixel;
+    return o.value(QStringLiteral("parent")).toInt(-1);
+}
+
 } // namespace
 
 QString openFilter()
@@ -100,6 +172,7 @@ static Document* loadNative(const QString& path, QString* error)
         if (error) *error = QStringLiteral("The document is damaged.");
         return nullptr;
     }
+    QList<int> parents;
     for (int i = 0; i < count; ++i) {
         Layer l = Layer::create(QString());
         QString modeId;
@@ -107,12 +180,24 @@ static Document* loadNative(const QString& path, QString* error)
         in >> l.name >> l.offset >> l.visible >> l.opacity >> l.fill >> modeId >> l.lockTransparency
             >> l.lockPixels >> l.lockPosition >> l.lockAll >> l.isBackground >> png;
         l.mode = Blend::fromId(modeId);
-        if (!png.isEmpty()) {
-            QImage img;
-            img.loadFromData(png, "PNG");
-            l.image = img.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+        l.image = fromPng(png);
+        int parent = -1;
+        if (version >= 3) {
+            QByteArray extra, maskPng;
+            QPoint maskOffset;
+            in >> extra >> maskPng >> maskOffset;
+            parent = applyExtra(l, extra);
+            if (l.mask) {
+                l.mask->image = fromPng(maskPng);
+                l.mask->offset = maskOffset;
+            }
         }
+        parents.append(parent);
         s.layers.append(l);
+    }
+    for (int i = 0; i < s.layers.size(); ++i) {
+        const int p = parents[i];
+        if (p > i && p < s.layers.size() && s.layers[p].isGroup()) s.layers[i].parent = s.layers[p].id;
     }
     if (version >= 2) {
         qint32 guideCount = 0;
@@ -164,16 +249,14 @@ bool saveNative(Document* doc, const QString& path, QString* error)
     out.setVersion(QDataStream::Qt_6_0);
     out << kMagic << kVersion << doc->size() << doc->dpi() << qint32(doc->activeIndex())
         << qint32(doc->layerCount());
+    QHash<quint64, int> indexOf;
+    for (int i = 0; i < doc->layerCount(); ++i) indexOf.insert(doc->layerAt(i).id, i);
     for (const Layer& l : doc->layers()) {
-        QByteArray png;
-        if (!l.image.isNull()) {
-            QBuffer buf(&png);
-            buf.open(QIODevice::WriteOnly);
-            l.image.convertToFormat(QImage::Format_ARGB32).save(&buf, "PNG");
-        }
         out << l.name << l.offset << l.visible << l.opacity << l.fill << Blend::id(l.mode)
             << l.lockTransparency << l.lockPixels << l.lockPosition << l.lockAll << l.isBackground
-            << png;
+            << toPng(l.image);
+        out << layerExtra(l, indexOf) << (l.mask ? toPng(l.mask->image) : QByteArray())
+            << (l.mask ? l.mask->offset : QPoint());
     }
     out << qint32(doc->guides().size());
     for (const Guide& g : doc->guides()) out << (g.orientation == Qt::Vertical) << g.position;

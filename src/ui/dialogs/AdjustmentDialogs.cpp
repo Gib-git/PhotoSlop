@@ -1,7 +1,10 @@
 #include "ui/dialogs/AdjustmentDialogs.h"
 
 #include "app/Theme.h"
+#include "core/Compositor.h"
 #include "core/Document.h"
+#include "core/DocumentOps.h"
+#include "core/LayerTree.h"
 #include "ui/Widgets.h"
 
 #include <QApplication>
@@ -415,14 +418,22 @@ void SliderField::setRange(double min, double max)
 
 // ---------------- PreviewDialog ----------------
 
-PreviewDialog::PreviewDialog(Document* doc, const QString& title, bool spreads, QWidget* parent, const QRect& target)
+PreviewDialog::PreviewDialog(Document* doc, const QString& title, bool spreads, QWidget* parent, const QRect& target,
+                             int adjustmentLayer)
     : QDialog(parent)
 {
     setWindowTitle(title);
-    m_session = std::make_unique<Filters::Session>(doc, title, spreads, target);
-    if (!m_session->isValid()) {
-        m_error = m_session->error();
-        m_session.reset();
+    if (adjustmentLayer >= 0 && adjustmentLayer < doc->layerCount()
+        && doc->layerAt(adjustmentLayer).kind == LayerKind::Adjustment) {
+        m_doc = doc;
+        m_layer = adjustmentLayer;
+        m_layerBefore = doc->layerAt(adjustmentLayer).adjustment;
+    } else {
+        m_session = std::make_unique<Filters::Session>(doc, title, spreads, target);
+        if (!m_session->isValid()) {
+            m_error = m_session->error();
+            m_session.reset();
+        }
     }
 
     auto* root = new QHBoxLayout(this);
@@ -458,12 +469,31 @@ PreviewDialog::PreviewDialog(Document* doc, const QString& title, bool spreads, 
         stopWorker(false); // its queued finished() sees the cancel flag
         m_stale = true;
         if (m_session) m_session->showOriginal();
+        if (m_layer >= 0) showLayerSettings(m_layerBefore);
     });
 }
 
 PreviewDialog::~PreviewDialog()
 {
-    if (m_session || m_watcher.isRunning()) finish(false);
+    if (m_session || m_layer >= 0 || m_watcher.isRunning()) finish(false);
+}
+
+void PreviewDialog::showLayerSettings(const std::shared_ptr<const Adjust::LayerSettings>& s)
+{
+    if (!m_doc || m_layer < 0 || m_layer >= m_doc->layerCount() || !s) return;
+    m_doc->layerRef(m_layer).adjustment = s;
+    m_doc->invalidate();
+}
+
+Adjust::Histogram PreviewDialog::sourceHistogram() const
+{
+    if (m_session) return Adjust::histogram(m_session->originalTarget(), m_session->selectionTarget());
+    if (!m_doc || m_layer < 0) return Adjust::Histogram();
+    // Everything below the adjustment layer.
+    QList<Layer> layers = m_doc->layers();
+    for (int i = 0; i < layers.size(); ++i)
+        if (i >= m_layer && !Tree::isInside(layers, m_layer, i)) layers[i].visible = false;
+    return Adjust::histogram(Compositor::flatten(layers, m_doc->bounds()));
 }
 
 QPushButton* PreviewDialog::addButton(const QString& text)
@@ -487,6 +517,13 @@ void PreviewDialog::settingsChanged()
 
 void PreviewDialog::render()
 {
+    if (m_layer >= 0) {
+        // Adjustment layers re-render straight away.
+        if (!m_preview->isChecked()) return;
+        m_stale = false;
+        showLayerSettings(layerSettings());
+        return;
+    }
     if (!m_session || !m_preview->isChecked()) return;
     if (m_rendering) {
         // The job's finished() starts the next one.
@@ -522,7 +559,7 @@ void PreviewDialog::stopWorker(bool keepCurrent)
 void PreviewDialog::waitForPreview()
 {
     QDeadlineTimer deadline(20000);
-    while (m_session && m_preview->isChecked() && (m_stale || m_timer.isActive() || m_rendering)
+    while ((m_session || m_layer >= 0) && m_preview->isChecked() && (m_stale || m_timer.isActive() || m_rendering)
            && !deadline.hasExpired()) {
         QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
         QThread::msleep(1);
@@ -534,6 +571,16 @@ void PreviewDialog::finish(bool commit)
     // Late results must not reach a committed or restored layer.
     disconnect(&m_watcher, nullptr, this, nullptr);
     stopWorker(commit);
+    if (m_layer >= 0) {
+        const int layer = m_layer;
+        m_layer = -1;
+        if (!m_doc || layer >= m_doc->layerCount()) return;
+        const auto settings = layerSettings();
+        m_doc->layerRef(layer).adjustment = m_layerBefore;
+        m_doc->invalidate();
+        if (commit && settings) Ops::setAdjustment(m_doc, layer, settings);
+        return;
+    }
     if (!m_session) return;
     if (commit) {
         const Filters::Spec s = spec();
@@ -568,8 +615,9 @@ void PreviewDialog::reject()
 
 QHash<QString, ParamDialog::Values> ParamDialog::s_last;
 
-ParamDialog::ParamDialog(Document* doc, const QString& title, bool spreads, Builder builder, QWidget* parent)
-    : PreviewDialog(doc, title, spreads, parent)
+ParamDialog::ParamDialog(Document* doc, const QString& title, bool spreads, Builder builder, QWidget* parent,
+                         int adjustmentLayer)
+    : PreviewDialog(doc, title, spreads, parent, QRect(), adjustmentLayer)
     , m_title(title)
     , m_builder(std::move(builder))
 {
@@ -650,6 +698,11 @@ void ParamDialog::useLastValues()
     settingsChanged();
 }
 
+std::shared_ptr<const Adjust::LayerSettings> ParamDialog::layerSettings() const
+{
+    return m_layerBuilder ? m_layerBuilder(m_values).finalized() : nullptr;
+}
+
 void ParamDialog::accept()
 {
     s_last.insert(m_title, m_values);
@@ -660,10 +713,10 @@ void ParamDialog::accept()
 
 Adjust::Levels LevelsDialog::s_last;
 
-LevelsDialog::LevelsDialog(Document* doc, bool useLast, QWidget* parent)
-    : PreviewDialog(doc, QStringLiteral("Levels"), false, parent)
+LevelsDialog::LevelsDialog(Document* doc, bool useLast, QWidget* parent, int adjustmentLayer)
+    : PreviewDialog(doc, QStringLiteral("Levels"), false, parent, QRect(), adjustmentLayer)
 {
-    if (session()) m_hist = Adjust::histogram(session()->originalTarget(), session()->selectionTarget());
+    m_hist = sourceHistogram();
     if (useLast) m_levels = s_last;
 
     m_channelBox = channelCombo(this);
@@ -792,10 +845,10 @@ void LevelsDialog::accept()
 
 Adjust::Curves CurvesDialog::s_last;
 
-CurvesDialog::CurvesDialog(Document* doc, bool useLast, QWidget* parent)
-    : PreviewDialog(doc, QStringLiteral("Curves"), false, parent)
+CurvesDialog::CurvesDialog(Document* doc, bool useLast, QWidget* parent, int adjustmentLayer)
+    : PreviewDialog(doc, QStringLiteral("Curves"), false, parent, QRect(), adjustmentLayer)
 {
-    if (session()) m_hist = Adjust::histogram(session()->originalTarget(), session()->selectionTarget());
+    m_hist = sourceHistogram();
     if (useLast) m_curves = s_last;
 
     m_channelBox = channelCombo(this);
@@ -925,8 +978,8 @@ private:
 
 Adjust::HueSaturation HueSaturationDialog::s_last;
 
-HueSaturationDialog::HueSaturationDialog(Document* doc, bool useLast, QWidget* parent)
-    : PreviewDialog(doc, QStringLiteral("Hue/Saturation"), false, parent)
+HueSaturationDialog::HueSaturationDialog(Document* doc, bool useLast, QWidget* parent, int adjustmentLayer)
+    : PreviewDialog(doc, QStringLiteral("Hue/Saturation"), false, parent, QRect(), adjustmentLayer)
 {
     if (useLast) m_hs = s_last;
     setMinimumWidth(400);
@@ -1012,8 +1065,8 @@ void HueSaturationDialog::accept()
 
 Adjust::ColorBalance ColorBalanceDialog::s_last;
 
-ColorBalanceDialog::ColorBalanceDialog(Document* doc, bool useLast, QWidget* parent)
-    : PreviewDialog(doc, QStringLiteral("Color Balance"), false, parent)
+ColorBalanceDialog::ColorBalanceDialog(Document* doc, bool useLast, QWidget* parent, int adjustmentLayer)
+    : PreviewDialog(doc, QStringLiteral("Color Balance"), false, parent, QRect(), adjustmentLayer)
 {
     if (useLast) m_cb = s_last;
     setMinimumWidth(420);
@@ -1114,13 +1167,13 @@ void ColorBalanceDialog::accept()
 
 int ThresholdDialog::s_last = 128;
 
-ThresholdDialog::ThresholdDialog(Document* doc, QWidget* parent)
-    : PreviewDialog(doc, QStringLiteral("Threshold"), false, parent)
+ThresholdDialog::ThresholdDialog(Document* doc, QWidget* parent, int adjustmentLayer)
+    : PreviewDialog(doc, QStringLiteral("Threshold"), false, parent, QRect(), adjustmentLayer)
 {
     m_level = intField(1, 255, s_last, this);
     content()->addLayout(labelled(QStringLiteral("Threshold Level:"), m_level, this));
     auto* hist = new HistogramView(this);
-    if (session()) hist->setData(Adjust::histogram(session()->originalTarget(), session()->selectionTarget()).channels[0], Theme::kText);
+    hist->setData(sourceHistogram().channels[0], Theme::kText);
     content()->addWidget(hist);
     m_bar = new LevelsBar(1, this);
     m_bar->setValues({double(s_last)});
@@ -1182,4 +1235,46 @@ void FadeDialog::setOpacity(int percent)
 Filters::Spec FadeDialog::spec() const
 {
     return Filters::fadeSpec(QStringLiteral("Fade ") + m_name, m_before, int(m_mode->mode()), m_opacity->value() / 100.0);
+}
+
+// ---------------- Adjustment layer settings ----------------
+
+std::shared_ptr<const Adjust::LayerSettings> LevelsDialog::layerSettings() const
+{
+    Adjust::LayerSettings s;
+    s.kind = Adjust::Kind::Levels;
+    s.levels = m_levels;
+    return s.finalized();
+}
+
+std::shared_ptr<const Adjust::LayerSettings> CurvesDialog::layerSettings() const
+{
+    Adjust::LayerSettings s;
+    s.kind = Adjust::Kind::Curves;
+    s.curves = m_curves;
+    return s.finalized();
+}
+
+std::shared_ptr<const Adjust::LayerSettings> HueSaturationDialog::layerSettings() const
+{
+    Adjust::LayerSettings s;
+    s.kind = Adjust::Kind::HueSaturation;
+    s.hueSaturation = m_hs;
+    return s.finalized();
+}
+
+std::shared_ptr<const Adjust::LayerSettings> ColorBalanceDialog::layerSettings() const
+{
+    Adjust::LayerSettings s;
+    s.kind = Adjust::Kind::ColorBalance;
+    s.colorBalance = m_cb;
+    return s.finalized();
+}
+
+std::shared_ptr<const Adjust::LayerSettings> ThresholdDialog::layerSettings() const
+{
+    Adjust::LayerSettings s;
+    s.kind = Adjust::Kind::Threshold;
+    s.thresholdLevel = level();
+    return s.finalized();
 }

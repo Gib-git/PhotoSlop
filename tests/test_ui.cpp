@@ -1,11 +1,17 @@
 // Drives the real main window with simulated input to check tools end to end.
 #include "core/ColorState.h"
 #include "core/Document.h"
+#include "core/Adjustments.h"
 #include "core/DocumentOps.h"
+#include "core/LayerStyle.h"
+#include "core/LayerTree.h"
+#include "core/VectorLayers.h"
 #include "tools/FreeTransformTool.h"
+#include "tools/RetouchTools.h"
 #include "tools/SelectionTools.h"
 #include "tools/Tool.h"
 #include "tools/ToolManager.h"
+#include "tools/VectorTools.h"
 #include "ui/CanvasView.h"
 #include "ui/DocumentPage.h"
 #include "ui/MainWindow.h"
@@ -14,7 +20,13 @@
 #include "ui/dialogs/AdjustmentDialogs.h"
 #include "ui/dialogs/ColorPickerDialog.h"
 #include "ui/dialogs/Dialogs.h"
+#include "ui/dialogs/LayerStyleDialog.h"
+#include "ui/panels/LayersPanel.h"
+#include "ui/panels/Panels.h"
 
+#include <QListView>
+#include <QMessageBox>
+#include <QPushButton>
 #include <QSettings>
 #include <QTemporaryDir>
 #include <QUndoStack>
@@ -115,6 +127,22 @@ class TestUi : public QObject {
         w->action(actionId)->trigger();
         QCoreApplication::processEvents();
         return seen;
+    }
+
+
+    // ---------------- Stage 4 helpers ----------------
+
+    LayersPanel* layersPanel() { return w->findChild<LayersPanel*>(); }
+
+    // Clicks a part (thumbnail, mask...) of a layer's row in the Layers panel.
+    void clickRowPart(int docIndex, LayerDelegate::Part part, Qt::KeyboardModifiers mods = {})
+    {
+        LayersPanel* lp = layersPanel();
+        auto* model = static_cast<LayerModel*>(lp->list()->model());
+        const QRect row = lp->list()->visualRect(model->index(model->rowFor(docIndex)));
+        const QRect r = lp->delegate()->partRect(docIndex, part, row.width()).translated(row.topLeft());
+        QTest::mouseClick(lp->list()->viewport(), Qt::LeftButton, mods, r.center());
+        QCoreApplication::processEvents();
     }
 
 private slots:
@@ -820,6 +848,341 @@ private slots:
         openWhite();
         w->action(QStringLiteral("image.invert"))->trigger();
         QCOMPARE(pixel(10, 10), QColor(Qt::black));
+    }
+    void typeToolTypesAndCommits()
+    {
+        openWhite(QSize(300, 150));
+        colors()->setForeground(Qt::black);
+        tools()->select(QStringLiteral("type"));
+        const int count = doc()->undoStack()->count();
+        click({20, 100});
+        auto* type = static_cast<TypeTool*>(tools()->tool(QStringLiteral("type")));
+        QVERIFY(type->isEditing());
+        QCOMPARE(tools()->modalTool(), static_cast<Tool*>(type));
+        // Letters are typed, not taken as tool shortcuts.
+        QTest::keyClicks(view()->viewport(), QStringLiteral("BVM"));
+        QCOMPARE(tools()->current(), static_cast<Tool*>(type));
+        QTest::keyClick(view()->viewport(), Qt::Key_Backspace);
+        QCOMPARE(type->textData().text, QStringLiteral("BV"));
+        // Enter on the keypad commits.
+        QTest::keyClick(view()->viewport(), Qt::Key_Enter, Qt::KeypadModifier);
+        QVERIFY(!type->isEditing());
+        const Layer& l = doc()->layerAt(doc()->activeIndex());
+        QCOMPARE(l.kind, LayerKind::Text);
+        QCOMPARE(l.text->text, QStringLiteral("BV"));
+        QCOMPARE(l.name, QStringLiteral("BV"));
+        QCOMPARE(doc()->undoStack()->count(), count + 1);
+        QCOMPARE(doc()->undoStack()->text(count), QStringLiteral("Type Layer"));
+        // Clicking the text edits it again; Escape cancels the edit.
+        click({30, 90});
+        QVERIFY(type->isEditing());
+        QTest::keyClicks(view()->viewport(), QStringLiteral("ZZZ"));
+        QTest::keyClick(view()->viewport(), Qt::Key_Escape);
+        QCOMPARE(doc()->layerAt(doc()->activeIndex()).text->text, QStringLiteral("BV"));
+        QCOMPARE(doc()->undoStack()->count(), count + 1);
+        // An empty type layer is discarded.
+        const int layers = doc()->layerCount();
+        click({200, 30});
+        QTest::keyClick(view()->viewport(), Qt::Key_Enter, Qt::KeypadModifier);
+        QCOMPARE(doc()->layerCount(), layers);
+        // Undo removes the type layer.
+        doc()->undoStack()->undo();
+        QCOMPARE(doc()->layerCount(), layers - 1);
+    }
+
+    void switchingToolsCommitsType()
+    {
+        openWhite();
+        tools()->select(QStringLiteral("type"));
+        click({20, 100});
+        QTest::keyClicks(view()->viewport(), QStringLiteral("Hi"));
+        tools()->select(QStringLiteral("move"));
+        QCOMPARE(doc()->layerAt(doc()->activeIndex()).text->text, QStringLiteral("Hi"));
+        QVERIFY(!tools()->modalTool());
+    }
+
+    void paintingTypeLayerAsksToRasterize()
+    {
+        openWhite();
+        TextData t;
+        t.text = QStringLiteral("Big");
+        t.size = 60;
+        t.position = QPointF(10, 90);
+        Ops::newTextLayer(doc(), t);
+        colors()->setForeground(Qt::red);
+        tools()->select(QStringLiteral("brush"));
+        // Cancel keeps the text and paints nothing.
+        QTimer::singleShot(0, w.get(), [] {
+            if (auto* box = qobject_cast<QMessageBox*>(QApplication::activeModalWidget())) box->reject();
+        });
+        drag({10, 70}, {150, 70});
+        QCOMPARE(doc()->activeLayer()->kind, LayerKind::Text);
+        // OK rasterizes, then paints.
+        QTimer::singleShot(0, w.get(), [] {
+            if (auto* box = qobject_cast<QMessageBox*>(QApplication::activeModalWidget())) box->button(QMessageBox::Ok)->click();
+        });
+        drag({10, 70}, {150, 70});
+        QCOMPARE(doc()->activeLayer()->kind, LayerKind::Pixel);
+        QCOMPARE(pixel(120, 70), QColor(Qt::red));
+    }
+
+    void shapeToolDrawsLiveShape()
+    {
+        openWhite();
+        colors()->setForeground(Qt::blue);
+        tools()->select(QStringLiteral("rectangle"));
+        drag({40, 30}, {120, 90});
+        const Layer& l = doc()->layerAt(doc()->activeIndex());
+        QCOMPARE(l.kind, LayerKind::Shape);
+        QCOMPARE(l.name, QStringLiteral("Rectangle 1"));
+        QCOMPARE(pixel(80, 60), QColor(Qt::blue));
+        QCOMPARE(pixel(130, 60), QColor(Qt::white));
+        // Shift draws a circle with the Ellipse tool.
+        tools()->select(QStringLiteral("ellipse"));
+        drag({140, 20}, {190, 40}, Qt::ShiftModifier);
+        const QRectF b = doc()->layerAt(doc()->activeIndex()).shape->path.boundingRect();
+        QVERIFY(std::abs(b.width() - b.height()) < 1.0);
+        // Free Transform keeps it a shape and re-renders it crisply.
+        doc()->setActiveIndex(doc()->activeIndex() - 1);
+        QVERIFY(transform()->begin(view(), false));
+        QPolygonF q = transform()->quad();
+        QTransform grow = QTransform::fromTranslate(-40, -30) * QTransform::fromScale(1.5, 1.0) * QTransform::fromTranslate(40, 30);
+        transform()->setQuad(grow.map(q));
+        QVERIFY(transform()->commit(view()));
+        const Layer& r = doc()->layerAt(doc()->activeIndex());
+        QCOMPARE(r.kind, LayerKind::Shape);
+        QVERIFY(std::abs(r.shape->path.boundingRect().width() - 120.0) < 1.0);
+        QCOMPARE(pixel(150, 60), QColor(Qt::blue));
+    }
+
+    static bool near(const QColor& a, const QColor& b, int tol = 3)
+    {
+        return std::abs(a.red() - b.red()) <= tol && std::abs(a.green() - b.green()) <= tol && std::abs(a.blue() - b.blue()) <= tol;
+    }
+
+    void cloneStampCopiesFromSource()
+    {
+        openWhite();
+        squareLayer(QRect(10, 10, 40, 40));
+        tools()->select(QStringLiteral("clone-stamp"));
+        auto* clone = static_cast<CloneStampTool*>(tools()->tool(QStringLiteral("clone-stamp")));
+        QVERIFY(!clone->hasSource());
+        // Painting without a source alerts.
+        QTimer::singleShot(0, w.get(), [] {
+            if (QWidget* m = QApplication::activeModalWidget()) m->close();
+        });
+        drag({120, 30}, {125, 30});
+        QCOMPARE(pixel(122, 30), QColor(Qt::white));
+        click({30, 30}, Qt::AltModifier);
+        QVERIFY(clone->hasSource());
+        drag({130, 30}, {140, 30});
+        QVERIFY(near(pixel(135, 30), Qt::black)); // soft tip: within a level or two
+        QCOMPARE(doc()->undoStack()->text(doc()->undoStack()->index() - 1), QStringLiteral("Clone Stamp"));
+    }
+
+    void historyBrushRestoresOpenState()
+    {
+        openWhite();
+        colors()->setForeground(Qt::black);
+        tools()->select(QStringLiteral("brush"));
+        drag({20, 75}, {180, 75});
+        QCOMPARE(pixel(100, 75), QColor(Qt::black));
+        tools()->select(QStringLiteral("history-brush"));
+        drag({20, 75}, {180, 75});
+        QVERIFY(near(pixel(100, 75), Qt::white));
+        QCOMPARE(doc()->undoStack()->count(), 2);
+        // With the black stroke's state as the source, the History Brush paints it back.
+        w->findChild<HistoryPanel*>()->setHistoryBrushSource(1);
+        QVERIFY(near(pixel(100, 75), Qt::white)); // picking a source changes nothing on screen
+        QCOMPARE(doc()->undoStack()->index(), 2);
+        drag({20, 75}, {180, 75});
+        QVERIFY(near(pixel(100, 75), Qt::black));
+    }
+
+    void toningToolsChangeTones()
+    {
+        openWhite();
+        doc()->modify(QStringLiteral("Gray"), [&] { doc()->layerRef(0).image.fill(QColor(128, 128, 128)); });
+        tools()->select(QStringLiteral("dodge"));
+        drag({20, 40}, {180, 40});
+        QVERIFY(pixel(100, 40).red() > 140);
+        tools()->select(QStringLiteral("burn"));
+        drag({20, 110}, {180, 110});
+        QVERIFY(pixel(100, 110).red() < 120);
+        doc()->modify(QStringLiteral("Red"), [&] { doc()->layerRef(0).image.fill(QColor(220, 30, 30)); });
+        tools()->select(QStringLiteral("sponge"));
+        drag({20, 75}, {180, 75});
+        const QColor c = pixel(100, 75);
+        QVERIFY(c.red() - c.green() < 170);
+    }
+
+    void blurSmudgeAndHealing()
+    {
+        openWhite();
+        squareLayer(QRect(0, 0, 100, 150));
+        // Blur softens the hard edge at x = 100.
+        tools()->select(QStringLiteral("blur"));
+        for (int i = 0; i < 3; ++i) drag({100, 20}, {100, 130});
+        const int edge = pixel(100, 75).red();
+        QVERIFY(edge > 10 && edge < 245);
+        // Smudge drags black out over white.
+        tools()->select(QStringLiteral("smudge"));
+        drag({90, 40}, {130, 40}, {}, 40);
+        QVERIFY(pixel(104, 40).red() < 230);
+
+        // Spot Healing removes a small dark spot on white.
+        openWhite();
+        squareLayer(QRect(98, 73, 4, 4));
+        doc()->setActiveIndex(1);
+        tools()->select(QStringLiteral("spot-healing"));
+        drag({97, 75}, {103, 75});
+        QVERIFY(pixel(100, 75).red() > 200);
+        QCOMPARE(doc()->undoStack()->text(doc()->undoStack()->index() - 1), QStringLiteral("Spot Healing Brush"));
+    }
+
+    void layerMaskTargetsAndHides()
+    {
+        openWhite();
+        squareLayer(QRect(20, 20, 100, 100));
+        w->action(QStringLiteral("layer.maskRevealAll"))->trigger();
+        QVERIFY(doc()->activeLayer()->hasMask());
+        QVERIFY(doc()->editingMask());
+        QVERIFY(page()->tabTitle().contains(QStringLiteral("Layer Mask")));
+        colors()->setForeground(QColor(255, 0, 0)); // paints as its grey on a mask
+        tools()->select(QStringLiteral("brush"));
+        colors()->reset();
+        drag({20, 50}, {120, 50});
+        QCOMPARE(pixel(70, 50), QColor(Qt::white)); // hidden by the mask
+        QCOMPARE(pixel(70, 90), QColor(Qt::black));
+        QCOMPARE(QColor(doc()->activeLayer()->pixelAt(QPoint(70, 50))), QColor(Qt::black)); // pixels untouched
+        // The panel's thumbnails switch the target.
+        const int idx = doc()->activeIndex();
+        clickRowPart(idx, LayerDelegate::Part::Thumbnail);
+        QVERIFY(!doc()->editingMask());
+        clickRowPart(idx, LayerDelegate::Part::Mask);
+        QVERIFY(doc()->editingMask());
+        // Shift-click disables the mask.
+        clickRowPart(idx, LayerDelegate::Part::Mask, Qt::ShiftModifier);
+        QVERIFY(!doc()->activeLayer()->maskEnabled);
+        QCOMPARE(pixel(70, 50), QColor(Qt::black));
+        QCOMPARE(w->action(QStringLiteral("layer.maskToggle"))->text(), QStringLiteral("Enable"));
+    }
+
+    void adjustmentLayerFromMenu()
+    {
+        openWhite();
+        const int layers = doc()->layerCount();
+        QVERIFY(withDialog<LevelsDialog>(QStringLiteral("layer.newAdjustment.levels"), [&](LevelsDialog* d) {
+            QVERIFY(d->editsLayer());
+            Adjust::Levels lv;
+            lv.channels[0].outWhite = 128;
+            d->setLevels(lv);
+            d->waitForPreview();
+            QCOMPARE(pixel(10, 10), QColor(128, 128, 128));
+            d->accept();
+        }));
+        QCOMPARE(doc()->layerCount(), layers + 1);
+        const Layer& l = doc()->layerAt(doc()->activeIndex());
+        QCOMPARE(l.kind, LayerKind::Adjustment);
+        QCOMPARE(l.adjustment->levels.channels[0].outWhite, 128);
+        QCOMPARE(pixel(10, 10), QColor(128, 128, 128));
+        QCOMPARE(QColor(doc()->layerAt(0).pixelAt(QPoint(10, 10))), QColor(Qt::white)); // non-destructive
+        // Layer Content Options reopens it with its settings; Cancel changes nothing.
+        QVERIFY(withDialog<LevelsDialog>(QStringLiteral("layer.contentOptions"), [&](LevelsDialog* d) {
+            QCOMPARE(d->levels().channels[0].outWhite, 128);
+            Adjust::Levels lv;
+            d->setLevels(lv);
+            d->waitForPreview();
+            d->reject();
+        }));
+        QCOMPARE(pixel(10, 10), QColor(128, 128, 128));
+        // Cancelling a new adjustment layer removes it.
+        QVERIFY(withDialog<CurvesDialog>(QStringLiteral("layer.newAdjustment.curves"), [&](CurvesDialog* d) { d->reject(); }));
+        QCOMPARE(doc()->layerCount(), layers + 1);
+        // Brightness/Contrast goes through the slider dialog.
+        QVERIFY(withDialog<ParamDialog>(QStringLiteral("layer.newAdjustment.brightnessContrast"), [&](ParamDialog* d) {
+            QVERIFY(d->editsLayer());
+            d->setValue(QStringLiteral("brightness"), -150);
+            d->accept();
+        }));
+        QCOMPARE(doc()->layerAt(doc()->activeIndex()).adjustment->brightness, -150);
+        QVERIFY(pixel(10, 10).red() < 128);
+        // The Adjustments panel buttons add layers too.
+        QVERIFY(w->action(QStringLiteral("layer.newAdjustment.invert"))->isEnabled());
+        w->action(QStringLiteral("layer.newAdjustment.invert"))->trigger();
+        QCOMPARE(doc()->layerAt(doc()->activeIndex()).adjustment->kind, Adjust::Kind::Invert);
+    }
+
+    void layerStyleDialogAddsEffects()
+    {
+        openWhite();
+        squareLayer(QRect(50, 50, 40, 40));
+        const int count = doc()->undoStack()->count();
+        QVERIFY(withDialog<LayerStyleDialog>(QStringLiteral("layer.styleStroke"), [&](LayerStyleDialog* d) {
+            QVERIFY(d->style().stroke.enabled); // opening on an effect's page turns it on
+            LayerStyle st = d->style();
+            st.stroke.color = Qt::red;
+            st.stroke.size = 4;
+            d->setStyle(st);
+            QCoreApplication::processEvents();
+            QCOMPARE(pixel(47, 70), QColor(Qt::red)); // live preview
+            d->accept();
+        }));
+        QVERIFY(doc()->activeLayer()->hasStyle());
+        QCOMPARE(doc()->undoStack()->count(), count + 1);
+        QCOMPARE(pixel(47, 70), QColor(Qt::red));
+        // Cancel restores.
+        QVERIFY(withDialog<LayerStyleDialog>(QStringLiteral("layer.styleDropShadow"), [&](LayerStyleDialog* d) {
+            d->setOpacity(10);
+            d->reject();
+        }));
+        QCOMPARE(doc()->activeLayer()->opacity, 1.0f);
+        QVERIFY(!doc()->activeLayer()->style->dropShadow.enabled);
+        // Copy, clear and paste.
+        w->action(QStringLiteral("layer.styleCopy"))->trigger();
+        w->action(QStringLiteral("layer.styleClear"))->trigger();
+        QVERIFY(!doc()->activeLayer()->style);
+        QCOMPARE(pixel(47, 70), QColor(Qt::white));
+        w->action(QStringLiteral("layer.stylePaste"))->trigger();
+        QCOMPARE(pixel(47, 70), QColor(Qt::red));
+    }
+
+    void groupAndClippingShortcuts()
+    {
+        openWhite();
+        squareLayer(QRect(10, 10, 30, 30));
+        squareLayer(QRect(0, 0, 200, 150));
+        QCOMPARE(w->action(QStringLiteral("layer.clipping"))->shortcut(), QKeySequence(QStringLiteral("Ctrl+Alt+G")));
+        w->action(QStringLiteral("layer.clipping"))->trigger();
+        QVERIFY(doc()->activeLayer()->clipped);
+        QCOMPARE(pixel(100, 100), QColor(Qt::white));
+        QCOMPARE(w->action(QStringLiteral("layer.clipping"))->text(), QStringLiteral("Release Clipping Mask"));
+        QCOMPARE(w->action(QStringLiteral("layer.group"))->shortcut(), QKeySequence(QStringLiteral("Ctrl+G")));
+        w->action(QStringLiteral("layer.group"))->trigger();
+        QVERIFY(doc()->activeLayer()->isGroup());
+        QCOMPARE(w->action(QStringLiteral("layer.mergeDown"))->text(), QStringLiteral("Merge Group"));
+        w->action(QStringLiteral("layer.ungroup"))->trigger();
+        QVERIFY(!doc()->activeLayer()->isGroup());
+        // Dragging a row onto a group in the Layers panel moves it inside.
+        w->action(QStringLiteral("layer.newGroupQuick"))->trigger();
+        const int group = doc()->activeIndex();
+        auto* model = static_cast<LayerModel*>(layersPanel()->list()->model());
+        std::unique_ptr<QMimeData> md(model->mimeData({model->index(model->rowFor(1))}));
+        model->dropMimeData(md.get(), Qt::MoveAction, -1, 0, model->index(model->rowFor(group)));
+        const int moved = Tree::indexOf(doc()->layers(), doc()->layerAt(doc()->activeIndex()).id);
+        QVERIFY(doc()->layerAt(moved).parent != 0);
+        QVERIFY(doc()->layerAt(Tree::parentIndex(doc()->layers(), moved)).isGroup());
+    }
+
+    void newToolShortcuts()
+    {
+        for (const char* key : {"J", "S", "Y", "O", "T", "U"}) QVERIFY2(w->action(QStringLiteral("tool.%1").arg(QLatin1String(key))), key);
+        tools()->select(QStringLiteral("rectangle"));
+        w->action(QStringLiteral("tool.U.cycle"))->trigger();
+        QCOMPARE(tools()->current()->id(), QStringLiteral("ellipse"));
+        // A letter returns to the group's last used tool (the Sponge, from an earlier test).
+        w->action(QStringLiteral("tool.O"))->trigger();
+        QCOMPARE(tools()->current()->id(), QStringLiteral("sponge"));
     }
 };
 

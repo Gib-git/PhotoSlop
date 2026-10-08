@@ -61,7 +61,30 @@ public:
     void adjustSize(int direction) override;
     void adjustHardness(int direction) override;
 
-private:
+protected:
+    // ---- Hooks for tools built on this stroke engine (Clone Stamp, History Brush...) ----
+    // Phrase for alerts: "Could not use the <name> tool".
+    virtual QString alertPrefix() const;
+    // History name for a finished stroke.
+    virtual QString strokeName() const;
+    // Extra checks and setup once the layer is ready; return false to abandon the stroke.
+    virtual bool strokeStarting(CanvasView*, const ToolEvent&) { return true; }
+    // Pixels painted through the stroke mask for canvas row `y`, from `x0`.
+    virtual void sourceRow(int y, int x0, int count, uint32_t* out);
+    // True to mix the source with the original pixels (alpha included) instead of blending
+    // it on top; for tools that restore or alter existing pixels.
+    virtual bool mixesSource() const { return false; }
+    // Called before the stroke is committed.
+    virtual void strokeFinishing() {}
+
+    // The finished stroke's coverage (0..255, Opacity and selection applied) over the area it
+    // touched, which is returned in `bounds`.
+    std::vector<uint8_t> strokeCoverage(QRect* bounds) const;
+    // Edit layer pixel before the stroke, at a canvas position.
+    uint32_t originalAt(int x, int y) const;
+    // Brush tip coverage at distance `d` from the centre for radius `r`.
+    double tipAlpha(double d, double r) const;
+
     bool begin(CanvasView* v, const ToolEvent& e);
     void strokeTo(const QPointF& p, double pressure);
     void dab(const QPointF& c, double pressure);
@@ -69,6 +92,9 @@ private:
     void end();
     bool pencilTip() const;
     void syncOptions();
+    // The size / hardness / opacity part of the options bar, shared by derived tools.
+    void addBrushOptions(QWidget* w, class QHBoxLayout* lay, const QString& opacityLabel = QStringLiteral("Opacity:"),
+                         bool withFlow = true, bool withMode = true, bool withOpacity = true);
 
     Kind m_kind;
     // Settings
@@ -97,6 +123,9 @@ private:
     QPointer<Document> m_lastDoc;
     QPointF m_lastStrokeEnd;
     bool m_hasLastStrokeEnd = false;
+
+    QImage m_original; // edit layer pixels before the stroke
+    QPoint m_originalOffset;
 
     // Options widgets
     QPointer<BrushPickerButton> m_pickerButton;

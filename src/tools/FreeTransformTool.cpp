@@ -2,8 +2,10 @@
 
 #include "app/Theme.h"
 #include "core/ColorState.h"
+#include "core/DocumentOps.h"
 #include "core/ImageOps.h"
 #include "core/Selection.h"
+#include "core/VectorLayers.h"
 #include "tools/ToolManager.h"
 #include "ui/CanvasView.h"
 #include "ui/Widgets.h"
@@ -312,14 +314,24 @@ bool FreeTransformTool::begin(CanvasView* v, bool selectionOnly, Mode mode)
     } else {
         Layer* l = doc->editLayer();
         if (!l) return false;
-        if (!l->visible) {
-            alert(QStringLiteral("Could not complete the %1 command because the target layer is hidden.").arg(command));
+        const QString prefix = QStringLiteral("Could not complete the %1 command").arg(command);
+        // Text and shape layers transform as vectors; only selected parts need pixels.
+        const bool vector = l->isVector() && !doc->hasSelection();
+        if (vector) {
+            const QString err = Ops::editTargetError(doc, prefix);
+            if (err.contains(QLatin1String("hidden"))) {
+                alert(err);
+                return false;
+            }
+        } else if (!m_manager->preparePixelEdit(doc, prefix)) {
             return false;
         }
-        if (l->pixelsLocked() || (!doc->hasSelection() && l->positionLocked())) {
-            alert(QStringLiteral("Could not complete the %1 command because the layer is locked.").arg(command));
+        l = doc->editLayer();
+        if (!doc->hasSelection() && l->positionLocked()) {
+            alert(QStringLiteral("%1 because the layer is locked.").arg(prefix));
             return false;
         }
+        m_vectorTarget = vector;
         m_layerId = l->id;
         if (doc->hasSelection()) {
             const QImage& sel = doc->selection();
@@ -527,7 +539,26 @@ bool FreeTransformTool::commit(CanvasView*)
     Document* doc = m_doc;
     const DocState before = m_before;
     const QString name = historyName();
+    const bool vector = m_vectorTarget && !m_selectionOnly;
+    const bool warp = m_warp;
+    const QTransform t = xf();
+    const quint64 layerId = m_layerId;
     end();
+    if (changed && vector) {
+        // Re-render the text or shape from its transformed outline instead of resampling;
+        // a warp needs pixels.
+        const int idx = doc->indexOfId(layerId);
+        if (idx >= 0) {
+            Layer& l = doc->layerRef(idx);
+            if (warp) {
+                Vector::convertToPixels(l);
+            } else {
+                for (const Layer& b : before.layers)
+                    if (b.id == layerId) l = b;
+                Vector::transform(l, t);
+            }
+        }
+    }
     if (changed) doc->pushSnapshot(name, before);
     else doc->restoreState(before);
     m_manager->exitModal();

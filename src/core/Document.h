@@ -56,22 +56,43 @@ public:
     // ---- Layers (index 0 is the bottom of the stack) ----
     int layerCount() const { return int(m_layers.size()); }
     const QList<Layer>& layers() const { return m_layers; }
-    // `index` may be kQuickMaskIndex while Quick Mask mode is on.
-    const Layer& layerAt(int index) const { return index == kQuickMaskIndex ? m_qmLayer : m_layers[index]; }
-    Layer& layerRef(int index) { return index == kQuickMaskIndex ? m_qmLayer : m_layers[index]; } // direct, un-undoable access
+    // `index` may also be kQuickMaskIndex or a maskIndex().
+    const Layer& layerAt(int index) const;
+    Layer& layerRef(int index); // direct, un-undoable access
     QList<Layer>& layersRef() { return m_layers; }
     int activeIndex() const { return m_active; }
     void setActiveIndex(int index);
     Layer* activeLayer();
     int indexOfId(quint64 id) const;
     QString nextLayerName();
+    // "Group 1", "Levels 1"...: the first free name with this prefix.
+    QString nextName(const QString& prefix) const;
     bool hasBackground() const { return !m_layers.isEmpty() && m_layers.first().isBackground; }
 
     // ---- Edit target ----
-    // Painting and pixel commands go to the Quick Mask while it is on, otherwise to the active layer.
+    // Painting and pixel commands go to the Quick Mask while it is on, then to the active
+    // layer's mask when it is targeted (adjustment layers always target theirs), otherwise
+    // to the active layer.
     static constexpr int kQuickMaskIndex = -2;
-    int editIndex() const { return m_quickMask ? kQuickMaskIndex : m_active; }
-    Layer* editLayer() { return m_quickMask ? &m_qmLayer : activeLayer(); }
+    static constexpr int kMaskIndexBase = -1000;
+    static int maskIndex(int layerIndex) { return kMaskIndexBase - layerIndex; }
+    static bool isMaskIndex(int index) { return index <= kMaskIndexBase; }
+    static int maskOwner(int index) { return kMaskIndexBase - index; }
+    int editIndex() const;
+    Layer* editLayer();
+    // True when painting goes to the active layer's mask.
+    bool editingMask() const { return isMaskIndex(editIndex()); }
+    // Targets the active layer's mask (when it has one) or its pixels.
+    void setMaskTargeted(bool on);
+    bool maskTargeted() const { return m_maskTarget; }
+
+    // ---- History Brush source ----
+    // The state the History Brush paints from: the document as opened, unless the History
+    // panel picked another state.
+    const DocState& historySource() const { return m_historySource; }
+    void setHistorySource(const DocState& s) { m_historySource = s; }
+    // The document as it was after `undoIndex` history steps (0 = as opened).
+    DocState stateAt(int undoIndex);
 
     // ---- Quick Mask ----
     bool inQuickMask() const { return m_quickMask; }
@@ -128,6 +149,7 @@ signals:
     void layersChanged();
     void layerPixelsChanged(int index);
     void activeLayerChanged();
+    void editTargetChanged();
     void selectionChanged();
     void guidesChanged();
     void quickMaskChanged();
@@ -148,6 +170,8 @@ private:
     QString m_filePath;
     QList<Layer> m_layers;
     int m_active = 0;
+    bool m_maskTarget = false;
+    DocState m_historySource;
     int m_layerCounter = 0;
 
     QImage m_selection;

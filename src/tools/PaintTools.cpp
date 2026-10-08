@@ -210,13 +210,9 @@ bool BrushTool::pencilTip() const
     return m_kind == Kind::Pencil || (m_kind == Kind::Eraser && m_eraserPencil);
 }
 
-QWidget* BrushTool::createOptions(QWidget* parent)
+void BrushTool::addBrushOptions(QWidget* w, QHBoxLayout* lay, const QString& opacityLabel, bool withFlow, bool withMode,
+                                bool withOpacity)
 {
-    auto* w = new QWidget(parent);
-    auto* lay = new QHBoxLayout(w);
-    lay->setContentsMargins(0, 0, 0, 0);
-    lay->setSpacing(6);
-
     m_pickerButton = new BrushPickerButton(w);
     m_pickerButton->setBrush(m_size, m_hardness);
     connect(m_pickerButton, &BrushPickerButton::brushChosen, this, [this](int size, int hard) {
@@ -230,34 +226,57 @@ QWidget* BrushTool::createOptions(QWidget* parent)
     lay->addWidget(settings);
     lay->addWidget(makeVSeparator(w));
 
-    lay->addWidget(new QLabel(QStringLiteral("Mode:"), w));
-    if (m_kind == Kind::Eraser) {
-        auto* mode = new QComboBox(w);
-        mode->addItems({QStringLiteral("Brush"), QStringLiteral("Pencil")});
-        connect(mode, &QComboBox::currentIndexChanged, this, [this](int i) { m_eraserPencil = i == 1; });
-        lay->addWidget(mode);
-    } else {
+    if (withMode) {
+        lay->addWidget(new QLabel(QStringLiteral("Mode:"), w));
         m_modeCombo = new BlendModeCombo(w);
+        m_modeCombo->setMode(m_mode);
         connect(m_modeCombo, &BlendModeCombo::modeChanged, this, [this](BlendMode m) { m_mode = m; });
         lay->addWidget(m_modeCombo);
+        lay->addWidget(makeVSeparator(w));
     }
-    lay->addWidget(makeVSeparator(w));
 
-    m_opacityField = new ValueField(QStringLiteral("Opacity:"), 1, 100, QStringLiteral("%"), true, w);
-    m_opacityField->setValue(m_opacity);
-    connect(m_opacityField, &ValueField::valueChanged, this, [this](int v) { m_opacity = v; });
-    lay->addWidget(m_opacityField);
-    auto* pOpacity = makeIconButton(QStringLiteral("pressure-opacity"),
-                                    QStringLiteral("Always use Pressure for Opacity"), w, true);
-    connect(pOpacity, &QToolButton::toggled, this, [this](bool on) { m_pressureOpacity = on; });
-    lay->addWidget(pOpacity);
+    if (withOpacity) {
+        m_opacityField = new ValueField(opacityLabel, 1, 100, QStringLiteral("%"), true, w);
+        m_opacityField->setValue(m_opacity);
+        connect(m_opacityField, &ValueField::valueChanged, this, [this](int v) { m_opacity = v; });
+        lay->addWidget(m_opacityField);
+        auto* pOpacity = makeIconButton(QStringLiteral("pressure-opacity"),
+                                        QStringLiteral("Always use Pressure for Opacity"), w, true);
+        connect(pOpacity, &QToolButton::toggled, this, [this](bool on) { m_pressureOpacity = on; });
+        lay->addWidget(pOpacity);
+    }
 
-    if (m_kind != Kind::Pencil) {
+    if (withFlow) {
         lay->addWidget(makeVSeparator(w));
         m_flowField = new ValueField(QStringLiteral("Flow:"), 1, 100, QStringLiteral("%"), true, w);
         m_flowField->setValue(m_flow);
         connect(m_flowField, &ValueField::valueChanged, this, [this](int v) { m_flow = v; });
         lay->addWidget(m_flowField);
+    }
+    connect(this, &Tool::optionsChanged, this, &BrushTool::syncOptions, Qt::UniqueConnection);
+}
+
+QWidget* BrushTool::createOptions(QWidget* parent)
+{
+    auto* w = new QWidget(parent);
+    auto* lay = new QHBoxLayout(w);
+    lay->setContentsMargins(0, 0, 0, 0);
+    lay->setSpacing(6);
+
+    if (m_kind == Kind::Eraser) {
+        addBrushOptions(w, lay, QStringLiteral("Opacity:"), true, false);
+        // Photoshop's eraser Mode picks the tip, not a blend mode; it sits after the picker.
+        auto* modeLabel = new QLabel(QStringLiteral("Mode:"), w);
+        auto* mode = new QComboBox(w);
+        mode->addItems({QStringLiteral("Brush"), QStringLiteral("Pencil")});
+        connect(mode, &QComboBox::currentIndexChanged, this, [this](int i) { m_eraserPencil = i == 1; });
+        lay->insertWidget(3, modeLabel);
+        lay->insertWidget(4, mode);
+        lay->insertWidget(5, makeVSeparator(w));
+    } else {
+        addBrushOptions(w, lay, QStringLiteral("Opacity:"), m_kind != Kind::Pencil, true);
+    }
+    if (m_kind != Kind::Pencil) {
         auto* air = makeIconButton(QStringLiteral("airbrush"), QStringLiteral("Enable airbrush-style build-up effects"), w, true);
         air->setEnabled(false);
         lay->addWidget(air);
@@ -285,8 +304,6 @@ QWidget* BrushTool::createOptions(QWidget* parent)
     connect(pSize, &QToolButton::toggled, this, [this](bool on) { m_pressureSize = on; });
     lay->addWidget(pSize);
     lay->addStretch();
-
-    connect(this, &Tool::optionsChanged, this, &BrushTool::syncOptions);
     return w;
 }
 
@@ -323,24 +340,85 @@ void BrushTool::adjustHardness(int dir)
     emit optionsChanged();
 }
 
+QString BrushTool::alertPrefix() const
+{
+    return QStringLiteral("Could not use the %1 tool").arg(name().section(QLatin1Char(' '), 0, -2).toLower());
+}
+
+QString BrushTool::strokeName() const
+{
+    switch (m_kind) {
+    case Kind::Brush: return QStringLiteral("Brush Tool");
+    case Kind::Pencil: return QStringLiteral("Pencil");
+    case Kind::Eraser: return QStringLiteral("Eraser");
+    }
+    return name();
+}
+
+void BrushTool::sourceRow(int, int, int count, uint32_t* out) { std::fill(out, out + count, m_color); }
+
+std::vector<uint8_t> BrushTool::strokeCoverage(QRect* bounds) const
+{
+    const uint32_t opacity = uint32_t(m_opacity * 255 / 100);
+    const int w = m_maskRect.width();
+    int x0 = w, y0 = m_maskRect.height(), x1 = -1, y1 = -1;
+    for (int y = 0; y < m_maskRect.height(); ++y) {
+        const uint16_t* row = m_mask.data() + size_t(y) * size_t(w);
+        for (int x = 0; x < w; ++x) {
+            if (!row[x]) continue;
+            x0 = std::min(x0, x);
+            x1 = std::max(x1, x);
+            y0 = std::min(y0, y);
+            y1 = y;
+        }
+    }
+    const QRect r = x1 < 0 ? QRect() : QRect(QPoint(x0, y0), QPoint(x1, y1)).translated(m_maskRect.topLeft());
+    std::vector<uint8_t> cov(size_t(r.width()) * size_t(std::max(0, r.height())));
+    for (int y = r.top(); y <= r.bottom(); ++y) {
+        const uint16_t* row = m_mask.data() + size_t(y - m_maskRect.top()) * size_t(w);
+        const uchar* sel = m_selection.isNull() ? nullptr : m_selection.constScanLine(y);
+        for (int x = r.left(); x <= r.right(); ++x) {
+            uint32_t v = (uint32_t(row[x - m_maskRect.left()]) * opacity + 32767) / 65535;
+            if (sel) v = (v * sel[x] + 127) / 255;
+            cov[size_t(y - r.top()) * size_t(r.width()) + size_t(x - r.left())] = uint8_t(v);
+        }
+    }
+    if (bounds) *bounds = r;
+    return cov;
+}
+
+uint32_t BrushTool::originalAt(int x, int y) const
+{
+    const int lx = x - m_originalOffset.x(), ly = y - m_originalOffset.y();
+    if (lx < 0 || ly < 0 || lx >= m_original.width() || ly >= m_original.height()) return 0;
+    return reinterpret_cast<const uint32_t*>(m_original.constScanLine(ly))[lx];
+}
+
+double BrushTool::tipAlpha(double d, double r) const
+{
+    const double h = pencilTip() ? 1.0 : m_hardness / 100.0;
+    const double inner = r * h;
+    const double edge = std::clamp(r - d + 0.5, 0.0, 1.0);
+    if (h >= 0.99 || d <= inner) return edge;
+    if (d >= r) return 0.0;
+    const double t = (d - inner) / (r - inner);
+    const double s = 1.0 - t * t;
+    return std::min(edge, s * s);
+}
+
 bool BrushTool::begin(CanvasView* v, const ToolEvent& e)
 {
     Document* doc = v->document();
+    if (!m_manager->preparePixelEdit(doc, alertPrefix())) return false;
     Layer* l = doc->editLayer();
     if (!l) return false;
-    const QString toolName = name().section(QLatin1Char(' '), 0, 0).toLower();
-    if (!l->visible) {
-        alert(QStringLiteral("Could not use the %1 tool because the target layer is hidden.").arg(toolName));
-        return false;
-    }
-    if (l->pixelsLocked()) {
-        alert(QStringLiteral("Could not use the %1 tool because the layer is locked.").arg(toolName));
-        return false;
-    }
     m_erase = m_kind == Kind::Eraser && !l->isBackground && !l->lockTransparency;
     m_preserveAlpha = l->lockTransparency && !l->isBackground;
     const bool paintsBackgroundColor = m_kind == Kind::Eraser && !m_erase;
-    m_color = ImageOps::premultiplied(paintsBackgroundColor ? colors()->background() : colors()->foreground());
+    QColor c = paintsBackgroundColor ? colors()->background() : colors()->foreground();
+    // Masks hold grey values; colours paint as their grey, as in Photoshop.
+    if (doc->editingMask() || doc->inQuickMask()) c = QColor(qGray(c.rgb()), qGray(c.rgb()), qGray(c.rgb()));
+    m_color = ImageOps::premultiplied(c);
 
     m_edit = std::make_unique<PixelEdit>(doc, doc->editIndex(), (m_erase || m_preserveAlpha) ? QRect() : doc->bounds());
     m_maskRect = m_edit->layerRect() & doc->bounds();
@@ -349,10 +427,18 @@ bool BrushTool::begin(CanvasView* v, const ToolEvent& e)
         m_edit.reset();
         return false;
     }
+    m_original = m_edit->original();
+    m_originalOffset = m_edit->layerRect().topLeft();
     m_mask.assign(size_t(m_maskRect.width()) * size_t(m_maskRect.height()), 0);
     m_selection = doc->selection();
     m_pending = QRect();
-    Q_UNUSED(e);
+    if (!strokeStarting(v, e)) {
+        m_edit->cancel();
+        m_edit.reset();
+        m_mask.clear();
+        m_original = QImage();
+        return false;
+    }
     return true;
 }
 
@@ -401,17 +487,13 @@ void BrushTool::deactivated(CanvasView*)
 void BrushTool::end()
 {
     flushToLayer();
-    QString text;
-    switch (m_kind) {
-    case Kind::Brush: text = QStringLiteral("Brush Tool"); break;
-    case Kind::Pencil: text = QStringLiteral("Pencil"); break;
-    case Kind::Eraser: text = QStringLiteral("Eraser"); break;
-    }
-    m_edit->commit(text);
+    strokeFinishing();
+    m_edit->commit(strokeName());
     m_edit.reset();
     m_mask.clear();
     m_mask.shrink_to_fit();
     m_selection = QImage();
+    m_original = QImage();
 }
 
 void BrushTool::strokeTo(const QPointF& p, double pressure)
@@ -499,7 +581,8 @@ void BrushTool::flushToLayer()
     const uint32_t opacity = uint32_t(m_opacity * 255 / 100);
     const int n = r.width();
     std::vector<uint8_t> cov(static_cast<size_t>(n));
-    std::vector<uint32_t> src(static_cast<size_t>(n), m_color);
+    std::vector<uint32_t> src(static_cast<size_t>(n));
+    const bool mix = mixesSource();
 
     for (int y = r.top(); y <= r.bottom(); ++y) {
         const uint16_t* mrow = m_mask.data() + size_t(y - m_maskRect.top()) * size_t(m_maskRect.width())
@@ -516,6 +599,17 @@ void BrushTool::flushToLayer()
         if (m_erase) {
             for (int i = 0; i < n; ++i)
                 if (cov[size_t(i)]) dst[i] = Blend::byteMul(dst[i], 255 - cov[size_t(i)]);
+            continue;
+        }
+        sourceRow(y, r.left(), n, src.data());
+        if (mix) {
+            for (int i = 0; i < n; ++i) {
+                const uint32_t c = cov[size_t(i)];
+                if (!c) continue;
+                uint32_t s = src[size_t(i)];
+                if (m_preserveAlpha) s = qAlpha(dst[i]) ? qPremultiply((qUnpremultiply(s) & 0x00ffffffu) | (dst[i] & 0xff000000u)) : 0;
+                dst[i] = c == 255 ? s : Blend::byteMul(s, c) + Blend::byteMul(dst[i], 255 - c);
+            }
         } else if (m_preserveAlpha) {
             Blend::compositeRowPreserveAlpha(dst, src.data(), n, m_mode, 1.f, cov.data(), r.left(), y);
         } else {

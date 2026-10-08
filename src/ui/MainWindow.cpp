@@ -6,14 +6,19 @@
 #include "core/Document.h"
 #include "core/DocumentOps.h"
 #include "core/ImageOps.h"
+#include "core/LayerStyle.h"
+#include "core/LayerTree.h"
+#include "core/VectorLayers.h"
 #include "io/DocumentIO.h"
 #include "tools/FillTools.h"
 #include "tools/FreeTransformTool.h"
 #include "tools/NavigationTools.h"
 #include "tools/PaintTools.h"
+#include "tools/RetouchTools.h"
 #include "tools/SelectionTools.h"
 #include "tools/ToolManager.h"
 #include "tools/TransformTools.h"
+#include "tools/VectorTools.h"
 #include "ui/CanvasView.h"
 #include "ui/DocumentPage.h"
 #include "ui/ToolBox.h"
@@ -21,6 +26,7 @@
 #include "ui/dialogs/AdjustmentDialogs.h"
 #include "ui/dialogs/ColorPickerDialog.h"
 #include "ui/dialogs/Dialogs.h"
+#include "ui/dialogs/LayerStyleDialog.h"
 #include "ui/panels/LayersPanel.h"
 #include "ui/panels/Panels.h"
 
@@ -70,6 +76,83 @@ QList<QKeySequence> keys(std::initializer_list<const char*> list)
     return out;
 }
 
+using Values = QHash<QString, double>;
+
+// Dialog recipes shared by Image > Adjustments and the matching adjustment layers.
+void setupBrightnessContrast(ParamDialog& d)
+{
+    d.addSlider(QStringLiteral("brightness"), QStringLiteral("Brightness:"), -150, 150, 0);
+    d.addSlider(QStringLiteral("contrast"), QStringLiteral("Contrast:"), -50, 100, 0);
+    d.addCheck(QStringLiteral("legacy"), QStringLiteral("Use Legacy"), false);
+}
+
+Adjust::LayerSettings brightnessContrastSettings(const Values& v)
+{
+    Adjust::LayerSettings s;
+    s.kind = Adjust::Kind::BrightnessContrast;
+    s.brightness = int(v[QStringLiteral("brightness")]);
+    s.contrast = int(v[QStringLiteral("contrast")]);
+    s.legacy = v[QStringLiteral("legacy")] != 0;
+    return s;
+}
+
+void setupBlackWhite(ParamDialog& d)
+{
+    const Adjust::BlackWhite def;
+    const char* names[6] = {"Reds:", "Yellows:", "Greens:", "Cyans:", "Blues:", "Magentas:"};
+    for (int i = 0; i < 6; ++i)
+        d.addSlider(QStringLiteral("w%1").arg(i), QString::fromLatin1(names[i]), -200, 300, def.weights[i], 0, QStringLiteral("%"));
+    d.addCheck(QStringLiteral("tint"), QStringLiteral("Tint"), false);
+    d.addSlider(QStringLiteral("hue"), QStringLiteral("Hue:"), 0, 360, def.tintHue, 0, QStringLiteral("°"));
+    d.addSlider(QStringLiteral("saturation"), QStringLiteral("Saturation:"), 0, 100, def.tintSaturation, 0, QStringLiteral("%"));
+}
+
+Adjust::LayerSettings blackWhiteSettings(const Values& v)
+{
+    Adjust::LayerSettings s;
+    s.kind = Adjust::Kind::BlackWhite;
+    for (int i = 0; i < 6; ++i) s.blackWhite.weights[i] = int(v[QStringLiteral("w%1").arg(i)]);
+    s.blackWhite.tint = v[QStringLiteral("tint")] != 0;
+    s.blackWhite.tintHue = int(v[QStringLiteral("hue")]);
+    s.blackWhite.tintSaturation = int(v[QStringLiteral("saturation")]);
+    return s;
+}
+
+void setupPosterize(ParamDialog& d)
+{
+    d.addSlider(QStringLiteral("levels"), QStringLiteral("Levels:"), 2, 255, 4, 0, QString(), 64);
+}
+
+Adjust::LayerSettings posterizeSettings(const Values& v)
+{
+    Adjust::LayerSettings s;
+    s.kind = Adjust::Kind::Posterize;
+    s.posterizeLevels = int(v[QStringLiteral("levels")]);
+    return s;
+}
+
+// The dialog values matching saved settings.
+Values valuesOf(const Adjust::LayerSettings& s)
+{
+    Values v;
+    switch (s.kind) {
+    case Adjust::Kind::BrightnessContrast:
+        v[QStringLiteral("brightness")] = s.brightness;
+        v[QStringLiteral("contrast")] = s.contrast;
+        v[QStringLiteral("legacy")] = s.legacy;
+        break;
+    case Adjust::Kind::BlackWhite:
+        for (int i = 0; i < 6; ++i) v[QStringLiteral("w%1").arg(i)] = s.blackWhite.weights[i];
+        v[QStringLiteral("tint")] = s.blackWhite.tint;
+        v[QStringLiteral("hue")] = s.blackWhite.tintHue;
+        v[QStringLiteral("saturation")] = s.blackWhite.tintSaturation;
+        break;
+    case Adjust::Kind::Posterize: v[QStringLiteral("levels")] = s.posterizeLevels; break;
+    default: break;
+    }
+    return v;
+}
+
 } // namespace
 
 MainWindow::MainWindow(QWidget* parent)
@@ -112,6 +195,7 @@ MainWindow::MainWindow(QWidget* parent)
     createDocks();
     createMenus();
     createHiddenShortcuts();
+    m_adjustmentsPanel->setActionLookup([this](const QString& id) { return action(id); });
 
     connect(m_tools, &ToolManager::alertRequested, this, &MainWindow::alert);
     connect(m_viewOptions, &ViewOptions::changed, this, &MainWindow::syncViewActions);
@@ -146,25 +230,53 @@ MainWindow::~MainWindow()
 void MainWindow::createTools()
 {
     using K = BrushTool::Kind;
-    m_tools->addTool(new MoveTool(m_tools), 0);
-    m_tools->addTool(new MarqueeTool(m_tools, false), 1);
-    m_tools->addTool(new MarqueeTool(m_tools, true), 1);
-    m_tools->addTool(new LassoTool(m_tools, false), 2);
-    m_tools->addTool(new LassoTool(m_tools, true), 2);
-    m_tools->addTool(new MagneticLassoTool(m_tools), 2);
-    m_tools->addTool(new QuickSelectionTool(m_tools), 3);
-    m_tools->addTool(new MagicWandTool(m_tools), 3);
-    m_tools->addTool(new CropTool(m_tools), 4);
-    m_tools->addTool(new EyedropperTool(m_tools), 5);
-    m_tools->addTool(new BrushTool(m_tools, K::Brush), 6);
-    m_tools->addTool(new BrushTool(m_tools, K::Pencil), 6);
-    m_tools->addTool(new BrushTool(m_tools, K::Eraser), 7);
-    m_tools->addTool(new GradientTool(m_tools), 8);
-    m_tools->addTool(new PaintBucketTool(m_tools), 8);
-    m_tools->addTool(new HandTool(m_tools), 9);
-    m_tools->addTool(new ZoomTool(m_tools), 10);
+    // Toolbox slots in Photoshop's order; tools in one slot share a flyout.
+    int g = 0;
+    m_tools->addTool(new MoveTool(m_tools), g++);
+    m_tools->addTool(new MarqueeTool(m_tools, false), g);
+    m_tools->addTool(new MarqueeTool(m_tools, true), g++);
+    m_tools->addTool(new LassoTool(m_tools, false), g);
+    m_tools->addTool(new LassoTool(m_tools, true), g);
+    m_tools->addTool(new MagneticLassoTool(m_tools), g++);
+    m_tools->addTool(new QuickSelectionTool(m_tools), g);
+    m_tools->addTool(new MagicWandTool(m_tools), g++);
+    m_tools->addTool(new CropTool(m_tools), g++);
+    m_tools->addTool(new EyedropperTool(m_tools), g++);
+    m_tools->addTool(new SpotHealingTool(m_tools), g);
+    m_tools->addTool(new CloneStampTool(m_tools, true), g++);
+    m_tools->addTool(new BrushTool(m_tools, K::Brush), g);
+    m_tools->addTool(new BrushTool(m_tools, K::Pencil), g++);
+    m_tools->addTool(new CloneStampTool(m_tools), g++);
+    m_tools->addTool(new HistoryBrushTool(m_tools), g++);
+    m_tools->addTool(new BrushTool(m_tools, K::Eraser), g++);
+    m_tools->addTool(new GradientTool(m_tools), g);
+    m_tools->addTool(new PaintBucketTool(m_tools), g++);
+    m_tools->addTool(new FocusTool(m_tools, false), g);
+    m_tools->addTool(new FocusTool(m_tools, true), g);
+    m_tools->addTool(new SmudgeTool(m_tools), g++);
+    m_tools->addTool(new ToningTool(m_tools, ToningTool::Kind::Dodge), g);
+    m_tools->addTool(new ToningTool(m_tools, ToningTool::Kind::Burn), g);
+    m_tools->addTool(new ToningTool(m_tools, ToningTool::Kind::Sponge), g++);
+    m_tools->addTool(new TypeTool(m_tools), g++);
+    m_tools->addTool(new ShapeTool(m_tools, ShapeTool::Kind::Rectangle), g);
+    m_tools->addTool(new ShapeTool(m_tools, ShapeTool::Kind::Ellipse), g);
+    m_tools->addTool(new ShapeTool(m_tools, ShapeTool::Kind::Polygon), g);
+    m_tools->addTool(new ShapeTool(m_tools, ShapeTool::Kind::Line), g++);
+    m_tools->addTool(new HandTool(m_tools), g++);
+    m_tools->addTool(new ZoomTool(m_tools), g++);
     m_transform = new FreeTransformTool(m_tools);
     m_tools->addTool(m_transform, -1);
+
+    // Painting on a text or shape layer asks to rasterize it first, as Photoshop does.
+    m_tools->setRasterizePrompt([this](Document* doc, int index) {
+        const bool text = doc->layerAt(index).kind == LayerKind::Text;
+        const QString msg = text ? QStringLiteral("This type layer must be rasterized before proceeding. Its text will no longer be editable.")
+                                 : QStringLiteral("This shape layer must be rasterized before proceeding. Its vector outline will no longer be editable.");
+        QMessageBox box(QMessageBox::Warning, QStringLiteral("PhotoSlop"), msg, QMessageBox::Ok | QMessageBox::Cancel, this);
+        box.button(QMessageBox::Ok)->setText(text ? QStringLiteral("Rasterize Type") : QStringLiteral("Rasterize Shape"));
+        if (box.exec() != QMessageBox::Ok) return false;
+        return Ops::rasterizeLayer(doc, index);
+    });
 }
 
 void MainWindow::createToolBars()
@@ -239,14 +351,15 @@ void MainWindow::createDocks()
     auto* swatches = makeDock(QStringLiteral("Swatches"), QStringLiteral("SwatchesDock"), m_swatchesPanel);
     m_propertiesPanel = new PropertiesPanel;
     auto* props = makeDock(QStringLiteral("Properties"), QStringLiteral("PropertiesDock"), m_propertiesPanel);
-    auto* adjust = makeDock(QStringLiteral("Adjustments"), QStringLiteral("AdjustmentsDock"), new AdjustmentsPanel);
+    m_adjustmentsPanel = new AdjustmentsPanel;
+    auto* adjust = makeDock(QStringLiteral("Adjustments"), QStringLiteral("AdjustmentsDock"), m_adjustmentsPanel);
     m_layersPanel = new LayersPanel;
     m_layersPanel->setActionLookup(lookup);
     auto* layers = makeDock(QStringLiteral("Layers"), QStringLiteral("LayersDock"), m_layersPanel);
     m_channelsPanel = new ChannelsPanel;
     auto* channels = makeDock(QStringLiteral("Channels"), QStringLiteral("ChannelsDock"), m_channelsPanel);
     auto* paths = makeDock(QStringLiteral("Paths"), QStringLiteral("PathsDock"),
-                           new PlaceholderPanel(QStringLiteral("Paths will appear here once the Pen and Shape tools arrive.")));
+                           new PlaceholderPanel(QStringLiteral("Paths will appear here once the Pen tool arrives.")));
 
     // Collapsed icon column (History / Navigator / Info), left of the panels.
     m_strip = new PanelStrip(this);
@@ -382,12 +495,13 @@ void MainWindow::createMenus()
     // Undo during Free Transform cancels it instead of stepping back through history.
     disconnect(undo, &QAction::triggered, m_undoGroup, nullptr);
     connect(undo, &QAction::triggered, this, [this] {
-        if (m_transform->isActive()) m_transform->cancel(currentView());
+        // Undo during Free Transform or typing abandons it instead.
+        if (Tool* modal = m_tools->modalTool()) modal->cancel(currentView());
         else m_undoGroup->undo();
     });
     disconnect(redo, &QAction::triggered, m_undoGroup, nullptr);
     connect(redo, &QAction::triggered, this, [this] {
-        if (!m_transform->isActive()) m_undoGroup->redo();
+        if (!m_tools->modalTool()) m_undoGroup->redo();
     });
     m_actions.insert(QStringLiteral("edit.undo"), undo);
     m_actions.insert(QStringLiteral("edit.redo"), redo);
@@ -516,21 +630,18 @@ void MainWindow::createMenus()
     // Holding Alt (Option) opens Levels, Curves, Hue/Saturation and Color Balance with the last settings.
     auto altHeld = [] { return bool(QApplication::keyboardModifiers() & Qt::AltModifier); };
     adj->addAction(makeAction(QStringLiteral("image.brightnessContrast"), QStringLiteral("Brightness/Contrast..."), {}, [this] {
-        paramDialog(QStringLiteral("Brightness/Contrast"), false, false, [](ParamDialog& d) {
-            d.addSlider(QStringLiteral("brightness"), QStringLiteral("Brightness:"), -150, 150, 0);
-            d.addSlider(QStringLiteral("contrast"), QStringLiteral("Contrast:"), -50, 100, 0);
-            d.addCheck(QStringLiteral("legacy"), QStringLiteral("Use Legacy"), false);
-        }, [](const QHash<QString, double>& v) {
-            return Adjust::spec(QStringLiteral("Brightness/Contrast"),
-                                Adjust::brightnessContrastMap(int(v[QStringLiteral("brightness")]), int(v[QStringLiteral("contrast")]),
-                                                              v[QStringLiteral("legacy")] != 0));
+        paramDialog(QStringLiteral("Brightness/Contrast"), false, false, setupBrightnessContrast, [](const Values& v) {
+            const Adjust::LayerSettings s = brightnessContrastSettings(v);
+            return Adjust::spec(QStringLiteral("Brightness/Contrast"), s.buildMap());
         });
     }));
     adj->addAction(makeAction(QStringLiteral("image.levels"), QStringLiteral("Levels..."), keys({"Ctrl+L", "Ctrl+Alt+L"}), [this, altHeld] {
+        if (!prepareTarget(QStringLiteral("Levels"))) return;
         LevelsDialog dlg(currentDoc(), altHeld(), this);
         execPreview(dlg);
     }));
     adj->addAction(makeAction(QStringLiteral("image.curves"), QStringLiteral("Curves..."), keys({"Ctrl+M", "Ctrl+Alt+M"}), [this, altHeld] {
+        if (!prepareTarget(QStringLiteral("Curves"))) return;
         CurvesDialog dlg(currentDoc(), altHeld(), this);
         execPreview(dlg);
     }));
@@ -539,30 +650,19 @@ void MainWindow::createMenus()
     stub(adj, QStringLiteral("Vibrance..."));
     adj->addAction(makeAction(QStringLiteral("image.hueSaturation"), QStringLiteral("Hue/Saturation..."), keys({"Ctrl+U", "Ctrl+Alt+U"}),
                               [this, altHeld] {
+        if (!prepareTarget(QStringLiteral("Hue/Saturation"))) return;
         HueSaturationDialog dlg(currentDoc(), altHeld(), this);
         execPreview(dlg);
     }));
     adj->addAction(makeAction(QStringLiteral("image.colorBalance"), QStringLiteral("Color Balance..."), keys({"Ctrl+B", "Ctrl+Alt+B"}),
                               [this, altHeld] {
+        if (!prepareTarget(QStringLiteral("Color Balance"))) return;
         ColorBalanceDialog dlg(currentDoc(), altHeld(), this);
         execPreview(dlg);
     }));
     adj->addAction(makeAction(QStringLiteral("image.blackWhite"), QStringLiteral("Black && White..."), keys({"Ctrl+Alt+Shift+B"}), [this] {
-        paramDialog(QStringLiteral("Black and White"), false, false, [](ParamDialog& d) {
-            const Adjust::BlackWhite def;
-            const char* names[6] = {"Reds:", "Yellows:", "Greens:", "Cyans:", "Blues:", "Magentas:"};
-            for (int i = 0; i < 6; ++i)
-                d.addSlider(QStringLiteral("w%1").arg(i), QString::fromLatin1(names[i]), -200, 300, def.weights[i], 0, QStringLiteral("%"));
-            d.addCheck(QStringLiteral("tint"), QStringLiteral("Tint"), false);
-            d.addSlider(QStringLiteral("hue"), QStringLiteral("Hue:"), 0, 360, def.tintHue, 0, QStringLiteral("°"));
-            d.addSlider(QStringLiteral("saturation"), QStringLiteral("Saturation:"), 0, 100, def.tintSaturation, 0, QStringLiteral("%"));
-        }, [](const QHash<QString, double>& v) {
-            Adjust::BlackWhite bw;
-            for (int i = 0; i < 6; ++i) bw.weights[i] = int(v[QStringLiteral("w%1").arg(i)]);
-            bw.tint = v[QStringLiteral("tint")] != 0;
-            bw.tintHue = int(v[QStringLiteral("hue")]);
-            bw.tintSaturation = int(v[QStringLiteral("saturation")]);
-            return Adjust::spec(QStringLiteral("Black & White"), Adjust::blackWhiteMap(bw));
+        paramDialog(QStringLiteral("Black and White"), false, false, setupBlackWhite, [](const Values& v) {
+            return Adjust::spec(QStringLiteral("Black & White"), blackWhiteSettings(v).buildMap());
         });
     }));
     stub(adj, QStringLiteral("Photo Filter..."));
@@ -573,13 +673,12 @@ void MainWindow::createMenus()
         applySpec(Adjust::spec(QStringLiteral("Invert"), Adjust::invertMap()));
     }));
     adj->addAction(makeAction(QStringLiteral("image.posterize"), QStringLiteral("Posterize..."), {}, [this] {
-        paramDialog(QStringLiteral("Posterize"), false, false, [](ParamDialog& d) {
-            d.addSlider(QStringLiteral("levels"), QStringLiteral("Levels:"), 2, 255, 4, 0, QString(), 64);
-        }, [](const QHash<QString, double>& v) {
-            return Adjust::spec(QStringLiteral("Posterize"), Adjust::posterizeMap(int(v[QStringLiteral("levels")])));
+        paramDialog(QStringLiteral("Posterize"), false, false, setupPosterize, [](const Values& v) {
+            return Adjust::spec(QStringLiteral("Posterize"), posterizeSettings(v).buildMap());
         });
     }));
     adj->addAction(makeAction(QStringLiteral("image.threshold"), QStringLiteral("Threshold..."), {}, [this] {
+        if (!prepareTarget(QStringLiteral("Threshold"))) return;
         ThresholdDialog dlg(currentDoc(), this);
         execPreview(dlg);
     }));
@@ -633,7 +732,7 @@ void MainWindow::createMenus()
         if (!ok) return;
         auto* copy = new Document(d->size());
         DocState s = d->state();
-        for (Layer& l : s.layers) l.id = Layer::nextId();
+        Tree::renewIds(s.layers);
         copy->initialize(s);
         copy->setTitle(name);
         addDocument(copy);
@@ -643,6 +742,17 @@ void MainWindow::createMenus()
 
     // ---------------- Layer ----------------
     QMenu* layer = mb->addMenu(QStringLiteral("&Layer"));
+    auto withDoc = [this](const std::function<void(Document*)>& fn) {
+        return [this, fn] {
+            if (Document* d = currentDoc()) fn(d);
+        };
+    };
+    auto withError = [this](const std::function<bool(Document*, QString*)>& fn) {
+        return [this, fn] {
+            QString err;
+            if (Document* d = currentDoc(); d && !fn(d, &err) && !err.isEmpty()) alert(err);
+        };
+    };
     QMenu* newMenu = layer->addMenu(QStringLiteral("New"));
     newMenu->addAction(makeAction(QStringLiteral("layer.new"), QStringLiteral("Layer..."), keys({"Ctrl+Shift+N"}), [this] { newLayerDialog(); }));
     makeAction(QStringLiteral("layer.newQuick"), QStringLiteral("New Layer"), keys({"Ctrl+Alt+Shift+N"}), [this] {
@@ -650,22 +760,25 @@ void MainWindow::createMenus()
     });
     addAction(A(QStringLiteral("layer.newQuick")));
     newMenu->addAction(makeAction(QStringLiteral("layer.fromBackground"), QStringLiteral("Layer from Background..."), {}, [this] { layerFromBackground(); }));
-    stub(newMenu, QStringLiteral("Group..."));
-    stub(newMenu, QStringLiteral("Group from Layers..."));
+    newMenu->addAction(makeAction(QStringLiteral("layer.newGroup"), QStringLiteral("Group..."), {}, [this] {
+        Document* d = currentDoc();
+        if (!d) return;
+        bool ok = false;
+        const QString name = QInputDialog::getText(this, QStringLiteral("New Group"), QStringLiteral("Name:"), QLineEdit::Normal,
+                                                   d->nextName(QStringLiteral("Group")), &ok);
+        if (ok) Ops::newGroup(d, name);
+    }));
+    makeAction(QStringLiteral("layer.newGroupQuick"), QStringLiteral("Create a New Group"), {}, withDoc([](Document* d) { Ops::newGroup(d); }));
+    newMenu->addAction(makeAction(QStringLiteral("layer.groupFromLayers"), QStringLiteral("Group from Layers..."), {},
+                                  withError([](Document* d, QString* e) { return Ops::groupLayer(d, e); })));
     newMenu->addSeparator();
-    newMenu->addAction(makeAction(QStringLiteral("layer.viaCopy"), QStringLiteral("Layer via Copy"), keys({"Ctrl+J"}), [this] {
-        QString err;
-        if (Document* d = currentDoc(); d && !Ops::layerViaCopy(d, false, &err) && !err.isEmpty()) alert(err);
-    }));
-    newMenu->addAction(makeAction(QStringLiteral("layer.viaCut"), QStringLiteral("Layer via Cut"), keys({"Ctrl+Shift+J"}), [this] {
-        QString err;
-        if (Document* d = currentDoc(); d && !Ops::layerViaCopy(d, true, &err) && !err.isEmpty()) alert(err);
-    }));
+    newMenu->addAction(makeAction(QStringLiteral("layer.viaCopy"), QStringLiteral("Layer via Copy"), keys({"Ctrl+J"}),
+                                  withError([](Document* d, QString* e) { return Ops::layerViaCopy(d, false, e); })));
+    newMenu->addAction(makeAction(QStringLiteral("layer.viaCut"), QStringLiteral("Layer via Cut"), keys({"Ctrl+Shift+J"}),
+                                  withError([](Document* d, QString* e) { return Ops::layerViaCopy(d, true, e); })));
     layer->addAction(makeAction(QStringLiteral("layer.duplicate"), QStringLiteral("Duplicate Layer..."), {}, [this] { duplicateLayerDialog(); }));
-    layer->addAction(makeAction(QStringLiteral("layer.delete"), QStringLiteral("Delete Layer"), {}, [this] {
-        QString err;
-        if (Document* d = currentDoc(); d && !Ops::deleteLayer(d, &err)) alert(err);
-    }));
+    layer->addAction(makeAction(QStringLiteral("layer.delete"), QStringLiteral("Delete Layer"), {},
+                                withError([](Document* d, QString* e) { return Ops::deleteLayer(d, e); })));
     layer->addSeparator();
     layer->addAction(makeAction(QStringLiteral("layer.rename"), QStringLiteral("Rename Layer..."), {}, [this] {
         Document* d = currentDoc();
@@ -675,21 +788,125 @@ void MainWindow::createMenus()
                                           d->activeLayer()->name, &ok);
         if (ok) Ops::rename(d, d->activeIndex(), n);
     }));
-    stub(layer, QStringLiteral("Layer Style"));
+
+    // Layer Style
+    QMenu* styleMenu = layer->addMenu(QStringLiteral("Layer Style"));
+    const struct { const char* id; const char* text; LayerStyleDialog::Page page; } stylePages[] = {
+        {"layer.styleBlending", "Blending Options...", LayerStyleDialog::Blending},
+        {"layer.styleStroke", "Stroke...", LayerStyleDialog::StrokePage},
+        {"layer.styleColorOverlay", "Color Overlay...", LayerStyleDialog::ColorOverlayPage},
+        {"layer.styleOuterGlow", "Outer Glow...", LayerStyleDialog::OuterGlowPage},
+        {"layer.styleDropShadow", "Drop Shadow...", LayerStyleDialog::DropShadowPage},
+    };
+    for (const auto& sp : stylePages) {
+        const LayerStyleDialog::Page page = sp.page;
+        styleMenu->addAction(makeAction(QString::fromLatin1(sp.id), QString::fromLatin1(sp.text), {}, [this, page] { layerStyleDialog(page); }));
+        if (page == LayerStyleDialog::Blending) styleMenu->addSeparator();
+    }
+    styleMenu->addSeparator();
+    styleMenu->addAction(makeAction(QStringLiteral("layer.styleCopy"), QStringLiteral("Copy Layer Style"), {}, [this] {
+        if (Document* d = currentDoc(); d && d->activeLayer() && d->activeLayer()->style) m_copiedStyle = d->activeLayer()->style;
+        updateActions();
+    }));
+    styleMenu->addAction(makeAction(QStringLiteral("layer.stylePaste"), QStringLiteral("Paste Layer Style"), {}, [this] {
+        if (Document* d = currentDoc(); d && m_copiedStyle) Ops::setStyle(d, d->activeIndex(), m_copiedStyle, QStringLiteral("Paste Layer Style"));
+    }));
+    styleMenu->addAction(makeAction(QStringLiteral("layer.styleClear"), QStringLiteral("Clear Layer Style"), {},
+                                    withDoc([](Document* d) { Ops::setStyle(d, d->activeIndex(), nullptr, QStringLiteral("Clear Layer Style")); })));
+    styleMenu->addSeparator();
+    styleMenu->addAction(makeAction(QStringLiteral("layer.styleHide"), QStringLiteral("Hide All Effects"), {}, withDoc([](Document* d) {
+        const Layer* l = d->activeLayer();
+        if (!l || !l->style) return;
+        LayerStyle st = *l->style;
+        st.visible = !st.visible;
+        Ops::setStyle(d, d->activeIndex(), std::make_shared<const LayerStyle>(st),
+                      st.visible ? QStringLiteral("Show Layer Effects") : QStringLiteral("Hide Layer Effects"));
+    })));
     stub(layer, QStringLiteral("Smart Filter"));
     layer->addSeparator();
     stub(layer, QStringLiteral("New Fill Layer"));
-    stub(layer, QStringLiteral("New Adjustment Layer"));
+
+    // New Adjustment Layer
+    QMenu* adjLayer = layer->addMenu(QStringLiteral("New Adjustment Layer"));
+    const struct { const char* id; const char* text; Adjust::Kind kind; } adjKinds[] = {
+        {"brightnessContrast", "Brightness/Contrast...", Adjust::Kind::BrightnessContrast},
+        {"levels", "Levels...", Adjust::Kind::Levels},
+        {"curves", "Curves...", Adjust::Kind::Curves},
+        {"hueSaturation", "Hue/Saturation...", Adjust::Kind::HueSaturation},
+        {"colorBalance", "Color Balance...", Adjust::Kind::ColorBalance},
+        {"blackWhite", "Black && White...", Adjust::Kind::BlackWhite},
+        {"invert", "Invert...", Adjust::Kind::Invert},
+        {"posterize", "Posterize...", Adjust::Kind::Posterize},
+        {"threshold", "Threshold...", Adjust::Kind::Threshold},
+    };
+    for (const auto& k : adjKinds) {
+        const Adjust::Kind kind = k.kind;
+        if (kind == Adjust::Kind::HueSaturation || kind == Adjust::Kind::Invert) adjLayer->addSeparator();
+        adjLayer->addAction(makeAction(QStringLiteral("layer.newAdjustment.") + QLatin1String(k.id), QString::fromUtf8(k.text), {},
+                                       [this, kind] { newAdjustmentLayer(kind); }));
+    }
+    layer->addAction(makeAction(QStringLiteral("layer.contentOptions"), QStringLiteral("Layer Content Options..."), {}, [this] {
+        if (Document* d = currentDoc()) editAdjustmentLayer(d->activeIndex());
+    }));
     layer->addSeparator();
-    stub(layer, QStringLiteral("Layer Mask"));
+
+    // Layer Mask
+    QMenu* maskMenu = layer->addMenu(QStringLiteral("Layer Mask"));
+    const struct { const char* id; const char* text; Ops::MaskFill fill; } maskFills[] = {
+        {"layer.maskRevealAll", "Reveal All", Ops::MaskFill::RevealAll},
+        {"layer.maskHideAll", "Hide All", Ops::MaskFill::HideAll},
+        {"layer.maskRevealSelection", "Reveal Selection", Ops::MaskFill::RevealSelection},
+        {"layer.maskHideSelection", "Hide Selection", Ops::MaskFill::HideSelection},
+    };
+    for (const auto& mf : maskFills) {
+        const Ops::MaskFill fill = mf.fill;
+        maskMenu->addAction(makeAction(QString::fromLatin1(mf.id), QString::fromLatin1(mf.text), {},
+                                       withError([fill](Document* d, QString* e) { return Ops::addMask(d, fill, e); })));
+    }
+    // The Layers panel's mask button: from the selection when there is one; Alt hides.
+    makeAction(QStringLiteral("layer.maskAdd"), QStringLiteral("Add Layer Mask"), {}, withError([](Document* d, QString* e) {
+        const bool hide = QApplication::keyboardModifiers() & Qt::AltModifier;
+        const Ops::MaskFill fill = d->hasSelection() ? (hide ? Ops::MaskFill::HideSelection : Ops::MaskFill::RevealSelection)
+                                                     : (hide ? Ops::MaskFill::HideAll : Ops::MaskFill::RevealAll);
+        return Ops::addMask(d, fill, e);
+    }));
+    maskMenu->addSeparator();
+    maskMenu->addAction(makeAction(QStringLiteral("layer.maskDelete"), QStringLiteral("Delete"), {},
+                                   withError([](Document* d, QString* e) { return Ops::deleteMask(d, false, e); })));
+    maskMenu->addAction(makeAction(QStringLiteral("layer.maskApply"), QStringLiteral("Apply"), {},
+                                   withError([](Document* d, QString* e) { return Ops::deleteMask(d, true, e); })));
+    maskMenu->addSeparator();
+    maskMenu->addAction(makeAction(QStringLiteral("layer.maskToggle"), QStringLiteral("Disable"), {}, withDoc([](Document* d) {
+        if (const Layer* l = d->activeLayer(); l && l->mask) Ops::setMaskEnabled(d, d->activeIndex(), !l->maskEnabled);
+    })));
+    maskMenu->addAction(makeAction(QStringLiteral("layer.maskLink"), QStringLiteral("Unlink"), {}, withDoc([](Document* d) {
+        if (const Layer* l = d->activeLayer(); l && l->mask) Ops::setMaskLinked(d, d->activeIndex(), !l->maskLinked);
+    })));
+    maskMenu->addSeparator();
+    maskMenu->addAction(makeAction(QStringLiteral("layer.maskLoadSelection"), QStringLiteral("Load Selection"), {},
+                                   withDoc([](Document* d) { Ops::loadSelectionFromMask(d, d->activeIndex()); })));
     stub(layer, QStringLiteral("Vector Mask"));
-    stub(layer, QStringLiteral("Create Clipping Mask"), QKeySequence(QStringLiteral("Ctrl+Alt+G")));
+    layer->addAction(makeAction(QStringLiteral("layer.clipping"), QStringLiteral("Create Clipping Mask"), keys({"Ctrl+Alt+G"}),
+                                withError([](Document* d, QString* e) { return Ops::toggleClippingMask(d, e); })));
     layer->addSeparator();
     stub(layer, QStringLiteral("Smart Objects"));
-    stub(layer, QStringLiteral("Rasterize"));
+    QMenu* rasterize = layer->addMenu(QStringLiteral("Rasterize"));
+    rasterize->addAction(makeAction(QStringLiteral("layer.rasterizeType"), QStringLiteral("Type"), {},
+                                    withDoc([](Document* d) { Ops::rasterizeLayer(d, d->activeIndex()); })));
+    rasterize->addAction(makeAction(QStringLiteral("layer.rasterizeShape"), QStringLiteral("Shape"), {},
+                                    withDoc([](Document* d) { Ops::rasterizeLayer(d, d->activeIndex()); })));
+    rasterize->addAction(makeAction(QStringLiteral("layer.rasterizeStyle"), QStringLiteral("Layer Style"), {},
+                                    withDoc([](Document* d) { Ops::rasterizeStyle(d, d->activeIndex()); })));
+    rasterize->addAction(makeAction(QStringLiteral("layer.rasterizeLayer"), QStringLiteral("Layer"), {}, withDoc([](Document* d) {
+        const int i = d->activeIndex();
+        if (d->layerAt(i).isVector()) Ops::rasterizeLayer(d, i);
+        if (d->layerAt(i).hasStyle()) Ops::rasterizeStyle(d, i);
+    })));
     layer->addSeparator();
-    stub(layer, QStringLiteral("Group Layers"), QKeySequence(QStringLiteral("Ctrl+G")));
-    stub(layer, QStringLiteral("Ungroup Layers"), QKeySequence(QStringLiteral("Ctrl+Shift+G")));
+    layer->addAction(makeAction(QStringLiteral("layer.group"), QStringLiteral("Group Layers"), keys({"Ctrl+G"}),
+                                withError([](Document* d, QString* e) { return Ops::groupLayer(d, e); })));
+    layer->addAction(makeAction(QStringLiteral("layer.ungroup"), QStringLiteral("Ungroup Layers"), keys({"Ctrl+Shift+G"}),
+                                withError([](Document* d, QString* e) { return Ops::ungroup(d, e); })));
     layer->addAction(makeAction(QStringLiteral("layer.hide"), QStringLiteral("Hide Layers"), keys({"Ctrl+,"}), [this] {
         if (Document* d = currentDoc(); d && d->activeLayer())
             Ops::setVisible(d, d->activeIndex(), !d->activeLayer()->visible);
@@ -719,20 +936,16 @@ void MainWindow::createMenus()
     stub(layer, QStringLiteral("Link Layers"));
     stub(layer, QStringLiteral("Select Linked Layers"));
     layer->addSeparator();
-    layer->addAction(makeAction(QStringLiteral("layer.mergeDown"), QStringLiteral("Merge Down"), keys({"Ctrl+E"}), [this] {
-        QString err;
-        if (Document* d = currentDoc(); d && !Ops::mergeDown(d, &err)) alert(err);
-    }));
-    layer->addAction(makeAction(QStringLiteral("layer.mergeVisible"), QStringLiteral("Merge Visible"), keys({"Ctrl+Shift+E"}), [this] {
-        QString err;
-        if (Document* d = currentDoc(); d && !Ops::mergeVisible(d, &err)) alert(err);
-    }));
+    layer->addAction(makeAction(QStringLiteral("layer.mergeDown"), QStringLiteral("Merge Down"), keys({"Ctrl+E"}),
+                                withError([](Document* d, QString* e) { return Ops::mergeDown(d, e); })));
+    layer->addAction(makeAction(QStringLiteral("layer.mergeVisible"), QStringLiteral("Merge Visible"), keys({"Ctrl+Shift+E"}),
+                                withError([](Document* d, QString* e) { return Ops::mergeVisible(d, e); })));
     layer->addAction(makeAction(QStringLiteral("layer.flatten"), QStringLiteral("Flatten Image"), {}, [this] {
         Document* d = currentDoc();
         if (!d) return;
         bool hidden = false;
-        for (const Layer& l : d->layers())
-            if (!l.visible) hidden = true;
+        for (int i = 0; i < d->layerCount(); ++i)
+            if (!Tree::effectivelyVisible(d->layers(), i)) hidden = true;
         if (hidden && QMessageBox::question(this, QStringLiteral("PhotoSlop"), QStringLiteral("Discard hidden layers?"),
                                             QMessageBox::Ok | QMessageBox::Cancel) != QMessageBox::Ok)
             return;
@@ -742,11 +955,25 @@ void MainWindow::createMenus()
 
     // ---------------- Type ----------------
     QMenu* type = mb->addMenu(QStringLiteral("&Type"));
-    for (const char* t : {"More from Adobe Fonts...", "Panels", "Anti-Alias", "Orientation", "OpenType", "Extrude to 3D",
-                          "Create Work Path", "Convert to Shape", "Rasterize Type Layer", "Convert Text Shape Type",
-                          "Warp Text...", "Match Font...", "Font Preview Size", "Language Options", "Update All Text Layers",
-                          "Manage Missing Fonts", "Paste Lorem Ipsum", "Load Default Type Styles", "Save Default Type Styles"})
-        stub(type, QString::fromLatin1(t) == QLatin1String("More from Adobe Fonts...") ? QStringLiteral("More Fonts...") : QString::fromLatin1(t));
+    for (const char* t : {"More Fonts...", "Panels", "Anti-Alias", "Orientation", "OpenType", "Extrude to 3D", "Create Work Path",
+                          "Convert to Shape"})
+        stub(type, QString::fromLatin1(t));
+    type->addAction(makeAction(QStringLiteral("type.rasterize"), QStringLiteral("Rasterize Type Layer"), {},
+                               withDoc([](Document* d) { Ops::rasterizeLayer(d, d->activeIndex()); })));
+    // Double-clicking a type layer's thumbnail edits its text with the Type tool.
+    makeAction(QStringLiteral("type.edit"), QStringLiteral("Edit Type"), {}, [this] {
+        Document* d = currentDoc();
+        CanvasView* v = currentView();
+        if (!d || !v || !d->activeLayer() || d->activeLayer()->kind != LayerKind::Text) return;
+        auto* t = static_cast<TypeTool*>(m_tools->tool(QStringLiteral("type")));
+        m_tools->select(t);
+        if (t->beginEdit(v, d->activeIndex(), QPointF())) t->setCaret(int(t->textData().text.size()));
+        v->setFocus();
+    });
+    for (const char* t : {"Convert Text Shape Type", "Warp Text...", "Match Font...", "Font Preview Size", "Language Options",
+                          "Update All Text Layers", "Manage Missing Fonts", "Paste Lorem Ipsum", "Load Default Type Styles",
+                          "Save Default Type Styles"})
+        stub(type, QString::fromLatin1(t));
 
     // ---------------- Select ----------------
     QMenu* select = mb->addMenu(QStringLiteral("&Select"));
@@ -853,7 +1080,6 @@ void MainWindow::createMenus()
     auto radiusSlider = [](ParamDialog& d, double def) {
         d.addSlider(QStringLiteral("radius"), QStringLiteral("Radius:"), 0.1, 1000, def, 1, QStringLiteral("Pixels"), 250);
     };
-    using Values = QHash<QString, double>;
     const QHash<QString, std::function<void()>> filterActions = {
         {QStringLiteral("Blur"), fixedFilter(&Filters::blurSpec)},
         {QStringLiteral("Blur More"), fixedFilter(&Filters::blurMoreSpec)},
@@ -1061,7 +1287,7 @@ void MainWindow::createHiddenShortcuts()
 {
     // Tool letters: the key selects the group's last tool; Shift+key cycles through the group.
     for (const auto& grp : m_tools->groups()) {
-        if (grp.tools.isEmpty()) continue;
+        if (grp.tools.isEmpty() || grp.tools.first()->shortcut().isNull()) continue; // e.g. Blur/Sharpen/Smudge
         const QChar key = grp.tools.first()->shortcut();
         QAction* a = makeAction(QStringLiteral("tool.%1").arg(key), grp.tools.first()->name(),
                                 {QKeySequence(QString(key))}, [this, key] { m_tools->selectByShortcut(key, false); }, false);
@@ -1113,6 +1339,8 @@ void MainWindow::addDocument(Document* doc)
     connect(doc, &Document::selectionChanged, this, &MainWindow::updateActions);
     connect(doc, &Document::layersChanged, this, &MainWindow::updateActions);
     connect(doc, &Document::quickMaskChanged, this, &MainWindow::updateActions);
+    connect(doc, &Document::activeLayerChanged, this, &MainWindow::updateActions);
+    connect(doc, &Document::editTargetChanged, this, &MainWindow::updateActions);
     connect(doc->undoStack(), &QUndoStack::indexChanged, this, &MainWindow::updateActions);
     m_tabs->setCurrentIndex(idx);
     m_central->setCurrentWidget(m_tabs);
@@ -1401,8 +1629,54 @@ void MainWindow::updateActions()
     action(QStringLiteral("edit.cut"))->setEnabled(sel);
     action(QStringLiteral("layer.viaCut"))->setEnabled(sel);
     action(QStringLiteral("layer.fromBackground"))->setEnabled(l && l->isBackground);
-    action(QStringLiteral("layer.mergeDown"))->setEnabled(doc->activeIndex() > 0);
-    action(QStringLiteral("layer.delete"))->setEnabled(doc->layerCount() > 1);
+    const QList<Layer>& layers = doc->layers();
+    const int ai = doc->activeIndex();
+    const QList<int> siblings = Tree::children(layers, Tree::parentIndex(layers, ai));
+    const bool hasBelow = siblings.indexOf(ai) > 0;
+    const bool isGroup = l && l->isGroup();
+    const bool isBg = l && l->isBackground;
+    action(QStringLiteral("layer.mergeDown"))->setEnabled(isGroup || hasBelow);
+    action(QStringLiteral("layer.mergeDown"))->setText(isGroup ? QStringLiteral("Merge Group") : QStringLiteral("Merge Down"));
+    action(QStringLiteral("layer.delete"))->setEnabled(doc->layerCount() - (ai - Tree::subtreeStart(layers, ai) + 1) >= 1);
+    action(QStringLiteral("layer.delete"))->setText(isGroup ? QStringLiteral("Delete Group") : QStringLiteral("Delete Layer"));
+    // Groups and clipping
+    action(QStringLiteral("layer.group"))->setEnabled(l && !isBg);
+    action(QStringLiteral("layer.groupFromLayers"))->setEnabled(l && !isBg);
+    action(QStringLiteral("layer.ungroup"))->setEnabled(isGroup);
+    action(QStringLiteral("layer.clipping"))->setEnabled(l && !isBg && (l->clipped || hasBelow));
+    action(QStringLiteral("layer.clipping"))->setText(l && l->clipped ? QStringLiteral("Release Clipping Mask")
+                                                                       : QStringLiteral("Create Clipping Mask"));
+    // Styles
+    const bool styleable = l && !isBg && !isGroup && l->kind != LayerKind::Adjustment;
+    for (const char* id : {"layer.styleBlending", "layer.styleStroke", "layer.styleColorOverlay", "layer.styleOuterGlow",
+                           "layer.styleDropShadow"})
+        action(QString::fromLatin1(id))->setEnabled(styleable);
+    const bool styled = l && l->style;
+    action(QStringLiteral("layer.styleCopy"))->setEnabled(styled);
+    action(QStringLiteral("layer.stylePaste"))->setEnabled(styleable && m_copiedStyle);
+    action(QStringLiteral("layer.styleClear"))->setEnabled(styled);
+    action(QStringLiteral("layer.styleHide"))->setEnabled(styled);
+    action(QStringLiteral("layer.styleHide"))->setText(styled && !l->style->visible ? QStringLiteral("Show All Effects")
+                                                                                    : QStringLiteral("Hide All Effects"));
+    // Masks
+    const bool masked = l && l->mask;
+    for (const char* id : {"layer.maskRevealAll", "layer.maskHideAll", "layer.maskAdd"})
+        action(QString::fromLatin1(id))->setEnabled(l && !isBg && !masked);
+    for (const char* id : {"layer.maskRevealSelection", "layer.maskHideSelection"})
+        action(QString::fromLatin1(id))->setEnabled(l && !isBg && !masked && sel);
+    for (const char* id : {"layer.maskDelete", "layer.maskToggle", "layer.maskLink", "layer.maskLoadSelection"})
+        action(QString::fromLatin1(id))->setEnabled(masked);
+    action(QStringLiteral("layer.maskApply"))->setEnabled(masked && l->isPixel());
+    action(QStringLiteral("layer.maskToggle"))->setText(masked && !l->maskEnabled ? QStringLiteral("Enable") : QStringLiteral("Disable"));
+    action(QStringLiteral("layer.maskLink"))->setText(masked && !l->maskLinked ? QStringLiteral("Link") : QStringLiteral("Unlink"));
+    // Content
+    const bool adjustment = l && l->kind == LayerKind::Adjustment;
+    action(QStringLiteral("layer.contentOptions"))->setEnabled(adjustment && l->adjustment && l->adjustment->kind != Adjust::Kind::Invert);
+    action(QStringLiteral("layer.rasterizeType"))->setEnabled(l && l->kind == LayerKind::Text);
+    action(QStringLiteral("type.rasterize"))->setEnabled(l && l->kind == LayerKind::Text);
+    action(QStringLiteral("layer.rasterizeShape"))->setEnabled(l && l->kind == LayerKind::Shape);
+    action(QStringLiteral("layer.rasterizeStyle"))->setEnabled(l && l->hasStyle());
+    action(QStringLiteral("layer.rasterizeLayer"))->setEnabled(l && (l->isVector() || l->hasStyle()));
     action(QStringLiteral("layer.flatten"))->setEnabled(doc->layerCount() > 1 || (l && !l->isBackground));
     action(QStringLiteral("file.revert"))->setEnabled(!doc->filePath().isEmpty());
     action(QStringLiteral("filter.last"))->setEnabled(bool(m_lastFilter));
@@ -1491,7 +1765,7 @@ void MainWindow::paste(bool inPlace)
 void MainWindow::fillDialog()
 {
     Document* doc = currentDoc();
-    if (!doc) return;
+    if (!doc || !prepareTarget(QStringLiteral("Fill"))) return;
     FillDialog dlg(m_colors, this);
     if (dlg.exec() != QDialog::Accepted) return;
     QString err;
@@ -1501,7 +1775,7 @@ void MainWindow::fillDialog()
 void MainWindow::quickFill(bool background, bool preserve)
 {
     Document* doc = currentDoc();
-    if (!doc) return;
+    if (!doc || !prepareTarget(QStringLiteral("Fill"))) return;
     QString err;
     if (!Ops::fill(doc, background ? m_colors->background() : m_colors->foreground(), BlendMode::Normal, 1.f, preserve, &err))
         alert(err);
@@ -1626,6 +1900,78 @@ void MainWindow::toggleQuickMask()
     if (Document* doc = currentDoc()) Ops::setQuickMask(doc, !doc->inQuickMask());
 }
 
+void MainWindow::layerStyleDialog(int page)
+{
+    Document* doc = currentDoc();
+    if (!doc || !doc->activeLayer()) return;
+    const Layer& l = *doc->activeLayer();
+    if (l.isBackground || l.isGroup() || l.kind == LayerKind::Adjustment) return;
+    LayerStyleDialog dlg(doc, doc->activeIndex(), LayerStyleDialog::Page(page), this);
+    dlg.exec();
+}
+
+void MainWindow::newAdjustmentLayer(Adjust::Kind kind)
+{
+    Document* doc = currentDoc();
+    if (!doc) return;
+    Ops::newAdjustmentLayer(doc, Adjust::LayerSettings::make(kind));
+    if (kind == Adjust::Kind::Invert) return; // nothing to set
+    if (!editAdjustmentLayer(doc->activeIndex())) doc->undoStack()->undo();
+}
+
+bool MainWindow::editAdjustmentLayer(int index)
+{
+    Document* doc = currentDoc();
+    if (!doc || index < 0 || index >= doc->layerCount()) return false;
+    const Layer& l = doc->layerAt(index);
+    if (l.kind != LayerKind::Adjustment || !l.adjustment) return false;
+    const Adjust::LayerSettings s = *l.adjustment;
+    auto run = [](PreviewDialog& dlg) { return dlg.exec() == QDialog::Accepted; };
+    auto param = [&](const QString& title, void (*setup)(ParamDialog&), Adjust::LayerSettings (*settings)(const Values&)) {
+        ParamDialog dlg(doc, title, false, [settings, title](const Values& v) { return Adjust::spec(title, settings(v).buildMap()); },
+                        this, index);
+        setup(dlg);
+        dlg.setLayerBuilder(settings);
+        const Values v = valuesOf(s);
+        for (auto it = v.cbegin(); it != v.cend(); ++it) dlg.setValue(it.key(), it.value());
+        dlg.ready();
+        return run(dlg);
+    };
+    switch (s.kind) {
+    case Adjust::Kind::Levels: {
+        LevelsDialog dlg(doc, false, this, index);
+        dlg.setLevels(s.levels);
+        return run(dlg);
+    }
+    case Adjust::Kind::Curves: {
+        CurvesDialog dlg(doc, false, this, index);
+        dlg.setCurves(s.curves);
+        return run(dlg);
+    }
+    case Adjust::Kind::HueSaturation: {
+        HueSaturationDialog dlg(doc, false, this, index);
+        dlg.setSettings(s.hueSaturation);
+        return run(dlg);
+    }
+    case Adjust::Kind::ColorBalance: {
+        ColorBalanceDialog dlg(doc, false, this, index);
+        dlg.setSettings(s.colorBalance);
+        return run(dlg);
+    }
+    case Adjust::Kind::Threshold: {
+        ThresholdDialog dlg(doc, this, index);
+        dlg.setLevel(s.thresholdLevel);
+        return run(dlg);
+    }
+    case Adjust::Kind::BrightnessContrast:
+        return param(QStringLiteral("Brightness/Contrast"), setupBrightnessContrast, brightnessContrastSettings);
+    case Adjust::Kind::BlackWhite: return param(QStringLiteral("Black and White"), setupBlackWhite, blackWhiteSettings);
+    case Adjust::Kind::Posterize: return param(QStringLiteral("Posterize"), setupPosterize, posterizeSettings);
+    case Adjust::Kind::Invert: return true;
+    }
+    return false;
+}
+
 void MainWindow::startTransform(bool selectionOnly, int mode)
 {
     CanvasView* v = currentView();
@@ -1698,10 +2044,16 @@ bool MainWindow::execPreview(PreviewDialog& dlg)
     return true;
 }
 
+bool MainWindow::prepareTarget(const QString& command)
+{
+    Document* doc = currentDoc();
+    return doc && m_tools->preparePixelEdit(doc, QStringLiteral("Could not complete the %1 command").arg(command));
+}
+
 void MainWindow::applySpec(const Filters::Spec& spec, const SpecRecipe& recipe)
 {
     Document* doc = currentDoc();
-    if (!doc) return;
+    if (!doc || !prepareTarget(spec.name)) return;
     QString err;
     Filters::Applied applied;
     QApplication::setOverrideCursor(Qt::WaitCursor);
@@ -1719,7 +2071,7 @@ void MainWindow::paramDialog(const QString& title, bool spreads, bool isFilter, 
                              const ParamBuilder& build)
 {
     Document* doc = currentDoc();
-    if (!doc) return;
+    if (!doc || !prepareTarget(title)) return;
     const bool useLast = isFilter || (QApplication::keyboardModifiers() & Qt::AltModifier);
     ParamDialog dlg(doc, title, spreads, build, this);
     setup(dlg);
@@ -1746,7 +2098,7 @@ void MainWindow::setLastFilter(const QString& name, const SpecRecipe& recipe)
 void MainWindow::autoAdjust(Adjust::AutoMode mode, const QString& name)
 {
     Document* doc = currentDoc();
-    if (!doc) return;
+    if (!doc || !prepareTarget(name)) return;
     Adjust::Levels levels;
     {
         // A throwaway session reads the pixels the command will change.
@@ -1968,6 +2320,21 @@ bool MainWindow::eventFilter(QObject* obj, QEvent* e)
         const bool keep = !w || (v && (w == v || v->isAncestorOf(w))) || m_optionsBar->isAncestorOf(w) || w == m_optionsBar
             || qobject_cast<QMenu*>(w) || qobject_cast<QMenuBar*>(w) || w->window() != this;
         if (!keep) m_tools->commitModal();
+    }
+    // Text entry (the Type tool) takes keys ahead of the single-letter shortcuts.
+    if ((e->type() == QEvent::KeyPress || e->type() == QEvent::ShortcutOverride) && !QApplication::activeModalWidget()
+        && !QApplication::activePopupWidget() && !isTypingTarget()) {
+        Tool* cur = m_tools->current();
+        CanvasView* v = currentView();
+        auto* ke = static_cast<QKeyEvent*>(e);
+        if (cur && v && cur->wantsKey(ke)) {
+            if (e->type() == QEvent::ShortcutOverride) {
+                e->accept();
+                return true;
+            }
+            cur->keyPress(v, ke);
+            return true;
+        }
     }
     if (e->type() != QEvent::KeyPress && e->type() != QEvent::KeyRelease) return QMainWindow::eventFilter(obj, e);
     if (QApplication::activeModalWidget() || QApplication::activePopupWidget() || !isActiveWindow() || isTypingTarget())

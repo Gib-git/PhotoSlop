@@ -1,5 +1,7 @@
 #include "core/Adjustments.h"
 
+#include <QJsonArray>
+#include <QJsonValue>
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -429,6 +431,197 @@ PixelMap blackWhiteMap(const BlackWhite& bw)
             else px[i] = qRgba(g, g, g, qAlpha(px[i]));
         }
     };
+}
+
+// ---------------- Adjustment layers ----------------
+
+QString kindName(Kind kind)
+{
+    switch (kind) {
+    case Kind::BrightnessContrast: return QStringLiteral("Brightness/Contrast");
+    case Kind::Levels: return QStringLiteral("Levels");
+    case Kind::Curves: return QStringLiteral("Curves");
+    case Kind::HueSaturation: return QStringLiteral("Hue/Saturation");
+    case Kind::ColorBalance: return QStringLiteral("Color Balance");
+    case Kind::BlackWhite: return QStringLiteral("Black & White");
+    case Kind::Invert: return QStringLiteral("Invert");
+    case Kind::Posterize: return QStringLiteral("Posterize");
+    case Kind::Threshold: return QStringLiteral("Threshold");
+    }
+    return QString();
+}
+
+QString LayerSettings::name() const { return kindName(kind); }
+
+PixelMap LayerSettings::buildMap() const
+{
+    switch (kind) {
+    case Kind::BrightnessContrast: return brightnessContrastMap(brightness, contrast, legacy);
+    case Kind::Levels: return levelsMap(levels);
+    case Kind::Curves: return curvesMap(curves);
+    case Kind::HueSaturation: return hueSaturationMap(hueSaturation);
+    case Kind::ColorBalance: return colorBalanceMap(colorBalance);
+    case Kind::BlackWhite: return blackWhiteMap(blackWhite);
+    case Kind::Invert: return invertMap();
+    case Kind::Posterize: return posterizeMap(posterizeLevels);
+    case Kind::Threshold: return thresholdMap(thresholdLevel);
+    }
+    return {};
+}
+
+std::shared_ptr<const LayerSettings> LayerSettings::make(Kind kind)
+{
+    LayerSettings s;
+    s.kind = kind;
+    return s.finalized();
+}
+
+std::shared_ptr<const LayerSettings> LayerSettings::finalized() const
+{
+    auto out = std::make_shared<LayerSettings>(*this);
+    out->map = out->buildMap();
+    return out;
+}
+
+namespace {
+
+QJsonArray curveToJson(const CurvePoints& pts)
+{
+    QJsonArray a;
+    for (const QPointF& p : pts) a.append(QJsonArray{p.x(), p.y()});
+    return a;
+}
+
+CurvePoints curveFromJson(const QJsonValue& v)
+{
+    CurvePoints pts;
+    for (const QJsonValue& p : v.toArray()) {
+        const QJsonArray xy = p.toArray();
+        if (xy.size() == 2) pts.append(QPointF(xy[0].toDouble(), xy[1].toDouble()));
+    }
+    return pts.size() >= 2 ? pts : identityCurve();
+}
+
+QJsonArray intsToJson(const int* v, int n)
+{
+    QJsonArray a;
+    for (int i = 0; i < n; ++i) a.append(v[i]);
+    return a;
+}
+
+void intsFromJson(const QJsonValue& v, int* out, int n)
+{
+    const QJsonArray a = v.toArray();
+    for (int i = 0; i < n && i < a.size(); ++i) out[i] = a[i].toInt(out[i]);
+}
+
+const char* kKindIds[] = {"brightnessContrast", "levels", "curves", "hueSaturation", "colorBalance",
+                          "blackWhite", "invert", "posterize", "threshold"};
+
+} // namespace
+
+QJsonObject LayerSettings::toJson() const
+{
+    QJsonObject o;
+    o.insert(QStringLiteral("kind"), QString::fromLatin1(kKindIds[int(kind)]));
+    switch (kind) {
+    case Kind::BrightnessContrast:
+        o.insert(QStringLiteral("brightness"), brightness);
+        o.insert(QStringLiteral("contrast"), contrast);
+        o.insert(QStringLiteral("legacy"), legacy);
+        break;
+    case Kind::Levels: {
+        QJsonArray chans;
+        for (const LevelsChannel& c : levels.channels)
+            chans.append(QJsonArray{c.inBlack, c.gamma, c.inWhite, c.outBlack, c.outWhite});
+        o.insert(QStringLiteral("levels"), chans);
+        break;
+    }
+    case Kind::Curves: {
+        QJsonArray chans;
+        for (const CurvePoints& c : curves.channels) chans.append(curveToJson(c));
+        o.insert(QStringLiteral("curves"), chans);
+        break;
+    }
+    case Kind::HueSaturation: {
+        QJsonArray ranges;
+        for (const HueSaturation::Range& r : hueSaturation.ranges) ranges.append(QJsonArray{r.hue, r.saturation, r.lightness});
+        o.insert(QStringLiteral("ranges"), ranges);
+        o.insert(QStringLiteral("colorize"), hueSaturation.colorize);
+        break;
+    }
+    case Kind::ColorBalance: {
+        QJsonArray tones;
+        for (const auto& t : colorBalance.values) tones.append(intsToJson(t.data(), 3));
+        o.insert(QStringLiteral("tones"), tones);
+        o.insert(QStringLiteral("preserveLuminosity"), colorBalance.preserveLuminosity);
+        break;
+    }
+    case Kind::BlackWhite:
+        o.insert(QStringLiteral("weights"), intsToJson(blackWhite.weights.data(), 6));
+        o.insert(QStringLiteral("tint"), blackWhite.tint);
+        o.insert(QStringLiteral("tintHue"), blackWhite.tintHue);
+        o.insert(QStringLiteral("tintSaturation"), blackWhite.tintSaturation);
+        break;
+    case Kind::Invert: break;
+    case Kind::Posterize: o.insert(QStringLiteral("levels"), posterizeLevels); break;
+    case Kind::Threshold: o.insert(QStringLiteral("level"), thresholdLevel); break;
+    }
+    return o;
+}
+
+std::shared_ptr<const LayerSettings> LayerSettings::fromJson(const QJsonObject& o)
+{
+    LayerSettings s;
+    const QString id = o.value(QStringLiteral("kind")).toString();
+    for (int i = 0; i < int(std::size(kKindIds)); ++i)
+        if (id == QLatin1String(kKindIds[i])) s.kind = Kind(i);
+    switch (s.kind) {
+    case Kind::BrightnessContrast:
+        s.brightness = o.value(QStringLiteral("brightness")).toInt();
+        s.contrast = o.value(QStringLiteral("contrast")).toInt();
+        s.legacy = o.value(QStringLiteral("legacy")).toBool();
+        break;
+    case Kind::Levels: {
+        const QJsonArray chans = o.value(QStringLiteral("levels")).toArray();
+        for (int i = 0; i < 4 && i < chans.size(); ++i) {
+            const QJsonArray c = chans[i].toArray();
+            if (c.size() != 5) continue;
+            s.levels.channels[i] = {c[0].toInt(), c[1].toDouble(1.0), c[2].toInt(255), c[3].toInt(), c[4].toInt(255)};
+        }
+        break;
+    }
+    case Kind::Curves: {
+        const QJsonArray chans = o.value(QStringLiteral("curves")).toArray();
+        for (int i = 0; i < 4 && i < chans.size(); ++i) s.curves.channels[i] = curveFromJson(chans[i]);
+        break;
+    }
+    case Kind::HueSaturation: {
+        const QJsonArray ranges = o.value(QStringLiteral("ranges")).toArray();
+        for (int i = 0; i < 7 && i < ranges.size(); ++i) {
+            const QJsonArray r = ranges[i].toArray();
+            if (r.size() == 3) s.hueSaturation.ranges[i] = {r[0].toInt(), r[1].toInt(), r[2].toInt()};
+        }
+        s.hueSaturation.colorize = o.value(QStringLiteral("colorize")).toBool();
+        break;
+    }
+    case Kind::ColorBalance: {
+        const QJsonArray tones = o.value(QStringLiteral("tones")).toArray();
+        for (int i = 0; i < 3 && i < tones.size(); ++i) intsFromJson(tones[i], s.colorBalance.values[i].data(), 3);
+        s.colorBalance.preserveLuminosity = o.value(QStringLiteral("preserveLuminosity")).toBool(true);
+        break;
+    }
+    case Kind::BlackWhite:
+        intsFromJson(o.value(QStringLiteral("weights")), s.blackWhite.weights.data(), 6);
+        s.blackWhite.tint = o.value(QStringLiteral("tint")).toBool();
+        s.blackWhite.tintHue = o.value(QStringLiteral("tintHue")).toInt(s.blackWhite.tintHue);
+        s.blackWhite.tintSaturation = o.value(QStringLiteral("tintSaturation")).toInt(s.blackWhite.tintSaturation);
+        break;
+    case Kind::Invert: break;
+    case Kind::Posterize: s.posterizeLevels = std::clamp(o.value(QStringLiteral("levels")).toInt(4), 2, 255); break;
+    case Kind::Threshold: s.thresholdLevel = std::clamp(o.value(QStringLiteral("level")).toInt(128), 1, 255); break;
+    }
+    return s.finalized();
 }
 
 } // namespace Adjust

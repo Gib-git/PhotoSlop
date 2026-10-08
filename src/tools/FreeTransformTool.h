@@ -82,6 +82,7 @@ private:
     QPointer<Document> m_doc;
     QPointer<CanvasView> m_view;
     bool m_selectionOnly = false;
+    bool m_vectorTarget = false; // a text or shape layer, re-rendered on commit
     Mode m_mode = Mode::Free;
     quint64 m_layerId = 0;
     DocState m_before;

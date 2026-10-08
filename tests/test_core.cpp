@@ -1,14 +1,20 @@
 #include "core/Adjustments.h"
+#include "core/Compositor.h"
+#include "core/LayerStyle.h"
+#include "core/LayerTree.h"
+#include "core/VectorLayers.h"
 #include "core/BlendMode.h"
 #include "core/Commands.h"
 #include "core/Document.h"
 #include "core/DocumentOps.h"
 #include "core/Filters.h"
+#include "core/Healing.h"
 #include "core/ImageOps.h"
 #include "core/Selection.h"
 #include "core/Transform.h"
 #include "io/DocumentIO.h"
 
+#include <QPainter>
 #include <QTemporaryDir>
 #include <QUndoStack>
 #include <QtTest>
@@ -741,9 +747,427 @@ private slots:
         const int v = qRed(doc->layers()[0].pixelAt(QPoint(4, 4)));
         QVERIFY(v > 120 && v < 135);
     }
+
+    // ---------------- Stage 4: layer power features ----------------
+
+    // A transparent layer filled with `color` inside `r`, added above the active layer.
+    static void colorLayer(Document* doc, const QColor& color, QRect r, const QString& name = QString())
+    {
+        Ops::newLayer(doc, name);
+        QPainterPath path;
+        path.addRect(r);
+        doc->changeSelection(Sel::pathMask(doc->size(), path, false), "Marquee");
+        QVERIFY(Ops::fill(doc, color, BlendMode::Normal, 1.f, false));
+        Ops::deselect(doc);
+    }
+
+    static QColor at(Document* doc, int x, int y) { return QColor::fromRgba(qUnpremultiply(doc->composite().pixel(x, y))); }
+
+    void groupsNestAndUngroup()
+    {
+        std::unique_ptr<Document> doc(makeDoc());
+        colorLayer(doc.get(), Qt::red, QRect(0, 0, 10, 10), "A");
+        QVERIFY(Ops::groupLayer(doc.get()));
+        QCOMPARE(doc->layerCount(), 3);
+        const Layer& g = doc->layerAt(2);
+        QVERIFY(g.isGroup());
+        QCOMPARE(g.mode, BlendMode::PassThrough);
+        QCOMPARE(doc->layerAt(1).parent, g.id);
+        QCOMPARE(Tree::children(doc->layers(), 2), QList<int>{1});
+        // A new layer with the group selected goes inside it, at the top.
+        Ops::newLayer(doc.get(), "B");
+        QCOMPARE(doc->activeIndex(), 2);
+        QCOMPARE(doc->layerAt(2).parent, doc->layerAt(3).id);
+        QCOMPARE(Tree::depth(doc->layers(), 2), 1);
+        // Hiding the group hides its contents.
+        QCOMPARE(at(doc.get(), 5, 5), QColor(Qt::red));
+        Ops::setVisible(doc.get(), 3, false);
+        QCOMPARE(at(doc.get(), 5, 5), QColor(Qt::white));
+        Ops::setVisible(doc.get(), 3, true);
+        // Ungroup keeps the order and drops the group.
+        doc->setActiveIndex(3);
+        QVERIFY(Ops::ungroup(doc.get()));
+        QCOMPARE(doc->layerCount(), 3);
+        QCOMPARE(doc->layerAt(1).parent, quint64(0));
+        QCOMPARE(doc->layerAt(2).parent, quint64(0));
+        QCOMPARE(doc->layerAt(2).name, QStringLiteral("B"));
+        doc->undoStack()->undo();
+        QVERIFY(doc->layerAt(3).isGroup());
+    }
+
+    void groupBlendIsolatesChildren()
+    {
+        // A Multiply layer inside a Normal group multiplies with the group's transparency, so
+        // the group shows its colour unchanged; in a Pass Through group it multiplies with the
+        // background.
+        std::unique_ptr<Document> doc(makeDoc());
+        doc->modify("Gray", [&] { doc->layerRef(0).image.fill(QColor(200, 200, 200)); });
+        colorLayer(doc.get(), QColor(128, 128, 128), QRect(0, 0, 10, 10));
+        Ops::setBlendMode(doc.get(), 1, BlendMode::Multiply);
+        QVERIFY(Ops::groupLayer(doc.get()));
+        const QColor pass = at(doc.get(), 5, 5);
+        QVERIFY(std::abs(pass.red() - 100) <= 2);
+        Ops::setBlendMode(doc.get(), 2, BlendMode::Normal);
+        QVERIFY(std::abs(at(doc.get(), 5, 5).red() - 128) <= 1);
+        // Group opacity applies once to the whole group.
+        Ops::setOpacity(doc.get(), 2, 0.5f);
+        QVERIFY(std::abs(at(doc.get(), 5, 5).red() - 164) <= 2);
+    }
+
+    void moveIntoAndOutOfGroups()
+    {
+        std::unique_ptr<Document> doc(makeDoc());
+        colorLayer(doc.get(), Qt::red, QRect(0, 0, 4, 4), "A");   // 1
+        colorLayer(doc.get(), Qt::green, QRect(0, 0, 4, 4), "B"); // 2
+        Ops::newGroup(doc.get());                                 // 3, empty
+        QVERIFY(Ops::moveLayerInto(doc.get(), 1, 3));
+        // A moved below the group's layer, inside it: B, A, Group order bottom-up becomes B, A(in), Group.
+        QCOMPARE(doc->layerAt(1).name, QStringLiteral("B"));
+        QCOMPARE(doc->layerAt(2).name, QStringLiteral("A"));
+        QCOMPARE(doc->layerAt(2).parent, doc->layerAt(3).id);
+        // Send Backward on the only child steps out below the group.
+        doc->setActiveIndex(2);
+        QVERIFY(Ops::arrange(doc.get(), Ops::Arrange::SendBackward));
+        QCOMPARE(doc->layerAt(doc->activeIndex()).parent, quint64(0));
+        // The Background never moves and nothing goes below it.
+        QVERIFY(!Ops::moveLayer(doc.get(), 0, 2));
+        doc->setActiveIndex(1);
+        QVERIFY(!Ops::arrange(doc.get(), Ops::Arrange::SendBackward) || doc->layerAt(0).isBackground);
+        QVERIFY(doc->layerAt(0).isBackground);
+        // A group cannot go inside itself.
+        Ops::newGroup(doc.get());
+        const int outer = doc->activeIndex();
+        QVERIFY(!Ops::moveLayerInto(doc.get(), outer, outer));
+    }
+
+    void duplicateAndDeleteGroup()
+    {
+        std::unique_ptr<Document> doc(makeDoc());
+        colorLayer(doc.get(), Qt::red, QRect(0, 0, 4, 4), "A");
+        QVERIFY(Ops::groupLayer(doc.get()));
+        QVERIFY(Ops::duplicateLayer(doc.get()));
+        QCOMPARE(doc->layerCount(), 5);
+        const Layer& copy = doc->layerAt(4);
+        QVERIFY(copy.isGroup());
+        QVERIFY(copy.id != doc->layerAt(2).id);
+        QCOMPARE(doc->layerAt(3).parent, copy.id);
+        QCOMPARE(doc->layerAt(1).parent, doc->layerAt(2).id);
+        QVERIFY(Ops::deleteLayer(doc.get()));
+        QCOMPARE(doc->layerCount(), 3);
+    }
+
+    void layerMaskHidesAndIsPaintable()
+    {
+        std::unique_ptr<Document> doc(makeDoc());
+        colorLayer(doc.get(), Qt::red, QRect(0, 0, 20, 20));
+        QPainterPath left;
+        left.addRect(0, 0, 10, 48);
+        doc->changeSelection(Sel::pathMask(doc->size(), left, false), "Marquee");
+        QVERIFY(Ops::addMask(doc.get(), Ops::MaskFill::RevealSelection));
+        QVERIFY(!doc->hasSelection());
+        QVERIFY(doc->editingMask());
+        QCOMPARE(at(doc.get(), 5, 5), QColor(Qt::red));
+        QCOMPARE(at(doc.get(), 15, 5), QColor(Qt::white));
+        // Filling the mask white reveals; the fill goes to the mask, not the pixels.
+        QVERIFY(Ops::fill(doc.get(), Qt::white, BlendMode::Normal, 1.f, false));
+        QCOMPARE(at(doc.get(), 15, 5), QColor(Qt::red));
+        doc->undoStack()->undo();
+        QCOMPARE(at(doc.get(), 15, 5), QColor(Qt::white));
+        // Disabling shows everything; deleting with apply bakes the mask in.
+        Ops::setMaskEnabled(doc.get(), 1, false);
+        QCOMPARE(at(doc.get(), 15, 5), QColor(Qt::red));
+        Ops::setMaskEnabled(doc.get(), 1, true);
+        QVERIFY(Ops::deleteMask(doc.get(), true));
+        QVERIFY(!doc->layerAt(1).hasMask());
+        QCOMPARE(qAlpha(doc->layerAt(1).pixelAt(QPoint(15, 5))), 0);
+        QCOMPARE(qAlpha(doc->layerAt(1).pixelAt(QPoint(5, 5))), 255);
+        // Hide All starts fully hidden.
+        QVERIFY(Ops::addMask(doc.get(), Ops::MaskFill::HideAll));
+        QCOMPARE(at(doc.get(), 5, 5), QColor(Qt::white));
+    }
+
+    void linkedMaskMovesWithLayer()
+    {
+        std::unique_ptr<Document> doc(makeDoc());
+        colorLayer(doc.get(), Qt::red, QRect(0, 0, 10, 10));
+        QPainterPath box;
+        box.addRect(0, 0, 5, 10);
+        doc->changeSelection(Sel::pathMask(doc->size(), box, false), "Marquee");
+        QVERIFY(Ops::addMask(doc.get(), Ops::MaskFill::RevealSelection));
+        Layer& l = doc->layerRef(1);
+        l.translate(QPoint(20, 0));
+        QCOMPARE(l.maskAt(QPoint(22, 5)), 255);
+        QCOMPARE(l.maskAt(QPoint(27, 5)), 0);
+        l.maskLinked = false;
+        l.translate(QPoint(-20, 0));
+        QCOMPARE(l.maskAt(QPoint(2, 5)), 0);
+    }
+
+    void clippingMaskLimitsToBase()
+    {
+        std::unique_ptr<Document> doc(makeDoc());
+        colorLayer(doc.get(), Qt::blue, QRect(10, 10, 10, 10));
+        colorLayer(doc.get(), Qt::red, QRect(0, 0, 40, 40));
+        QVERIFY(Ops::toggleClippingMask(doc.get()));
+        QVERIFY(Tree::isClipped(doc->layers(), 2));
+        QCOMPARE(at(doc.get(), 15, 15), QColor(Qt::red));
+        QCOMPARE(at(doc.get(), 5, 5), QColor(Qt::white));
+        // Hiding the base hides the clipped layer too.
+        Ops::setVisible(doc.get(), 1, false);
+        QCOMPARE(at(doc.get(), 5, 5), QColor(Qt::white));
+        QCOMPARE(at(doc.get(), 15, 15), QColor(Qt::white));
+        Ops::setVisible(doc.get(), 1, true);
+        QVERIFY(Ops::toggleClippingMask(doc.get()));
+        QCOMPARE(at(doc.get(), 5, 5), QColor(Qt::red));
+        // The Background cannot be clipped.
+        doc->setActiveIndex(0);
+        QVERIFY(!Ops::toggleClippingMask(doc.get()));
+    }
+
+    void adjustmentLayerIsNonDestructive()
+    {
+        std::unique_ptr<Document> doc(makeDoc());
+        colorLayer(doc.get(), QColor(255, 0, 0), QRect(0, 0, 20, 20));
+        QPainterPath left;
+        left.addRect(0, 0, 10, 48);
+        doc->changeSelection(Sel::pathMask(doc->size(), left, false), "Marquee");
+        Ops::newAdjustmentLayer(doc.get(), Adjust::LayerSettings::make(Adjust::Kind::Invert));
+        QCOMPARE(doc->layerAt(2).name, QStringLiteral("Invert 1"));
+        QCOMPARE(doc->layerAt(2).kind, LayerKind::Adjustment);
+        QVERIFY(doc->editingMask()); // adjustment layers always target their mask
+        // Inverted inside the old selection only.
+        QCOMPARE(at(doc.get(), 5, 5), QColor(0, 255, 255));
+        QCOMPARE(at(doc.get(), 15, 5), QColor(255, 0, 0));
+        QCOMPARE(at(doc.get(), 5, 30), QColor(0, 0, 0));
+        // The pixels below are untouched.
+        QCOMPARE(QColor(doc->layerAt(1).pixelAt(QPoint(5, 5))), QColor(255, 0, 0));
+        // Changing the settings re-renders; hiding the layer restores.
+        Adjust::LayerSettings t = *doc->layerAt(2).adjustment;
+        t.kind = Adjust::Kind::Threshold;
+        t.thresholdLevel = 128;
+        Ops::setAdjustment(doc.get(), 2, t.finalized());
+        QCOMPARE(at(doc.get(), 5, 5), QColor(Qt::black));
+        Ops::setVisible(doc.get(), 2, false);
+        QCOMPARE(at(doc.get(), 5, 5), QColor(255, 0, 0));
+        // Half opacity mixes halfway.
+        Ops::setVisible(doc.get(), 2, true);
+        Ops::setAdjustment(doc.get(), 2, Adjust::LayerSettings::make(Adjust::Kind::Invert));
+        Ops::setOpacity(doc.get(), 2, 0.5f);
+        QVERIFY(std::abs(at(doc.get(), 5, 30).red() - 128) <= 1);
+    }
+
+    void adjustmentInsideGroupOnlyAffectsGroup()
+    {
+        std::unique_ptr<Document> doc(makeDoc());
+        colorLayer(doc.get(), QColor(255, 0, 0), QRect(0, 0, 10, 10));
+        QVERIFY(Ops::groupLayer(doc.get()));
+        Ops::setBlendMode(doc.get(), 2, BlendMode::Normal);
+        Ops::newAdjustmentLayer(doc.get(), Adjust::LayerSettings::make(Adjust::Kind::Invert));
+        QCOMPARE(doc->layerAt(doc->activeIndex()).parent, doc->layerAt(3).id);
+        QCOMPARE(at(doc.get(), 5, 5), QColor(0, 255, 255));
+        QCOMPARE(at(doc.get(), 30, 30), QColor(Qt::white)); // the background is outside the group
+        // As Pass Through, the adjustment reaches everything below.
+        Ops::setBlendMode(doc.get(), 3, BlendMode::PassThrough);
+        QCOMPARE(at(doc.get(), 30, 30), QColor(Qt::black));
+    }
+
+    void layerStyleEffects()
+    {
+        std::unique_ptr<Document> doc(makeDoc());
+        colorLayer(doc.get(), Qt::red, QRect(20, 15, 10, 10));
+        LayerStyle st;
+        st.stroke.enabled = true;
+        st.stroke.size = 3;
+        st.stroke.color = Qt::blue;
+        Ops::setStyle(doc.get(), 1, std::make_shared<const LayerStyle>(st), "Layer Style");
+        QVERIFY(doc->layerAt(1).hasStyle());
+        QCOMPARE(at(doc.get(), 18, 20), QColor(Qt::blue)); // outside stroke
+        QCOMPARE(at(doc.get(), 25, 20), QColor(Qt::red));  // content untouched
+        QCOMPARE(at(doc.get(), 10, 20), QColor(Qt::white));
+        // Inside stroke draws over the content's edge instead.
+        st.stroke.position = StrokeEffect::Position::Inside;
+        Ops::setStyle(doc.get(), 1, std::make_shared<const LayerStyle>(st), "Layer Style");
+        QCOMPARE(at(doc.get(), 18, 20), QColor(Qt::white));
+        QCOMPARE(at(doc.get(), 21, 20), QColor(Qt::blue));
+        // Colour overlay survives Fill 0; drop shadow lands down-right.
+        st = LayerStyle();
+        st.colorOverlay.enabled = true;
+        st.colorOverlay.color = Qt::green;
+        st.dropShadow.enabled = true;
+        st.dropShadow.opacity = 100;
+        st.dropShadow.size = 0;
+        st.dropShadow.distance = 6;
+        st.dropShadow.angle = 90; // light from above: shadow straight down
+        Ops::setStyle(doc.get(), 1, std::make_shared<const LayerStyle>(st), "Layer Style");
+        Ops::setFill(doc.get(), 1, 0.f);
+        QCOMPARE(at(doc.get(), 25, 20), QColor(Qt::green));
+        QCOMPARE(at(doc.get(), 25, 28), QColor(Qt::black));
+        QCOMPARE(at(doc.get(), 25, 33), QColor(Qt::white));
+        // Rasterizing bakes the effects into the pixels.
+        Ops::setFill(doc.get(), 1, 1.f);
+        const QRgb before = doc->composite().pixel(25, 28);
+        QVERIFY(Ops::rasterizeStyle(doc.get(), 1));
+        QVERIFY(!doc->layerAt(1).style);
+        QCOMPARE(doc->composite().pixel(25, 28), before);
+    }
+
+    void textAndShapeLayers()
+    {
+        std::unique_ptr<Document> doc(makeDoc(QSize(200, 100)));
+        TextData t;
+        t.text = QStringLiteral("Hi");
+        t.size = 40;
+        t.color = Qt::black;
+        t.position = QPointF(20, 60);
+        const int ti = Ops::newTextLayer(doc.get(), t);
+        QCOMPARE(doc->layerAt(ti).kind, LayerKind::Text);
+        QCOMPARE(doc->layerAt(ti).name, QStringLiteral("Hi"));
+        QVERIFY(!doc->layerAt(ti).image.isNull());
+        const QRect r1 = doc->layerAt(ti).rect();
+        QVERIFY(r1.contains(QPoint(30, 50)));
+        // Editing re-renders; moving keeps the text editable.
+        t.text = QStringLiteral("Hi there");
+        Ops::setText(doc.get(), ti, t, "Edit Type Layer");
+        QVERIFY(doc->layerAt(ti).rect().width() > r1.width());
+        doc->layerRef(ti).translate(QPoint(10, 0));
+        QCOMPARE(doc->layerAt(ti).text->position, QPointF(30, 60));
+        QVERIFY(Ops::editTargetError(doc.get(), "Could not use the brush tool").contains("rasterized"));
+        QVERIFY(Ops::rasterizeLayer(doc.get(), ti));
+        QCOMPARE(doc->layerAt(ti).kind, LayerKind::Pixel);
+        QVERIFY(Ops::editTargetError(doc.get(), "x").isEmpty());
+
+        ShapeData s;
+        s.path = Vector::rectanglePath(QRectF(100, 10, 50, 30), 0);
+        s.fillColor = Qt::red;
+        const int si = Ops::newShapeLayer(doc.get(), s, "Rectangle");
+        QCOMPARE(doc->layerAt(si).name, QStringLiteral("Rectangle 1"));
+        QCOMPARE(at(doc.get(), 120, 20), QColor(Qt::red));
+        s.fillColor = Qt::blue;
+        Ops::setShape(doc.get(), si, s, "Edit Shape");
+        QCOMPARE(at(doc.get(), 120, 20), QColor(Qt::blue));
+        // Canvas rotation keeps shapes as vectors.
+        Ops::rotate(doc.get(), Ops::Rotation::Rotate180);
+        QCOMPARE(doc->layerAt(si).kind, LayerKind::Shape);
+        QCOMPARE(at(doc.get(), 200 - 120, 100 - 20), QColor(Qt::blue));
+    }
+
+    void mergeGroupAndAdjustmentDown()
+    {
+        std::unique_ptr<Document> doc(makeDoc());
+        colorLayer(doc.get(), QColor(255, 0, 0), QRect(0, 0, 10, 10));
+        Ops::newAdjustmentLayer(doc.get(), Adjust::LayerSettings::make(Adjust::Kind::Invert));
+        const QRgb shown = doc->composite().pixel(5, 5);
+        // Merging an adjustment layer down applies it to the pixels below.
+        QVERIFY(Ops::mergeDown(doc.get()));
+        QCOMPARE(doc->layerCount(), 2);
+        QCOMPARE(doc->layerAt(1).kind, LayerKind::Pixel);
+        QCOMPARE(doc->composite().pixel(5, 5), shown);
+        // Merging a group (Ctrl+E) gives one pixel layer that looks the same.
+        colorLayer(doc.get(), QColor(0, 0, 255), QRect(5, 5, 10, 10));
+        doc->setActiveIndex(2);
+        QVERIFY(Ops::groupLayer(doc.get()));
+        const QImage before = doc->composite().copy();
+        QVERIFY(Ops::mergeDown(doc.get()));
+        QCOMPARE(doc->layerAt(doc->activeIndex()).kind, LayerKind::Pixel);
+        QCOMPARE(doc->composite(), before);
+        // Merge Visible and Flatten use the same compositing.
+        QVERIFY(Ops::mergeVisible(doc.get()));
+        QCOMPARE(doc->composite(), before);
+    }
+
+    void stage4RoundTrip()
+    {
+        QTemporaryDir dir;
+        std::unique_ptr<Document> doc(makeDoc(QSize(120, 80)));
+        colorLayer(doc.get(), Qt::red, QRect(0, 0, 30, 30), "Base");
+        QVERIFY(Ops::groupLayer(doc.get()));
+        Ops::setBlendMode(doc.get(), 2, BlendMode::Normal);
+        QVERIFY(Ops::addMask(doc.get(), Ops::MaskFill::HideAll));
+        QVERIFY(Ops::fill(doc.get(), Qt::white, BlendMode::Normal, 1.f, false)); // reveal through the mask
+        Adjust::LayerSettings lv;
+        lv.kind = Adjust::Kind::Levels;
+        lv.levels.channels[0].inWhite = 200;
+        Ops::newAdjustmentLayer(doc.get(), lv.finalized());
+        colorLayer(doc.get(), Qt::blue, QRect(0, 0, 60, 60), "Clip");
+        QVERIFY(Ops::toggleClippingMask(doc.get()));
+        LayerStyle st;
+        st.dropShadow.enabled = true;
+        Ops::setStyle(doc.get(), doc->activeIndex(), std::make_shared<const LayerStyle>(st), "Layer Style");
+        TextData t;
+        t.text = "A";
+        t.position = QPointF(70, 50);
+        const int ti = Ops::newTextLayer(doc.get(), t);
+        ShapeData s;
+        s.path = Vector::ellipsePath(QRectF(80, 10, 20, 20));
+        Ops::newShapeLayer(doc.get(), s, "Ellipse");
+
+        const QString path = dir.filePath("s4.pslop");
+        QString err;
+        QVERIFY2(DocumentIO::saveNative(doc.get(), path, &err), qPrintable(err));
+        std::unique_ptr<Document> loaded(DocumentIO::load(path, &err));
+        QVERIFY2(loaded, qPrintable(err));
+        QCOMPARE(loaded->layerCount(), doc->layerCount());
+        for (int i = 0; i < doc->layerCount(); ++i) {
+            const Layer& a = doc->layerAt(i);
+            const Layer& b = loaded->layerAt(i);
+            QCOMPARE(b.kind, a.kind);
+            QCOMPARE(b.clipped, a.clipped);
+            QCOMPARE(b.hasMask(), a.hasMask());
+            QCOMPARE(bool(b.style), bool(a.style));
+            QCOMPARE(Tree::parentIndex(loaded->layers(), i), Tree::parentIndex(doc->layers(), i));
+        }
+        QVERIFY(loaded->layerAt(ti).text);
+        QCOMPARE(loaded->layerAt(ti).text->text, QStringLiteral("A"));
+        QCOMPARE(loaded->composite(), doc->composite());
+    }
+
+    void healingBlendsAndFindsTexture()
+    {
+        // A flat source healed into a target whose edges are a different flat colour takes the
+        // target's colour, keeping the source's (absent) texture.
+        QImage target(20, 20, QImage::Format_ARGB32_Premultiplied), source(20, 20, QImage::Format_ARGB32_Premultiplied);
+        target.fill(QColor(200, 100, 50));
+        source.fill(QColor(20, 20, 20));
+        std::vector<uint8_t> region(400, 0);
+        for (int y = 5; y < 15; ++y)
+            for (int x = 5; x < 15; ++x) region[size_t(y * 20 + x)] = 1;
+        const QImage healed = Heal::blend(target, source, region);
+        const QColor c = QColor(healed.pixel(10, 10));
+        QVERIFY(std::abs(c.red() - 200) <= 2 && std::abs(c.green() - 100) <= 2 && std::abs(c.blue() - 50) <= 2);
+        // Texture survives: a bright source dot stays brighter than its surroundings.
+        source.setPixel(10, 10, qRgb(120, 120, 120));
+        const QImage dotted = Heal::blend(target, source, region);
+        QVERIFY(qRed(dotted.pixel(10, 10)) > qRed(dotted.pixel(8, 8)) + 50);
+
+        // Proximity match: around a dark spot on a two-tone image, the best source is on the
+        // same side of the split.
+        QImage img(200, 100, QImage::Format_ARGB32_Premultiplied);
+        img.fill(Qt::white);
+        QPainter(&img).fillRect(0, 50, 200, 50, Qt::blue);
+        std::vector<uint8_t> spot(36, 1);
+        const QPoint off = Heal::findSource(img, img.rect(), spot, QRect(97, 20, 6, 6));
+        QVERIFY(20 + off.y() >= 0 && 26 + off.y() < 50); // stays in the white half
+    }
+
+    void parallelCompositeMatchesSingleThreaded()
+    {
+        std::unique_ptr<Document> doc(makeDoc(QSize(300, 300)));
+        colorLayer(doc.get(), QColor(10, 200, 30), QRect(20, 20, 200, 200));
+        LayerStyle st;
+        st.outerGlow.enabled = true;
+        st.outerGlow.size = 20;
+        st.stroke.enabled = true;
+        Ops::setStyle(doc.get(), 1, std::make_shared<const LayerStyle>(st), "Layer Style");
+        Ops::setBlendMode(doc.get(), 1, BlendMode::Dissolve);
+        Ops::setOpacity(doc.get(), 1, 0.7f);
+        const QImage parallel = doc->composite().copy();
+        const QImage single = Compositor::flatten(doc->layers(), doc->bounds());
+        QCOMPARE(parallel, single);
+    }
 };
 
-QTEST_GUILESS_MAIN(TestCore)
+// A GUI application: text layers need fonts.
+QTEST_MAIN(TestCore)
 #include "test_core.moc"
 #include <algorithm>
 #include <iterator>

@@ -24,17 +24,7 @@ constexpr double kPi = 3.14159265358979323846;
 
 bool checkLayer(const Tool* tool, Document* doc, const QString& toolName)
 {
-    Layer* l = doc->editLayer();
-    if (!l) return false;
-    if (!l->visible) {
-        tool->alert(QStringLiteral("Could not use the %1 because the target layer is hidden.").arg(toolName));
-        return false;
-    }
-    if (l->pixelsLocked()) {
-        tool->alert(QStringLiteral("Could not use the %1 because the layer is locked.").arg(toolName));
-        return false;
-    }
-    return true;
+    return tool->manager()->preparePixelEdit(doc, QStringLiteral("Could not use the %1").arg(toolName));
 }
 
 QIcon gradientIcon(const QGradientStops& stops)

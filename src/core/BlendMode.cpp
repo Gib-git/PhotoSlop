@@ -43,6 +43,7 @@ const ModeInfo kModes[] = {
     {BlendMode::Saturation, "saturation", "Saturation"},
     {BlendMode::Color, "color", "Color"},
     {BlendMode::Luminosity, "luminosity", "Luminosity"},
+    {BlendMode::PassThrough, "passThrough", "Pass Through"},
 };
 
 inline float clamp01(float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); }
@@ -298,6 +299,7 @@ void compositeRow(uint32_t* dst, const uint32_t* src, int count, BlendMode mode,
     if (op255 == 0 || count <= 0) return;
 
     switch (mode) {
+    case BlendMode::PassThrough: // only meaningful for groups; the compositor handles it
     case BlendMode::Normal:
         normalRow(dst, src, count, op255, mask);
         return;

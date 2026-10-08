@@ -20,18 +20,26 @@ It is written in C++20 with Qt 6 (Widgets). PhotoSlop is not affiliated with Ado
 | **Home screen** with New file, Open and recent files | **Free Transform**: rotate and scale a layer, with rulers, guides and exact values in the options bar |
 | ![Warp](docs/screenshots/warp.png) | ![Quick Mask](docs/screenshots/quick-mask.png) |
 | **Warp** bends a layer with a 4 × 4 control grid | **Quick Mask** shows the selection as a red overlay you can paint on |
-| ![Curves](docs/screenshots/curves.png) | |
-| **Curves** with a histogram, previewing live on the canvas | |
+| ![Curves](docs/screenshots/curves.png) | ![Layers](docs/screenshots/layers.png) |
+| **Curves** with a histogram, previewing live on the canvas | **Layer power features**: a group with a mask, a gradient clipped to a type layer with a stroke and drop shadow, a glowing ellipse shape and a masked Curves adjustment layer |
 
-## Status: Stage 3 (adjustments and filters)
+## Status: Stage 4 (layer power features)
 
 | Area | What works |
 |---|---|
 | Workspace | Photoshop "Essentials" layout: toolbar on the left, options bar on top, tabbed panel groups on the right, a collapsed icon strip (History, Navigator, Info), document tabs, a per-document status bar, a Home screen, Tab / Shift+Tab to hide panels, F to cycle screen modes |
 | Documents | New (preset browser), Open, Open Recent, Save, Save As, Save a Copy, Revert, Export As, Quick Export as PNG, Close / Close All / Close Others, multiple documents, drag-and-drop to open |
-| File formats | Native layered `.pslop`; PNG, JPEG, BMP, GIF, TIFF and WebP for import and flattened export |
-| Layers | New, duplicate, delete, rename, drag to reorder, visibility (Alt-click to solo), opacity, fill, 27 blend modes, four lock types, Background layer rules, Layer via Copy/Cut, Merge Down, Merge Visible, Flatten, Ctrl/Cmd-click a thumbnail to load its transparency as a selection |
-| Tools | Move, Rectangular and Elliptical Marquee, Lasso, Polygonal Lasso and Magnetic Lasso, Quick Selection, Magic Wand, Crop, Eyedropper, Brush, Pencil, Eraser, Gradient (5 types), Paint Bucket, Hand, Zoom |
+| File formats | Native layered `.pslop` (groups, masks, adjustment, type and shape layers and styles included); PNG, JPEG, BMP, GIF, TIFF and WebP for import and flattened export |
+| Layers | New, duplicate, delete, rename (double-click the name), drag to reorder, visibility (Alt-click to solo), opacity, fill, 27 blend modes, four lock types, Background layer rules, Layer via Copy/Cut, Merge Down, Merge Visible, Flatten, Ctrl/Cmd-click a thumbnail to load its transparency as a selection |
+| Groups | New Group, Group Layers (Ctrl+G), Ungroup (Ctrl+Shift+G), nesting, disclosure triangles, Pass Through or any blend mode, group opacity and masks, drag layers into and out of groups, Bring Forward / Send Backward step in and out of groups, Merge Group (Ctrl+E on a group), duplicate and delete whole groups |
+| Masks | Layer ▸ Layer Mask: Reveal All, Hide All, Reveal Selection, Hide Selection, Delete, Apply, Disable/Enable, Link/Unlink, Load Selection. Click the mask thumbnail to paint on the mask (every painting tool, Fill, filter and adjustment works on it; colours paint as grey), click the layer thumbnail to go back; Shift-click disables, Ctrl/Cmd-click loads it as a selection. Linked masks move with the layer |
+| Clipping masks | Create/Release Clipping Mask (Ctrl+Alt+G): a layer shows only inside the pixels of the layer below; several layers can clip to one base, and hiding the base hides them |
+| Adjustment layers | Layer ▸ New Adjustment Layer and the Adjustments panel: Brightness/Contrast, Levels, Curves, Hue/Saturation, Color Balance, Black & White, Invert, Posterize, Threshold. They change everything below without touching pixels, using the same dialogs as Image ▸ Adjustments (Layer Content Options or a double-click on the thumbnail reopens them). Each has a mask, made from the selection if there is one. Inside a group they only affect the group unless it is Pass Through |
+| Layer styles | Layer ▸ Layer Style (or double-click a row, or the fx button): Blending Options, Stroke (outside, inside, centre), Color Overlay, Outer Glow, Drop Shadow, with a live preview. Copy, Paste and Clear Layer Style, Hide All Effects, Rasterize ▸ Layer Style. Effects ignore Fill opacity, as in Photoshop |
+| Type | Horizontal Type Tool (T): click to type, click a type layer to edit it. Font, style, size, anti-aliasing, alignment and colour in the options bar; Enter makes a new line, Ctrl+Enter or Enter on the keypad commits, Esc cancels; arrow keys, Home/End and Backspace/Delete edit. The options restyle a selected type layer. Type stays editable through moves, Free Transform, canvas rotation and Image Size; painting on it asks to rasterize it first |
+| Shapes | Rectangle (with corner radius), Ellipse, Polygon (sides, star) and Line (weight) tools (U) draw shape layers; Shift constrains, Alt draws from the centre. Fill and stroke colours (Shift-click a swatch for none) and stroke width restyle the selected shape. Free Transform keeps shapes crisp |
+| Tools | Move (moves groups, linked masks and type; Auto-Select by layer or group), Rectangular and Elliptical Marquee, Lasso, Polygonal Lasso and Magnetic Lasso, Quick Selection, Magic Wand, Crop, Eyedropper, Spot Healing Brush, Healing Brush, Brush, Pencil, Clone Stamp, History Brush, Eraser, Gradient (5 types), Paint Bucket, Blur, Sharpen, Smudge, Dodge, Burn, Sponge, Type, Rectangle, Ellipse, Polygon, Line, Hand, Zoom |
+| Retouching | Clone Stamp (S) and Healing Brush (J): Alt-click a source point, then paint; Aligned, and Sample Current Layer, Current & Below or All Layers. The Healing Brush blends the copy into its surroundings. Spot Healing Brush (J) replaces what you paint with nearby texture (Proximity Match). History Brush (Y) paints back the document as opened, or any history state picked with "Set Source for History Brush" in the History panel. Dodge and Burn (O) with Shadows / Midtones / Highlights and Exposure, Sponge to saturate or desaturate, Blur, Sharpen and Smudge with Strength |
 | Painting | Size, hardness, opacity, flow, blend mode, pen pressure for size and opacity, Shift-click straight lines, brush preset picker. Opacity caps each stroke the same way it does in Photoshop |
 | Selections | Feathered 8-bit masks; add, subtract and intersect (Shift / Alt / Shift+Alt); marching ants; All, Deselect, Reselect, Inverse; Modify ▸ Border, Smooth, Expand, Contract, Feather; Grow and Similar (using the Magic Wand tolerance); Transform Selection; drag inside a selection to move its outline; arrow keys to nudge |
 | Selection tools | Magic Wand (tolerance, sample size, contiguous, sample all layers); Quick Selection (paint to grow the selection into similar, edge-bounded areas; switches to Add after the first stroke); Magnetic Lasso (follows the strongest edge within Width; Contrast and Frequency options; Backspace removes the last anchor, double-click or Enter closes) |
@@ -46,10 +54,14 @@ It is written in C++20 with Qt 6 (Widgets). PhotoSlop is not affiliated with Ado
 | Live preview | Adjustment and filter dialogs preview on the canvas as you drag, computed on all CPU cores in the background; the Preview box compares before and after. Everything works inside the selection (feathered edges blend), honours Lock Transparency, and also edits the Quick Mask. Blurs can spread into transparent areas |
 | Fade | Edit ▸ Fade (Ctrl+Shift+F), right after a filter or adjustment, mixes it back with opacity and a blend mode |
 | Colour | Foreground/background colours, Photoshop-style Color Picker (HSB / RGB / CMYK / hex), Color panel, Swatches panel |
+| Properties panel | Shows what is selected: canvas size, a layer's position, an adjustment layer's settings button, a type layer's font, a shape's fill and stroke, or the mask controls when a mask is targeted |
+| Compositing | Groups, clipping, masks, adjustment layers and effects are composited in bands on all CPU cores |
 
 Menu items for later stages are already in the menus, greyed out, with their Photoshop shortcuts shown.
 
-What differs from Photoshop so far: Quick Selection uses colour similarity and edge strength rather than a trained model; Warp offers the custom grid only (no Arc, Bulge and other presets); Transform ▸ Again repeats the last transform's matrix rather than its parameters; Snap To ▸ Layers and Slices are not implemented yet. Adjustments are applied directly to the pixels: adjustment layers and the Adjustments panel arrive with Stage 4. Adjustment dialogs have no saved presets, and filter dialogs preview on the canvas only (no thumbnail inside the dialog). The colour maths follow Photoshop's behaviour closely but are not pixel-identical.
+What differs from Photoshop so far: Quick Selection uses colour similarity and edge strength rather than a trained model; Warp offers the custom grid only (no Arc, Bulge and other presets); Transform ▸ Again repeats the last transform's matrix rather than its parameters; Snap To ▸ Layers and Slices are not implemented yet. Adjustment dialogs have no saved presets, and filter dialogs preview on the canvas only (no thumbnail inside the dialog). The colour maths follow Photoshop's behaviour closely but are not pixel-identical.
+
+Stage 4 limits: the Layers panel selects one layer at a time, so Group Layers groups the selected layer (drag others in afterwards). Type is point text only, with one font, size and colour per layer (no paragraph text, per-character styles, tracking or leading controls), and sizes are in pixels. Shapes are drawn once and restyled from the options bar; their outlines cannot be edited point by point (there is no Pen or Path Selection tool yet). Layer styles cover Stroke, Color Overlay, Outer Glow and Drop Shadow, and cannot be applied to groups. Spot Healing uses Proximity Match only (no Content-Aware). Fill layers, vector masks, smart objects and linked layers are not implemented.
 
 ## Keyboard shortcuts
 
@@ -64,7 +76,9 @@ The shortcuts match Photoshop on every platform. Wherever Windows and Linux use 
 | Fill / Fill with FG / Fill with BG | Shift+F5 / Alt+Backspace / Ctrl+Backspace | ⇧F5 / ⌥⌫ / ⌘⌫ |
 | Select All / Deselect / Reselect / Inverse | Ctrl+A / Ctrl+D / Ctrl+Shift+D / Ctrl+Shift+I | ⌘A / ⌘D / ⇧⌘D / ⇧⌘I |
 | New Layer / Layer via Copy / via Cut | Ctrl+Shift+N / Ctrl+J / Ctrl+Shift+J | ⇧⌘N / ⌘J / ⇧⌘J |
-| Merge Down / Merge Visible | Ctrl+E / Ctrl+Shift+E | ⌘E / ⇧⌘E |
+| Merge Down (Merge Group) / Merge Visible | Ctrl+E / Ctrl+Shift+E | ⌘E / ⇧⌘E |
+| Group / Ungroup | Ctrl+G / Ctrl+Shift+G | ⌘G / ⇧⌘G |
+| Create / Release Clipping Mask | Ctrl+Alt+G | ⌥⌘G |
 | Bring Forward / Send Backward | Ctrl+] / Ctrl+[ | ⌘] / ⌘[ |
 | Image Size / Canvas Size | Ctrl+Alt+I / Ctrl+Alt+C | ⌥⌘I / ⌥⌘C |
 | Free Transform / Transform Again | Ctrl+T / Ctrl+Shift+T | ⌘T / ⇧⌘T |
@@ -78,7 +92,9 @@ The shortcuts match Photoshop on every platform. Wherever Windows and Linux use 
 | Auto Tone / Auto Contrast / Auto Color | Ctrl+Shift+L / Ctrl+Alt+Shift+L / Ctrl+Shift+B | ⇧⌘L / ⌥⇧⌘L / ⇧⌘B |
 | Last Filter / Fade | Ctrl+Alt+F / Ctrl+Shift+F | ⌥⌘F / ⇧⌘F |
 | Zoom In / Out / Fit / 100% | Ctrl+= / Ctrl+- / Ctrl+0 / Ctrl+1 | ⌘= / ⌘- / ⌘0 / ⌘1 |
-| Tools | V M L W C I B E G H Z (Shift+letter cycles a tool group) | same |
+| Tools | V M L W C I J B S Y E G O T U H Z (Shift+letter cycles a tool group) | same |
+| Clone / Healing source | Alt-click | ⌥-click |
+| Type: new line / commit / cancel | Enter / Ctrl+Enter or keypad Enter / Esc | Return / ⌘Return or keypad Enter / Esc |
 | Default colours / Swap colours | D / X | same |
 | Brush size / hardness | [ ] / Shift+[ Shift+] | same |
 | Tool or layer opacity | 1…9, 0 = 100%, type two digits fast for e.g. 45% | same |
@@ -129,7 +145,7 @@ build\PhotoSlop.exe
 ```sh
 ctest --test-dir build --output-on-failure
 ```
-`test_core` covers blend maths, undo/redo, selections and Select ▸ Modify, transform and warp resampling, Quick Mask, guides, merging, crop/rotate, file round-trips, and every adjustment and filter (including selection, lock and cancel handling). `test_ui` drives the real main window with simulated mouse input to check every tool, Free Transform, Quick Mask, rulers, guides, snapping, the live-preview dialogs, Last Filter and Fade. On a headless machine, run it with `QT_QPA_PLATFORM=offscreen`.
+`test_core` covers blend maths, undo/redo, selections and Select ▸ Modify, transform and warp resampling, Quick Mask, guides, merging, crop/rotate, file round-trips, every adjustment and filter (including selection, lock and cancel handling), groups, masks, clipping, adjustment layers, layer styles, type and shape layers, healing, and parallel compositing. `test_ui` drives the real main window with simulated mouse and keyboard input to check every tool (including typing), Free Transform, Quick Mask, rulers, guides, snapping, the live-preview dialogs, Last Filter, Fade, the Layer Style dialog, adjustment layers and Layers panel clicks and drops. On a headless machine, run it with `QT_QPA_PLATFORM=offscreen`.
 
 ### Versions and releases
 
@@ -142,7 +158,7 @@ The version number lives in the `VERSION` file; CMake reads it and the app shows
 ## Project layout
 
 ```
-src/core/     Document model: layers, blend modes, compositing, selections, transforms and warps, adjustments, filters, undo commands, document operations
+src/core/     Document model: layers and the layer tree, blend modes, the compositor (groups, masks, clipping, adjustment layers, effects), type and shape layers, selections, transforms and warps, adjustments, filters, healing, undo commands, document operations
 src/io/       File loading and saving (.pslop and flat image formats)
 src/tools/    One class per tool, plus the ToolManager (groups, shortcuts, temporary tools)
 src/ui/       Main window, canvas view, rulers, view options, toolbox, panels and dialogs
@@ -157,8 +173,8 @@ tests/        Core unit tests and GUI tests
 
 1. **Core editor**: done.
 2. **Selections and transforms**: done.
-3. **Adjustments and filters**: done (this release).
-4. **Layer power features**: masks, clipping masks, groups, adjustment layers, layer styles, Type tool, Shape tools, Clone Stamp, Healing, Dodge/Burn.
+3. **Adjustments and filters**: done.
+4. **Layer power features**: done (this release).
 5. **Pro and platform**: PSD import/export, 16/32-bit and CMYK/Lab modes, GPU canvas, an editable shortcut editor, Preferences, and installers for every platform.
 
 ## License
