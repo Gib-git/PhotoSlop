@@ -107,6 +107,7 @@ private:
     void showAt(const QPointF& pos, bool inside);
     QPointer<CanvasView> m_view;
     QLabel* m_rgb;
+    QLabel* m_second;
     QLabel* m_xy;
     QLabel* m_wh;
     QLabel* m_doc;
@@ -157,7 +158,8 @@ protected:
 private:
     QPointer<Document> m_doc;
     class QTimer* m_timer;
-    QImage m_thumbs[4];
+    QList<QImage> m_thumbs;
+    QStringList m_names;
     void rebuild();
 };
 

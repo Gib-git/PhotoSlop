@@ -23,13 +23,23 @@ It is written in C++20 with Qt 6 (Widgets). PhotoSlop is not affiliated with Ado
 | ![Curves](docs/screenshots/curves.png) | ![Layers](docs/screenshots/layers.png) |
 | **Curves** with a histogram, previewing live on the canvas | **Layer power features**: a group with a mask, a gradient clipped to a type layer with a stroke and drop shadow, a glowing ellipse shape and a masked Curves adjustment layer |
 
-## Status: Stage 4 (layer power features)
+| ![Actions and CMYK](docs/screenshots/actions.png) | |
+| **Pro features**: a layered Photoshop file in CMYK mode with its colour plates in the Channels panel, and the Actions panel with recorded steps | |
+
+## Status: Stage 5 (pro and platform)
 
 | Area | What works |
 |---|---|
 | Workspace | Photoshop "Essentials" layout: toolbar on the left, options bar on top, tabbed panel groups on the right, a collapsed icon strip (History, Navigator, Info), document tabs, a per-document status bar, a Home screen, Tab / Shift+Tab to hide panels, F to cycle screen modes |
 | Documents | New (preset browser), Open, Open Recent, Save, Save As, Save a Copy, Revert, Export As, Quick Export as PNG, Close / Close All / Close Others, multiple documents, drag-and-drop to open |
-| File formats | Native layered `.pslop` (groups, masks, adjustment, type and shape layers and styles included); PNG, JPEG, BMP, GIF, TIFF and WebP for import and flattened export |
+| File formats | Native layered `.pslop` (groups, masks, adjustment, type and shape layers and styles included); layered Photoshop `.psd` to open and save, and `.psb` to open; PNG, JPEG, BMP, GIF, TIFF and WebP for import and flattened export |
+| Photoshop files | PhotoSlop's own reader and writer. Opening reads Bitmap, Grayscale, Duotone (as grey), Indexed, RGB, CMYK and Lab files at 1, 8, 16 and 32 bits per channel, raw, RLE or ZIP compressed. Layers keep their names (Unicode), blend modes, opacity, fill, visibility, locks and clipping; groups (with Pass Through), layer masks, guides and resolution come through, and so do Levels, Curves, Hue/Saturation, Color Balance, Brightness/Contrast, Invert, Posterize and Threshold adjustment layers. Saving writes all of that in the document's colour mode, plus a full composite so other apps can show the file. A note after opening or saving lists anything that could not be kept |
+| Image modes | Image ▸ Mode ▸ Grayscale, RGB Color, CMYK Color and Lab Color, undoable. Grayscale discards colour (after asking) and keeps the document grey: colours paint as their grey. The title bar shows the mode ("Layer 1, CMYK/8"), the Info panel reads values in the document's mode with CMYK alongside, and the Channels panel shows the mode's channels (Gray; Cyan, Magenta, Yellow, Black; Lightness, a, b). Grey PNG and TIFF files open in Grayscale mode |
+| GPU canvas | With Preferences ▸ Performance ▸ Use Graphics Processor (on by default when OpenGL 2 is available), the canvas is drawn with OpenGL: the image lives in tiled textures and only the parts that change are uploaded again |
+| Preferences | Edit ▸ Preferences (Ctrl+K): Home screen, Zoom with Scroll Wheel, UI font size, history states, Use Graphics Processor, painting and other cursors (Standard, Precise, Brush Tip, crosshair), transparency checkerboard size and colours, ruler units, guide and grid colours, grid style, gridline spacing and subdivisions, and the length of the recent file list |
+| Keyboard shortcuts | Edit ▸ Keyboard Shortcuts (Ctrl+Alt+Shift+K) changes the shortcut of any menu command or tool, with search, Add and Delete Shortcut, Use Default and Reset All. Taking a key that another command uses moves it, and the dialog says from where. Summarize saves the list as a web page. Changes are kept between sessions |
+| Workspaces | Window ▸ Workspace ▸ New Workspace saves the panel layout under a name; pick a workspace to switch to it, Reset to go back to how it was saved, Delete Workspace to remove it. Essentials is always there |
+| Actions | Window ▸ Actions (Alt+F9) records menu commands into named actions in sets, and plays them back on any document. Filter and adjustment dialogs made of sliders record their settings and replay without the dialog; each step can be switched off, or set to stop at its dialog. Double-click a step to play from there. Default Actions include Sepia Toning, Custom RGB to Grayscale, Soft Glow and Sharpen for Screen. Actions are kept between sessions |
 | Layers | New, duplicate, delete, rename (double-click the name), drag to reorder, visibility (Alt-click to solo), opacity, fill, 27 blend modes, four lock types, Background layer rules, Layer via Copy/Cut, Merge Down, Merge Visible, Flatten, Ctrl/Cmd-click a thumbnail to load its transparency as a selection |
 | Groups | New Group, Group Layers (Ctrl+G), Ungroup (Ctrl+Shift+G), nesting, disclosure triangles, Pass Through or any blend mode, group opacity and masks, drag layers into and out of groups, Bring Forward / Send Backward step in and out of groups, Merge Group (Ctrl+E on a group), duplicate and delete whole groups |
 | Masks | Layer ▸ Layer Mask: Reveal All, Hide All, Reveal Selection, Hide Selection, Delete, Apply, Disable/Enable, Link/Unlink, Load Selection. Click the mask thumbnail to paint on the mask (every painting tool, Fill, filter and adjustment works on it; colours paint as grey), click the layer thumbnail to go back; Shift-click disables, Ctrl/Cmd-click loads it as a selection. Linked masks move with the layer |
@@ -57,15 +67,17 @@ It is written in C++20 with Qt 6 (Widgets). PhotoSlop is not affiliated with Ado
 | Properties panel | Shows what is selected: canvas size, a layer's position, an adjustment layer's settings button, a type layer's font, a shape's fill and stroke, or the mask controls when a mask is targeted |
 | Compositing | Groups, clipping, masks, adjustment layers and effects are composited in bands on all CPU cores |
 
-Menu items for later stages are already in the menus, greyed out, with their Photoshop shortcuts shown.
+Menu items for features PhotoSlop does not have yet are in the menus, greyed out, with their Photoshop shortcuts shown.
 
 What differs from Photoshop so far: Quick Selection uses colour similarity and edge strength rather than a trained model; Warp offers the custom grid only (no Arc, Bulge and other presets); Transform ▸ Again repeats the last transform's matrix rather than its parameters; Snap To ▸ Layers and Slices are not implemented yet. Adjustment dialogs have no saved presets, and filter dialogs preview on the canvas only (no thumbnail inside the dialog). The colour maths follow Photoshop's behaviour closely but are not pixel-identical.
 
 Stage 4 limits: the Layers panel selects one layer at a time, so Group Layers groups the selected layer (drag others in afterwards). Type is point text only, with one font, size and colour per layer (no paragraph text, per-character styles, tracking or leading controls), and sizes are in pixels. Shapes are drawn once and restyled from the options bar; their outlines cannot be edited point by point (there is no Pen or Path Selection tool yet). Layer styles cover Stroke, Color Overlay, Outer Glow and Drop Shadow, and cannot be applied to groups. Spot Healing uses Proximity Match only (no Content-Aware). Fill layers, vector masks, smart objects and linked layers are not implemented.
 
+Stage 5 limits: PhotoSlop edits at 8 bits per channel. 16- and 32-bit Photoshop files open (converted to 8 bits, with a note), but Image ▸ Mode ▸ 16 and 32 Bits/Channel are not available yet. Pixels are always stored as RGB: CMYK uses a plain device conversion without colour profiles, so CMYK documents look the same as RGB and the separations are not ready for a printing press; Lab is converted exactly, but 8-bit Lab rounds the most saturated colours. In Photoshop files, type and shape layers are saved as pixels, layer styles are merged into their layers, and Black & White adjustment layers are left out (Photoshop stores them in a format PhotoSlop does not write). On the way in, type layers, smart objects and fill layers open as pixels, and layer styles and the other adjustment types are not imported. Actions record menu commands only, not tool strokes, and dialogs other than the slider-based filters and adjustments (Levels, Curves, Fill, Image Size...) open again when played.
+
 ## Keyboard shortcuts
 
-The shortcuts match Photoshop on every platform. Wherever Windows and Linux use **Ctrl** and **Alt**, macOS uses **⌘ Cmd** and **⌥ Option**. Edit ▸ Keyboard Shortcuts (Ctrl+Alt+Shift+K) lists them all inside the app.
+The shortcuts match Photoshop on every platform. Wherever Windows and Linux use **Ctrl** and **Alt**, macOS uses **⌘ Cmd** and **⌥ Option**. Edit ▸ Keyboard Shortcuts (Ctrl+Alt+Shift+K) lists them all inside the app and lets you change them.
 
 | Action | Windows / Linux | macOS |
 |---|---|---|
@@ -100,7 +112,8 @@ The shortcuts match Photoshop on every platform. Wherever Windows and Linux use 
 | Tool or layer opacity | 1…9, 0 = 100%, type two digits fast for e.g. 45% | same |
 | Temporary Hand / Eyedropper / Move | hold Space / Alt / Ctrl | hold Space / ⌥ / ⌘ |
 | Hide panels / hide right panels | Tab / Shift+Tab | same |
-| Panels | F6 Color, F7 Layers, F8 Info | same |
+| Preferences / Keyboard Shortcuts | Ctrl+K / Ctrl+Alt+Shift+K | ⌘K (in the PhotoSlop menu) / ⌥⇧⌘K |
+| Panels | F6 Color, F7 Layers, F8 Info, Alt+F9 Actions | F6, F7, F8, ⌥F9 |
 
 ## Download
 
@@ -109,7 +122,9 @@ Ready-to-run builds for each platform are on the GitHub **Releases** page:
 | Platform | File | How to run it |
 |---|---|---|
 | macOS (Apple silicon and Intel) | `PhotoSlop-<version>-macos.dmg` | Open the disk image and drag PhotoSlop to Applications. The app is not signed yet, so the first time, right-click it and choose Open |
-| Windows (64-bit) | `PhotoSlop-<version>-windows-x64.zip` | Unzip it and run `PhotoSlop.exe` |
+| Windows (64-bit) | `PhotoSlop-<version>-windows-x64-setup.exe` | Run the installer. It adds a Start menu entry, opens `.pslop` files and can add PhotoSlop to "Open with" for `.psd` files |
+| Windows (64-bit, portable) | `PhotoSlop-<version>-windows-x64.zip` | Unzip it and run `PhotoSlop.exe` |
+| Debian and Ubuntu (x86-64) | `photoslop_<version>_amd64.deb` | `sudo apt install ./photoslop_<version>_amd64.deb`, then start PhotoSlop from the applications menu or run `photoslop` |
 | Linux (x86-64) | `PhotoSlop-<version>-linux-x86_64.AppImage` | `chmod +x` the file, then run it |
 
 The version history is in [CHANGELOG.md](CHANGELOG.md).
@@ -145,7 +160,7 @@ build\PhotoSlop.exe
 ```sh
 ctest --test-dir build --output-on-failure
 ```
-`test_core` covers blend maths, undo/redo, selections and Select ▸ Modify, transform and warp resampling, Quick Mask, guides, merging, crop/rotate, file round-trips, every adjustment and filter (including selection, lock and cancel handling), groups, masks, clipping, adjustment layers, layer styles, type and shape layers, healing, and parallel compositing. `test_ui` drives the real main window with simulated mouse and keyboard input to check every tool (including typing), Free Transform, Quick Mask, rulers, guides, snapping, the live-preview dialogs, Last Filter, Fade, the Layer Style dialog, adjustment layers and Layers panel clicks and drops. On a headless machine, run it with `QT_QPA_PLATFORM=offscreen`.
+`test_core` covers blend maths, undo/redo, selections and Select ▸ Modify, transform and warp resampling, Quick Mask, guides, merging, crop/rotate, file round-trips, every adjustment and filter (including selection, lock and cancel handling), groups, masks, clipping, adjustment layers, layer styles, type and shape layers, healing, parallel compositing, Photoshop file round trips (layers, groups, masks, clipping, adjustment layers, guides, each colour mode) and the colour mode conversions. `test_ui` drives the real main window with simulated mouse and keyboard input to check every tool (including typing), Free Transform, Quick Mask, rulers, guides, snapping, the live-preview dialogs, Last Filter, Fade, the Layer Style dialog, adjustment layers, Layers panel clicks and drops, Image ▸ Mode, saving and reopening Photoshop files, Preferences, the Keyboard Shortcuts editor, workspaces and recording and playing actions. On a headless machine, run it with `QT_QPA_PLATFORM=offscreen`.
 
 ### Versions and releases
 
@@ -159,12 +174,12 @@ The version number lives in the `VERSION` file; CMake reads it and the app shows
 
 ```
 src/core/     Document model: layers and the layer tree, blend modes, the compositor (groups, masks, clipping, adjustment layers, effects), type and shape layers, selections, transforms and warps, adjustments, filters, healing, undo commands, document operations
-src/io/       File loading and saving (.pslop and flat image formats)
+src/io/       File loading and saving (.pslop, Photoshop .psd/.psb and flat image formats)
 src/tools/    One class per tool, plus the ToolManager (groups, shortcuts, temporary tools)
 src/ui/       Main window, canvas view, rulers, view options, toolbox, panels and dialogs
 resources/    Original SVG icons and the logo
 docs/         README screenshots
-packaging/    Linux desktop entry for the AppImage
+packaging/    App icons, the macOS Info.plist, the Windows installer script and the Linux desktop entry, MIME type and .deb builder
 scripts/      bump-version.sh
 tests/        Core unit tests and GUI tests
 ```
@@ -174,8 +189,8 @@ tests/        Core unit tests and GUI tests
 1. **Core editor**: done.
 2. **Selections and transforms**: done.
 3. **Adjustments and filters**: done.
-4. **Layer power features**: done (this release).
-5. **Pro and platform**: PSD import/export, 16/32-bit and CMYK/Lab modes, GPU canvas, an editable shortcut editor, Preferences, and installers for every platform.
+4. **Layer power features**: done.
+5. **Pro and platform**: done (this release), except editing at 16 and 32 bits per channel.
 
 ## License
 

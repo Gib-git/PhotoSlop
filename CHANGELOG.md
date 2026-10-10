@@ -6,6 +6,22 @@ The current version is in the `VERSION` file. To release, add notes under **Unre
 
 ## [Unreleased]
 
+Stage 5: pro and platform.
+
+### Added
+- Photoshop files: open layered `.psd` and `.psb` files (Bitmap, Grayscale, Duotone, Indexed, RGB, CMYK and Lab; 1, 8, 16 and 32 bits; raw, RLE and ZIP) and save `.psd` with layers, groups, masks, clipping, blend modes, fill, locks, guides, resolution and Levels, Curves, Hue/Saturation, Color Balance, Brightness/Contrast, Invert, Posterize and Threshold adjustment layers. A note lists anything that could not be kept.
+- Image ▸ Mode: Grayscale, RGB Color, CMYK Color and Lab Color. The Info and Channels panels and the document title follow the mode.
+- GPU canvas: the canvas is drawn with OpenGL when a graphics processor is available.
+- Edit ▸ Preferences (Ctrl+K): Home screen, scroll-wheel zoom, UI font size, history states, graphics processor, cursors, transparency checkerboard, ruler units, guide and grid colours and spacing, and the recent file list.
+- Edit ▸ Keyboard Shortcuts (Ctrl+Alt+Shift+K) can now change shortcuts for menu commands and tools, with conflict handling, Use Default, Reset All and Summarize.
+- Window ▸ Workspace: New Workspace, Delete Workspace, switching between saved workspaces, and Reset for the current one.
+- Window ▸ Actions (Alt+F9): record, play, stop, sets, step and dialog toggles, and four Default Actions.
+- Installers: a Windows setup program with file associations, a `.deb` for Debian and Ubuntu, and app icons and document types for macOS.
+
+### Changed
+- `.pslop` files store the colour mode (older files still open).
+- Grey PNG and TIFF files open in Grayscale mode.
+
 ## [0.4.0] - 2026-10-07
 
 Stage 4: layer power features.

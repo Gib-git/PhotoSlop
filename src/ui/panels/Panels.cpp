@@ -3,6 +3,7 @@
 #include "app/Theme.h"
 #include "core/Adjustments.h"
 #include "core/ColorState.h"
+#include "core/ColorModes.h"
 #include "core/Document.h"
 #include "core/VectorLayers.h"
 #include "ui/CanvasView.h"
@@ -429,11 +430,13 @@ InfoPanel::InfoPanel(QWidget* parent)
     m_xy = new QLabel(this);
     m_wh = new QLabel(this);
     m_doc = new QLabel(this);
-    for (QLabel* l : {m_rgb, m_xy, m_wh, m_doc}) {
+    m_second = new QLabel(this);
+    for (QLabel* l : {m_rgb, m_second, m_xy, m_wh, m_doc}) {
         l->setTextFormat(Qt::RichText);
         l->setAlignment(Qt::AlignTop | Qt::AlignLeft);
     }
     grid->addWidget(m_rgb, 0, 0);
+    grid->addWidget(m_second, 0, 1);
     grid->addWidget(m_xy, 1, 0);
     grid->addWidget(m_wh, 1, 1);
     grid->addWidget(m_doc, 2, 0, 1, 2);
@@ -449,21 +452,55 @@ void InfoPanel::setView(CanvasView* view)
     showAt(QPointF(), false);
 }
 
+namespace {
+
+// One Info panel readout: the colour's values in `mode`, or blanks.
+QString readout(ColorMode mode, const QColor* c)
+{
+    QStringList labels, values;
+    switch (mode) {
+    case ColorMode::Grayscale: labels = {QStringLiteral("K:")}; break;
+    case ColorMode::CMYK: labels = {QStringLiteral("C:"), QStringLiteral("M:"), QStringLiteral("Y:"), QStringLiteral("K:")}; break;
+    case ColorMode::Lab: labels = {QStringLiteral("L:"), QStringLiteral("a:"), QStringLiteral("b:")}; break;
+    default: labels = {QStringLiteral("R:"), QStringLiteral("G:"), QStringLiteral("B:")}; break;
+    }
+    if (c) {
+        switch (mode) {
+        case ColorMode::Grayscale:
+            values << QStringLiteral("%1%").arg(std::lround((255 - ColorModes::gray(c->red(), c->green(), c->blue())) * 100.0 / 255.0));
+            break;
+        case ColorMode::CMYK:
+            for (double v : ColorModes::rgbToCmyk(c->red(), c->green(), c->blue())) values << QStringLiteral("%1%").arg(std::lround(v * 100.0));
+            break;
+        case ColorMode::Lab:
+            for (double v : ColorModes::rgbToLab(c->red(), c->green(), c->blue())) values << QString::number(std::lround(v));
+            break;
+        default: values << QString::number(c->red()) << QString::number(c->green()) << QString::number(c->blue()); break;
+        }
+    }
+    QString rows;
+    for (int i = 0; i < labels.size(); ++i)
+        rows += QStringLiteral("<tr><td>%1&nbsp;</td><td>%2</td></tr>").arg(labels[i], i < values.size() ? values[i] : QStringLiteral(" "));
+    return QStringLiteral("<table>%1</table>").arg(rows);
+}
+
+} // namespace
+
 void InfoPanel::showAt(const QPointF& pos, bool inside)
 {
-    QString r = QStringLiteral(" "), g = QStringLiteral(" "), b = QStringLiteral(" ");
     QString x = QStringLiteral(" "), y = QStringLiteral(" ");
-    if (m_view && inside) {
+    QColor c;
+    const bool valid = m_view && inside;
+    // The first readout follows the document's mode; the second is CMYK, as in Photoshop.
+    const ColorMode mode = m_view ? m_view->document()->colorMode() : ColorMode::RGB;
+    if (valid) {
         const QPoint px(int(std::floor(pos.x())), int(std::floor(pos.y())));
-        QColor c = QColor::fromRgba(qUnpremultiply(m_view->document()->compositePixel(px)));
-        r = QString::number(c.red());
-        g = QString::number(c.green());
-        b = QString::number(c.blue());
+        c = QColor::fromRgba(qUnpremultiply(m_view->document()->compositePixel(px)));
         x = QString::number(px.x());
         y = QString::number(px.y());
     }
-    m_rgb->setText(QStringLiteral("<table><tr><td>R:&nbsp;</td><td>%1</td></tr><tr><td>G:&nbsp;</td><td>%2</td></tr>"
-                                  "<tr><td>B:&nbsp;</td><td>%3</td></tr></table>").arg(r, g, b));
+    m_rgb->setText(readout(mode, valid ? &c : nullptr));
+    m_second->setText(readout(mode == ColorMode::CMYK ? ColorMode::RGB : ColorMode::CMYK, valid ? &c : nullptr));
     m_xy->setText(QStringLiteral("<table><tr><td>X:&nbsp;</td><td>%1</td></tr><tr><td>Y:&nbsp;</td><td>%2</td></tr></table>").arg(x, y));
     QString w = QStringLiteral(" "), h = QStringLiteral(" ");
     if (m_view && m_view->document()->hasSelection()) {
@@ -687,29 +724,42 @@ void ChannelsPanel::setDocument(Document* doc)
 {
     if (m_doc) disconnect(m_doc, nullptr, this, nullptr);
     m_doc = doc;
-    if (doc) connect(doc, &Document::imageChanged, this, [this] { m_timer->start(); });
+    if (doc) {
+        connect(doc, &Document::imageChanged, this, [this] { m_timer->start(); });
+        connect(doc, &Document::colorModeChanged, this, &ChannelsPanel::rebuild);
+    }
     rebuild();
 }
 
 void ChannelsPanel::rebuild()
 {
-    for (QImage& t : m_thumbs) t = QImage();
+    m_thumbs.clear();
+    m_names.clear();
     if (m_doc) {
+        const ColorMode mode = m_doc->colorMode();
+        m_names = ColorModes::channelNames(mode);
         const int level = std::max(0, m_doc->pyramidLevelCount() - 1);
         QImage src = m_doc->pyramidLevel(level).scaled(32, 32, Qt::KeepAspectRatio, Qt::SmoothTransformation);
         QImage flat(src.size(), QImage::Format_RGB32);
         flat.fill(Qt::white);
         QPainter(&flat).drawImage(0, 0, src);
-        m_thumbs[0] = flat;
-        for (int c = 0; c < 3; ++c) {
-            QImage g(flat.size(), QImage::Format_Grayscale8);
-            for (int y = 0; y < flat.height(); ++y) {
-                auto* s = reinterpret_cast<const QRgb*>(flat.constScanLine(y));
-                uchar* d = g.scanLine(y);
-                for (int x = 0; x < flat.width(); ++x) d[x] = uchar(c == 0 ? qRed(s[x]) : c == 1 ? qGreen(s[x]) : qBlue(s[x]));
+        // Grayscale documents have a single channel, shown without a composite row.
+        const int n = ColorModes::channelCount(mode);
+        if (n > 1) m_thumbs << flat;
+        QList<QImage> planes;
+        for (int c = 0; c < n; ++c) planes << QImage(flat.size(), QImage::Format_Grayscale8);
+        int v[4];
+        for (int y = 0; y < flat.height(); ++y) {
+            auto* s = reinterpret_cast<const QRgb*>(flat.constScanLine(y));
+            for (int x = 0; x < flat.width(); ++x) {
+                ColorModes::toChannels(mode, s[x], v);
+                for (int c = 0; c < n; ++c)
+                    // Ink plates show ink as dark, like a printed separation.
+                    planes[c].scanLine(y)[x] = uchar(mode == ColorMode::CMYK ? 255 - v[c] : v[c]);
             }
-            m_thumbs[c + 1] = g;
         }
+        m_thumbs += planes;
+        if (n == 1) m_names = m_names.mid(0, 1);
     }
     QWidget::update();
 }
@@ -719,28 +769,25 @@ void ChannelsPanel::paintEvent(QPaintEvent*)
     QPainter p(this);
     p.fillRect(rect(), Theme::kPanel);
     if (!m_doc) return;
-    const char* names[] = {"RGB", "Red", "Green", "Blue"};
 #ifdef Q_OS_MACOS
-    const char* keys[] = {"⌘2", "⌘3", "⌘4", "⌘5"};
+    const QString mod = QStringLiteral("⌘");
 #else
-    const char* keys[] = {"Ctrl+2", "Ctrl+3", "Ctrl+4", "Ctrl+5"};
+    const QString mod = QStringLiteral("Ctrl+");
 #endif
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < m_thumbs.size() && i < m_names.size(); ++i) {
         QRect row(0, i * 42, width(), 42);
         p.fillRect(row, i == 0 ? Theme::kRowSelected : Theme::kPanel);
         p.setPen(QColor(0x26, 0x26, 0x26));
         p.drawLine(row.bottomLeft(), row.bottomRight());
         Theme::icon(QStringLiteral("eye")).paint(&p, QRect(6, row.top() + 13, 16, 16));
         QRect thumb(34, row.top() + 5, 32, 32);
-        if (!m_thumbs[i].isNull()) {
-            QRect tr(QPoint(), m_thumbs[i].size());
-            tr.moveCenter(thumb.center());
-            p.drawImage(tr, m_thumbs[i]);
-        }
+        QRect tr(QPoint(), m_thumbs[i].size());
+        tr.moveCenter(thumb.center());
+        p.drawImage(tr, m_thumbs[i]);
         p.setPen(Theme::kText);
-        p.drawText(QRect(76, row.top(), width() - 140, 42), Qt::AlignVCenter, QString::fromLatin1(names[i]));
+        p.drawText(QRect(76, row.top(), width() - 140, 42), Qt::AlignVCenter, m_names[i]);
         p.setPen(Theme::kTextDim);
-        p.drawText(QRect(width() - 70, row.top(), 62, 42), Qt::AlignVCenter | Qt::AlignRight, QString::fromUtf8(keys[i]));
+        p.drawText(QRect(width() - 70, row.top(), 62, 42), Qt::AlignVCenter | Qt::AlignRight, mod + QString::number(i + 2));
     }
 }
 

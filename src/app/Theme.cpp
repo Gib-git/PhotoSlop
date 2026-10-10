@@ -1,5 +1,7 @@
 #include "app/Theme.h"
 
+#include "app/Preferences.h"
+
 #include <QApplication>
 #include <QHash>
 #include <QPainter>
@@ -173,7 +175,7 @@ void apply(QApplication& app)
     app.setPalette(pal);
 
     QFont f = app.font();
-    f.setPixelSize(12);
+    f.setPixelSize(Preferences::instance().uiFontPixels());
     app.setFont(f);
 
     app.setStyleSheet(styleSheet());

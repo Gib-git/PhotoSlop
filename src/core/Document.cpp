@@ -11,12 +11,18 @@
 #include <algorithm>
 #include <iterator>
 
+namespace {
+int g_historyStates = 50; // Photoshop's default number of history states
+}
+
+void Document::setDefaultHistoryStates(int states) { g_historyStates = std::max(1, states); }
+
 Document::Document(const QSize& size, QObject* parent)
     : QObject(parent)
     , m_size(size)
     , m_undo(new QUndoStack(this))
 {
-    m_undo->setUndoLimit(50); // Photoshop's default number of history states
+    m_undo->setUndoLimit(g_historyStates);
     connect(m_undo, &QUndoStack::cleanChanged, this, &Document::modifiedChanged);
     reallocate();
 }
@@ -289,6 +295,13 @@ QRgb Document::compositePixel(const QPoint& pt)
 void Document::recomposite(const QRect& r)
 {
     Compositor::renderParallel(m_layers, m_composite, r);
+    // A Grayscale document cannot show colour, whatever its layers hold.
+    if (m_mode == ColorMode::Grayscale) ColorModes::grayscaleInPlace(m_composite, r);
+}
+
+void Document::setColorModeRaw(ColorMode mode)
+{
+    m_mode = mode;
 }
 
 void Document::updatePyramid(const QRect& r)
@@ -328,6 +341,7 @@ DocState Document::state() const
     DocState s;
     s.size = m_size;
     s.dpi = m_dpi;
+    s.mode = m_mode;
     s.layers = m_layers;
     s.active = m_active;
     s.selection = m_selection;
@@ -363,6 +377,8 @@ void Document::restoreState(const DocState& s)
 
     m_size = s.size;
     m_dpi = s.dpi;
+    const bool modeChange = s.mode != m_mode;
+    m_mode = s.mode;
     m_layers = s.layers;
     m_active = std::clamp(s.active, 0, std::max(0, int(m_layers.size()) - 1));
     if (m_maskTarget && (m_layers.isEmpty() || !m_layers[m_active].mask)) {
@@ -374,9 +390,12 @@ void Document::restoreState(const DocState& s)
         reallocate();
         invalidate();
         emit sizeChanged();
+    } else if (modeChange) {
+        invalidate();
     } else if (!dirty.isEmpty()) {
         invalidate(dirty);
     }
+    if (modeChange) emit colorModeChanged();
     if (selChange) {
         if (!m_selection.isNull()) m_lastSelection = m_selection;
         m_selection = s.selection;
@@ -421,11 +440,12 @@ void Document::pushSnapshot(const QString& text, const DocState& before, int mer
             else if (!sameLayer(before.layers[i], m_layers[i]))
                 dirty |= Compositor::extent(before.layers, i, bounds()) | Compositor::extent(m_layers, i, bounds());
         }
-        if (structure) dirty = bounds();
+        if (structure || before.mode != m_mode) dirty = bounds();
         if (!dirty.isEmpty()) invalidate(dirty);
         emit layersChanged();
         if (before.active != m_active || structure) emit activeLayerChanged();
     }
+    if (before.mode != m_mode) emit colorModeChanged();
     if (m_maskTarget && (m_layers.isEmpty() || !m_layers[std::clamp(m_active, 0, int(m_layers.size()) - 1)].mask)) {
         m_maskTarget = false;
         emit editTargetChanged();
@@ -452,6 +472,7 @@ void Document::initialize(const DocState& s)
 {
     m_size = s.size;
     m_dpi = s.dpi;
+    m_mode = s.mode;
     m_layers = s.layers;
     m_active = std::clamp(s.active, 0, std::max(0, int(m_layers.size()) - 1));
     m_selection = s.selection;

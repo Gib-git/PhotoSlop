@@ -201,8 +201,7 @@ void CloneStampTool::paintOverlay(QPainter& p, CanvasView* v)
     // Crosshair where the source is being sampled.
     const QPointF c = v->canvasToView(m_cursor + QPointF(m_offset));
     p.setRenderHint(QPainter::Antialiasing, false);
-    p.setCompositionMode(QPainter::CompositionMode_Difference);
-    p.setPen(QPen(Qt::white, 1));
+    v->setContrastPen(p, 1);
     p.drawLine(QPointF(c.x() - 6, c.y()), QPointF(c.x() + 6, c.y()));
     p.drawLine(QPointF(c.x(), c.y() - 6), QPointF(c.x(), c.y() + 6));
 }

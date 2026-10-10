@@ -7,4 +7,4 @@ Exec=PhotoSlop %F
 Icon=photoslop
 Terminal=false
 Categories=Graphics;2DGraphics;RasterGraphics;
-MimeType=image/png;image/jpeg;image/bmp;image/gif;image/tiff;image/webp;
+MimeType=application/x-photoslop;image/vnd.adobe.photoshop;image/png;image/jpeg;image/bmp;image/gif;image/tiff;image/webp;

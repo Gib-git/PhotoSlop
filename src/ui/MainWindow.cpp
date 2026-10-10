@@ -1,5 +1,6 @@
 #include "ui/MainWindow.h"
 
+#include "app/Preferences.h"
 #include "app/Theme.h"
 #include "core/ColorState.h"
 #include "core/Commands.h"
@@ -19,6 +20,7 @@
 #include "tools/ToolManager.h"
 #include "tools/TransformTools.h"
 #include "tools/VectorTools.h"
+#include "ui/ActionsModel.h"
 #include "ui/CanvasView.h"
 #include "ui/DocumentPage.h"
 #include "ui/ToolBox.h"
@@ -27,10 +29,15 @@
 #include "ui/dialogs/ColorPickerDialog.h"
 #include "ui/dialogs/Dialogs.h"
 #include "ui/dialogs/LayerStyleDialog.h"
+#include "ui/dialogs/PreferencesDialog.h"
+#include "ui/dialogs/ShortcutsDialog.h"
+#include "ui/GpuViewport.h"
+#include "ui/panels/ActionsPanel.h"
 #include "ui/panels/LayersPanel.h"
 #include "ui/panels/Panels.h"
 
 #include <QAbstractSpinBox>
+#include <QActionGroup>
 #include <QApplication>
 #include <QClipboard>
 #include <QCloseEvent>
@@ -48,6 +55,7 @@
 #include <QMimeData>
 #include <QPlainTextEdit>
 #include <QRandomGenerator>
+#include <QSet>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QStackedWidget>
@@ -77,6 +85,17 @@ QList<QKeySequence> keys(std::initializer_list<const char*> list)
 }
 
 using Values = QHash<QString, double>;
+
+// A menu item's text without its shortcut, mnemonics or trailing "..." ("Black & White").
+QString commandName(QString text)
+{
+    text = text.section(QLatin1Char('\t'), 0, 0);
+    text.remove(QStringLiteral("..."));
+    text.replace(QStringLiteral("&&"), QStringLiteral("\x01"));
+    text.remove(QLatin1Char('&'));
+    text.replace(QLatin1Char('\x01'), QLatin1Char('&'));
+    return text;
+}
 
 // Dialog recipes shared by Image > Adjustments and the matching adjustment layers.
 void setupBrightnessContrast(ParamDialog& d)
@@ -161,6 +180,7 @@ MainWindow::MainWindow(QWidget* parent)
     , m_tools(new ToolManager(m_colors, this))
     , m_undoGroup(new QUndoGroup(this))
     , m_viewOptions(new ViewOptions(this))
+    , m_actionsModel(new ActionsModel(this))
 {
     setWindowTitle(QStringLiteral("PhotoSlop — %1").arg(kSlogan));
     setWindowIcon(Theme::icon(QStringLiteral("app")));
@@ -182,7 +202,14 @@ MainWindow::MainWindow(QWidget* parent)
     m_tabs->setMovable(true);
     m_tabs->tabBar()->setExpanding(false);
     m_tabs->tabBar()->setElideMode(Qt::ElideMiddle);
+    // Shown instead of the Home screen when Preferences turn it off.
+    m_empty = new QWidget(m_central);
+    m_empty->setAutoFillBackground(true);
+    QPalette emptyPal = m_empty->palette();
+    emptyPal.setColor(QPalette::Window, Theme::kPasteboard);
+    m_empty->setPalette(emptyPal);
     m_central->addWidget(m_home);
+    m_central->addWidget(m_empty);
     m_central->addWidget(m_tabs);
     setCentralWidget(m_central);
     connect(m_home, &HomeScreen::newRequested, this, &MainWindow::newDocument);
@@ -195,9 +222,17 @@ MainWindow::MainWindow(QWidget* parent)
     createDocks();
     createMenus();
     createHiddenShortcuts();
+    for (auto it = m_actions.cbegin(); it != m_actions.cend(); ++it) m_defaultShortcuts.insert(it.key(), it.value()->shortcuts());
+    loadShortcuts();
     m_adjustmentsPanel->setActionLookup([this](const QString& id) { return action(id); });
 
     connect(m_tools, &ToolManager::alertRequested, this, &MainWindow::alert);
+    Document::setDefaultHistoryStates(Preferences::instance().historyStates);
+    connect(&Preferences::instance(), &Preferences::changed, this, [this] {
+        Document::setDefaultHistoryStates(Preferences::instance().historyStates);
+        refreshRecent();
+        if (!currentPage()) onCurrentChanged();
+    });
     connect(m_viewOptions, &ViewOptions::changed, this, &MainWindow::syncViewActions);
     connect(QApplication::clipboard(), &QClipboard::dataChanged, this, [this] {
         if (!m_settingClipboard) m_clipValid = false;
@@ -399,6 +434,14 @@ void MainWindow::createDocks()
                      m_strip->addPanel(Theme::icon(QStringLiteral("info")), QStringLiteral("Info"), m_infoPanel, QSize(240, 170)));
     action(QStringLiteral("window.info"))->setShortcut(QKeySequence(Qt::Key_F8));
     addAction(action(QStringLiteral("window.info")));
+    m_actionsPanel = new ActionsPanel(m_actionsModel);
+    m_actions.insert(QStringLiteral("window.actions"),
+                     m_strip->addPanel(Theme::icon(QStringLiteral("actions")), QStringLiteral("Actions"), m_actionsPanel, QSize(290, 380)));
+    action(QStringLiteral("window.actions"))->setShortcut(QKeySequence(QStringLiteral("Alt+F9")));
+    addAction(action(QStringLiteral("window.actions")));
+    connect(m_actionsPanel, &ActionsPanel::recordRequested, m_actionsModel, &ActionsModel::startRecording);
+    connect(m_actionsPanel, &ActionsPanel::stopRequested, m_actionsModel, &ActionsModel::stopRecording);
+    connect(m_actionsPanel, &ActionsPanel::playRequested, this, [this](int set, int a, int from) { playAction(set, a, from); });
 }
 
 QAction* MainWindow::makeAction(const QString& id, const QString& text, const QList<QKeySequence>& ks,
@@ -412,9 +455,21 @@ QAction* MainWindow::makeAction(const QString& id, const QString& text, const QL
                                                QStringLiteral("color."), QStringLiteral("brush."), QStringLiteral("window."),
                                                QStringLiteral("edit.freeTransform"), QStringLiteral("edit.shortcuts")};
     const bool commits = std::none_of(keepsTransform.begin(), keepsTransform.end(), [&](const QString& p) { return id.startsWith(p); });
-    connect(a, &QAction::triggered, this, [this, commits, fn = std::move(fn)] {
+    connect(a, &QAction::triggered, this, [this, a, id, commits, fn = std::move(fn)] {
         if (commits) m_tools->commitModal();
+        // While an action records, commands that change the document become steps.
+        const bool record = m_actionsModel->isRecording() && !m_playingAction && isRecordable(id);
+        const HistoryMark before = historyMark();
+        m_stepValues.clear();
         fn();
+        if (record && historyMark() != before) {
+            ActionStep step;
+            step.command = id;
+            step.title = commandName(a->text());
+            step.values = m_stepValues;
+            step.hasDialog = a->text().contains(QStringLiteral("..."));
+            m_actionsModel->appendStep(step);
+        }
     });
     m_actions.insert(id, a);
     if (needsDocument) m_docActions.append(a);
@@ -608,17 +663,29 @@ void MainWindow::createMenus()
     edit->addAction(makeAction(QStringLiteral("edit.shortcuts"), QStringLiteral("Keyboard Shortcuts..."), keys({"Ctrl+Alt+Shift+K"}), [this] { showShortcuts(); }, false));
     stub(edit, QStringLiteral("Menus..."), QKeySequence(QStringLiteral("Ctrl+Alt+Shift+M")));
     stub(edit, QStringLiteral("Toolbar..."));
-    QAction* prefs = stub(edit, QStringLiteral("Preferences..."), QKeySequence(QStringLiteral("Ctrl+K")));
+    QAction* prefs = makeAction(QStringLiteral("edit.preferences"), QStringLiteral("Preferences..."), keys({"Ctrl+K"}),
+                                [this] { preferencesDialog(); }, false);
     prefs->setMenuRole(QAction::PreferencesRole);
+    edit->addAction(prefs);
 
     // ---------------- Image ----------------
     QMenu* image = mb->addMenu(QStringLiteral("&Image"));
     QMenu* mode = image->addMenu(QStringLiteral("Mode"));
-    for (const char* m : {"Bitmap", "Grayscale", "Duotone", "Indexed Color..."}) stub(mode, QString::fromLatin1(m));
-    QAction* rgb = mode->addAction(QStringLiteral("RGB Color"));
-    rgb->setCheckable(true);
-    rgb->setChecked(true);
-    for (const char* m : {"CMYK Color", "Lab Color", "Multichannel"}) stub(mode, QString::fromLatin1(m));
+    stub(mode, QStringLiteral("Bitmap"));
+    auto* modeGroup = new QActionGroup(this);
+    auto modeAction = [&](const QString& id, ColorMode m) {
+        QAction* a = makeAction(id, ColorModes::menuName(m), {}, [this, m] { convertMode(m); });
+        a->setCheckable(true);
+        modeGroup->addAction(a);
+        mode->addAction(a);
+    };
+    modeAction(QStringLiteral("image.modeGray"), ColorMode::Grayscale);
+    stub(mode, QStringLiteral("Duotone"));
+    stub(mode, QStringLiteral("Indexed Color..."));
+    modeAction(QStringLiteral("image.modeRgb"), ColorMode::RGB);
+    modeAction(QStringLiteral("image.modeCmyk"), ColorMode::CMYK);
+    modeAction(QStringLiteral("image.modeLab"), ColorMode::Lab);
+    stub(mode, QStringLiteral("Multichannel"));
     mode->addSeparator();
     QAction* bits8 = mode->addAction(QStringLiteral("8 Bits/Channel"));
     bits8->setCheckable(true);
@@ -1223,22 +1290,20 @@ void MainWindow::createMenus()
     stub(arrangeWin, QStringLiteral("Tile All Horizontally"));
     arrangeWin->addAction(QStringLiteral("Consolidate All to Tabs"));
     stub(arrangeWin, QStringLiteral("Float in Window"));
-    QMenu* workspace = m_windowMenu->addMenu(QStringLiteral("Workspace"));
-    QAction* essentials = workspace->addAction(QStringLiteral("Essentials (Default)"));
-    essentials->setCheckable(true);
-    essentials->setChecked(true);
-    workspace->addSeparator();
-    workspace->addAction(makeAction(QStringLiteral("window.resetWorkspace"), QStringLiteral("Reset Essentials"), {}, [this] {
-        restoreState(m_defaultState, kStateVersion);
-        m_toolsBar->show();
-        m_optionsBar->show();
-    }, false));
+    m_workspaceMenu = m_windowMenu->addMenu(QStringLiteral("Workspace"));
+    makeAction(QStringLiteral("window.resetWorkspace"), QStringLiteral("Reset Essentials"), {}, [this] { resetWorkspace(); }, false);
+    makeAction(QStringLiteral("window.newWorkspace"), QStringLiteral("New Workspace..."), {}, [this] { newWorkspace(); }, false);
+    makeAction(QStringLiteral("window.deleteWorkspace"), QStringLiteral("Delete Workspace..."), {}, [this] { deleteWorkspace(); }, false);
+    rebuildWorkspaceMenu();
     m_windowMenu->addSeparator();
-    stub(m_windowMenu, QStringLiteral("Actions"), QKeySequence(QStringLiteral("Alt+F9")));
+    m_windowMenu->addAction(action(QStringLiteral("window.actions")));
     auto dockAct = [this](const QString& objectName, const char* key) {
         for (QDockWidget* d : m_docks) {
             if (d->objectName() != objectName) continue;
             QAction* a = d->toggleViewAction();
+            QString id = objectName;
+            id.chop(4); // "Dock"
+            m_actions.insert(QStringLiteral("window.") + id.toLower(), a);
             if (key) {
                 a->setShortcut(QKeySequence(QString::fromLatin1(key)));
                 addAction(a);
@@ -1341,6 +1406,7 @@ void MainWindow::addDocument(Document* doc)
     connect(doc, &Document::quickMaskChanged, this, &MainWindow::updateActions);
     connect(doc, &Document::activeLayerChanged, this, &MainWindow::updateActions);
     connect(doc, &Document::editTargetChanged, this, &MainWindow::updateActions);
+    connect(doc, &Document::colorModeChanged, this, &MainWindow::updateActions);
     connect(doc->undoStack(), &QUndoStack::indexChanged, this, &MainWindow::updateActions);
     m_tabs->setCurrentIndex(idx);
     m_central->setCurrentWidget(m_tabs);
@@ -1407,13 +1473,17 @@ void MainWindow::openFiles(const QStringList& paths)
         }
         if (found) continue;
         QString err;
-        Document* doc = DocumentIO::load(path, &err);
+        QStringList warnings;
+        Document* doc = DocumentIO::load(path, &err, &warnings);
         if (!doc) {
             alert(QStringLiteral("Could not open “%1” because %2").arg(QFileInfo(path).fileName(), err));
             continue;
         }
         addRecent(path);
         addDocument(doc);
+        if (!warnings.isEmpty())
+            alert(QStringLiteral("“%1” was opened, but some of it could not be kept:\n\n• %2")
+                      .arg(QFileInfo(path).fileName(), warnings.join(QStringLiteral("\n• "))));
     }
 }
 
@@ -1451,7 +1521,7 @@ bool MainWindow::saveDocument(Document* doc, bool saveAs, bool asCopy)
 {
     if (!doc) return false;
     QString path = doc->filePath();
-    const bool native = DocumentIO::isNativePath(path);
+    const bool native = DocumentIO::isLayeredPath(path);
     const bool flatOk = !path.isEmpty() && !native && doc->layerCount() == 1;
     if (!saveAs && !path.isEmpty() && (native || flatOk)) {
         // fall through with existing path
@@ -1470,8 +1540,9 @@ bool MainWindow::saveDocument(Document* doc, bool saveAs, bool asCopy)
 
     QString err;
     bool ok;
-    if (DocumentIO::isNativePath(path)) {
-        ok = DocumentIO::saveNative(doc, path, &err);
+    QStringList warnings;
+    if (DocumentIO::isLayeredPath(path)) {
+        ok = DocumentIO::saveLayered(doc, path, &err, &warnings);
     } else {
         const QByteArray fmt = DocumentIO::formatForPath(path);
         int quality = -1;
@@ -1491,6 +1562,9 @@ bool MainWindow::saveDocument(Document* doc, bool saveAs, bool asCopy)
         alert(QStringLiteral("Could not save “%1” because %2").arg(QFileInfo(path).fileName(), err));
         return false;
     }
+    if (!warnings.isEmpty())
+        alert(QStringLiteral("“%1” was saved. Photoshop format cannot keep everything:\n\n• %2")
+                  .arg(QFileInfo(path).fileName(), warnings.join(QStringLiteral("\n• "))));
     addRecent(path);
     if (!asCopy) {
         doc->setFilePath(path);
@@ -1552,7 +1626,7 @@ void MainWindow::addRecent(const QString& path)
     QStringList files = s.value(QStringLiteral("recentFiles")).toStringList();
     files.removeAll(path);
     files.prepend(path);
-    while (files.size() > 20) files.removeLast();
+    while (files.size() > std::max(1, Preferences::instance().recentFileCount)) files.removeLast();
     s.setValue(QStringLiteral("recentFiles"), files);
     refreshRecent();
 }
@@ -1560,6 +1634,7 @@ void MainWindow::addRecent(const QString& path)
 void MainWindow::refreshRecent()
 {
     QStringList files = QSettings().value(QStringLiteral("recentFiles")).toStringList();
+    files = files.mid(0, Preferences::instance().recentFileCount);
     m_recentMenu->clear();
     for (const QString& f : files) {
         QAction* a = m_recentMenu->addAction(QFileInfo(f).fileName());
@@ -1581,7 +1656,7 @@ void MainWindow::onCurrentChanged()
     DocumentPage* page = currentPage();
     Document* doc = page ? page->document() : nullptr;
     CanvasView* view = page ? page->view() : nullptr;
-    m_central->setCurrentWidget(page ? static_cast<QWidget*>(m_tabs) : m_home);
+    m_central->setCurrentWidget(page ? static_cast<QWidget*>(m_tabs) : Preferences::instance().showHomeScreen ? m_home : m_empty);
     m_tools->setActiveView(view);
     if (doc) m_undoGroup->setActiveStack(doc->undoStack());
     else m_undoGroup->setActiveStack(nullptr);
@@ -1612,6 +1687,7 @@ void MainWindow::updateActions()
 {
     Document* doc = currentDoc();
     for (QAction* a : std::as_const(m_docActions)) a->setEnabled(doc != nullptr);
+    if (!doc) m_colors->setGrayscale(false);
     m_toolBox->setQuickMask(doc && doc->inQuickMask());
     action(QStringLiteral("select.quickMask"))->setChecked(doc && doc->inQuickMask());
     if (!doc) return;
@@ -1679,6 +1755,9 @@ void MainWindow::updateActions()
     action(QStringLiteral("layer.rasterizeLayer"))->setEnabled(l && (l->isVector() || l->hasStyle()));
     action(QStringLiteral("layer.flatten"))->setEnabled(doc->layerCount() > 1 || (l && !l->isBackground));
     action(QStringLiteral("file.revert"))->setEnabled(!doc->filePath().isEmpty());
+    const char* modeIds[] = {"image.modeRgb", "image.modeGray", "image.modeCmyk", "image.modeLab"};
+    action(QString::fromLatin1(modeIds[int(doc->colorMode())]))->setChecked(true);
+    m_colors->setGrayscale(doc->colorMode() == ColorMode::Grayscale);
     action(QStringLiteral("filter.last"))->setEnabled(bool(m_lastFilter));
     const bool fade = canFade();
     action(QStringLiteral("edit.fade"))->setEnabled(fade);
@@ -1895,6 +1974,25 @@ void MainWindow::modifySelectionDialog(int howInt)
     Ops::modifySelection(doc, how, dlg.amount(), dlg.atCanvasBounds());
 }
 
+void MainWindow::convertMode(ColorMode mode)
+{
+    Document* doc = currentDoc();
+    if (!doc || doc->colorMode() == mode) {
+        updateActions();
+        return;
+    }
+    if (mode == ColorMode::Grayscale && !m_playingAction) {
+        QMessageBox box(QMessageBox::Question, QStringLiteral("PhotoSlop"), QStringLiteral("Discard color information?"),
+                        QMessageBox::Ok | QMessageBox::Cancel, this);
+        box.button(QMessageBox::Ok)->setText(QStringLiteral("Discard"));
+        if (box.exec() != QMessageBox::Ok) {
+            updateActions();
+            return;
+        }
+    }
+    Ops::setColorMode(doc, mode);
+}
+
 void MainWindow::toggleQuickMask()
 {
     if (Document* doc = currentDoc()) Ops::setQuickMask(doc, !doc->inQuickMask());
@@ -2072,19 +2170,36 @@ void MainWindow::paramDialog(const QString& title, bool spreads, bool isFilter, 
 {
     Document* doc = currentDoc();
     if (!doc || !prepareTarget(title)) return;
+    auto lastFilterRecipe = [build](const QHash<QString, double>& values) {
+        return [build, values] {
+            QHash<QString, double> v = values;
+            // Each repeat gets fresh noise.
+            if (v.contains(QStringLiteral("seed"))) v[QStringLiteral("seed")] = QRandomGenerator::global()->generate();
+            return build(v);
+        };
+    };
+    // An action playing back supplies the values, and may skip the dialog.
+    const Playback playback = m_playback;
+    m_playback = Playback();
+    if (playback.active && !playback.values.isEmpty() && !playback.showDialog) {
+        const Filters::Spec spec = build(playback.values);
+        applySpec(spec, isFilter ? SpecRecipe(lastFilterRecipe(playback.values)) : SpecRecipe());
+        m_stepValues = playback.values;
+        return;
+    }
     const bool useLast = isFilter || (QApplication::keyboardModifiers() & Qt::AltModifier);
     ParamDialog dlg(doc, title, spreads, build, this);
     setup(dlg);
-    if (useLast) dlg.useLastValues();
+    if (playback.active && !playback.values.isEmpty()) {
+        for (auto it = playback.values.cbegin(); it != playback.values.cend(); ++it) dlg.setValue(it.key(), it.value());
+    } else if (useLast) {
+        dlg.useLastValues();
+    }
     dlg.ready();
-    if (!execPreview(dlg) || !isFilter) return;
+    if (!execPreview(dlg)) return;
     const QHash<QString, double> values = dlg.values();
-    setLastFilter(dlg.spec().name, [build, values] {
-        QHash<QString, double> v = values;
-        // Each repeat gets fresh noise.
-        if (v.contains(QStringLiteral("seed"))) v[QStringLiteral("seed")] = QRandomGenerator::global()->generate();
-        return build(v);
-    });
+    m_stepValues = values;
+    if (isFilter) setLastFilter(dlg.spec().name, lastFilterRecipe(values));
 }
 
 void MainWindow::setLastFilter(const QString& name, const SpecRecipe& recipe)
@@ -2145,65 +2260,118 @@ void MainWindow::fadeDialog()
     updateActions();
 }
 
-void MainWindow::showShortcuts()
+QList<ShortcutsDialog::Entry> MainWindow::shortcutEntries() const
 {
-    QDialog dlg(this);
-    dlg.setWindowTitle(QStringLiteral("Keyboard Shortcuts"));
-    dlg.resize(620, 640);
-    auto* lay = new QVBoxLayout(&dlg);
-    auto* table = new QTableWidget(&dlg);
-    table->setColumnCount(2);
-    table->setHorizontalHeaderLabels({QStringLiteral("Application Menu Command"), QStringLiteral("Shortcut")});
-    table->horizontalHeader()->setStretchLastSection(true);
-    table->setColumnWidth(0, 360);
-    table->verticalHeader()->hide();
-    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    std::function<void(QMenu*, const QString&)> walk = [&](QMenu* menu, const QString& prefix) {
+    QHash<QAction*, QString> ids;
+    for (auto it = m_actions.cbegin(); it != m_actions.cend(); ++it) ids.insert(it.value(), it.key());
+    QList<ShortcutsDialog::Entry> out;
+    QSet<QString> seen;
+    auto add = [&](const QString& id, const QString& category, const QString& group, const QString& name) {
+        if (seen.contains(id)) return;
+        seen.insert(id);
+        ShortcutsDialog::Entry e;
+        e.id = id;
+        e.category = category;
+        e.group = group;
+        e.name = name;
+        e.keys = m_actions.value(id)->shortcuts();
+        e.defaults = m_defaultShortcuts.value(id);
+        out.append(e);
+    };
+    auto clean = [](QString t) {
+        t = t.section(QLatin1Char('\t'), 0, 0);
+        t.remove(QLatin1Char('&'));
+        return t;
+    };
+    std::function<void(QMenu*, const QString&, const QString&)> walk = [&](QMenu* menu, const QString& group, const QString& prefix) {
         for (QAction* a : menu->actions()) {
             if (a->isSeparator()) continue;
-            QString text = a->text().section(QLatin1Char('\t'), 0, 0);
-            text.remove(QLatin1Char('&'));
             if (a->menu()) {
-                walk(a->menu(), prefix + text + QStringLiteral(" > "));
+                walk(a->menu(), group, prefix + clean(a->text()) + QStringLiteral(" > "));
                 continue;
             }
-            QString key = a->shortcut().toString(QKeySequence::NativeText);
-            if (key.isEmpty()) key = a->text().section(QLatin1Char('\t'), 1);
-            const int row = table->rowCount();
-            table->insertRow(row);
-            table->setItem(row, 0, new QTableWidgetItem(prefix + text));
-            table->setItem(row, 1, new QTableWidgetItem(key));
+            const QString id = ids.value(a);
+            if (!id.isEmpty()) add(id, QStringLiteral("Application Menus"), group, prefix + clean(a->text()));
         }
     };
     for (QAction* a : menuBar()->actions())
-        if (a->menu()) {
-            QString t = a->text();
-            t.remove(QLatin1Char('&'));
-            walk(a->menu(), t + QStringLiteral(" > "));
-        }
-    const QStringList hidden = {QStringLiteral("color.default"), QStringLiteral("color.swap"), QStringLiteral("brush.smaller"),
-                                QStringLiteral("brush.larger"), QStringLiteral("brush.softer"), QStringLiteral("brush.harder"),
-                                QStringLiteral("edit.fillForeground"), QStringLiteral("edit.fillBackground"),
-                                QStringLiteral("view.screenCycle"), QStringLiteral("layer.newQuick")};
-    for (const QString& id : hidden) {
-        QAction* a = action(id);
-        const int row = table->rowCount();
-        table->insertRow(row);
-        table->setItem(row, 0, new QTableWidgetItem(QStringLiteral("Tools > ") + a->text()));
-        table->setItem(row, 1, new QTableWidgetItem(a->shortcut().toString(QKeySequence::NativeText)));
-    }
+        if (a->menu()) walk(a->menu(), clean(a->text()), QString());
+    // Tools: one entry per toolbox slot (Shift plus the same key cycles through the slot).
     for (const auto& grp : m_tools->groups()) {
-        for (Tool* t : grp.tools) {
-            const int row = table->rowCount();
-            table->insertRow(row);
-            table->setItem(row, 0, new QTableWidgetItem(QStringLiteral("Tools > ") + t->name()));
-            table->setItem(row, 1, new QTableWidgetItem(QString(t->shortcut())));
+        if (grp.tools.isEmpty() || grp.tools.first()->shortcut().isNull()) continue;
+        const QString id = QStringLiteral("tool.%1").arg(grp.tools.first()->shortcut());
+        if (!m_actions.contains(id)) continue;
+        QStringList names;
+        for (Tool* t : grp.tools) names << t->name();
+        add(id, QStringLiteral("Tools"), QStringLiteral("Tools"), names.join(QStringLiteral(", ")));
+    }
+    for (const char* id : {"color.default", "color.swap", "view.screenCycle", "brush.smaller", "brush.larger", "brush.softer",
+                           "brush.harder", "edit.fillForeground", "edit.fillBackground", "edit.fillForegroundPreserve",
+                           "edit.fillBackgroundPreserve"})
+        if (QAction* a = action(QString::fromLatin1(id)))
+            add(QString::fromLatin1(id), QStringLiteral("Tools"), QStringLiteral("Other"), clean(a->text()));
+    return out;
+}
+
+void MainWindow::applyShortcut(const QString& id, const QList<QKeySequence>& keys)
+{
+    QAction* a = action(id);
+    if (!a) return;
+    a->setShortcuts(keys);
+    // A tool key also sets the Shift+key that cycles through the tool's slot.
+    if (id.startsWith(QLatin1String("tool.")) && !id.endsWith(QLatin1String(".cycle"))) {
+        if (QAction* cycle = action(id + QStringLiteral(".cycle"))) {
+            QList<QKeySequence> shifted;
+            for (const QKeySequence& k : keys)
+                if (k.count() == 1 && !(k[0].keyboardModifiers() & Qt::ShiftModifier))
+                    shifted << QKeySequence(QKeyCombination(k[0].keyboardModifiers() | Qt::ShiftModifier, k[0].key()));
+            cycle->setShortcuts(shifted);
         }
     }
-    lay->addWidget(table);
-    auto* box = new QDialogButtonBox(QDialogButtonBox::Ok, &dlg);
-    connect(box, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
-    lay->addWidget(box);
+}
+
+void MainWindow::loadShortcuts()
+{
+    QSettings s;
+    s.beginGroup(QStringLiteral("shortcuts"));
+    for (const QString& id : s.childKeys()) {
+        if (!m_actions.contains(id)) continue;
+        QList<QKeySequence> keys;
+        for (const QString& k : s.value(id).toStringList())
+            if (!k.isEmpty()) keys << QKeySequence::fromString(k, QKeySequence::PortableText);
+        applyShortcut(id, keys);
+    }
+}
+
+void MainWindow::saveShortcuts(const QList<ShortcutsDialog::Entry>& entries)
+{
+    QSettings s;
+    s.beginGroup(QStringLiteral("shortcuts"));
+    for (const ShortcutsDialog::Entry& e : entries) {
+        applyShortcut(e.id, e.keys);
+        // Only changes from the defaults are stored.
+        if (e.keys == e.defaults) {
+            s.remove(e.id);
+            continue;
+        }
+        QStringList keys;
+        for (const QKeySequence& k : e.keys) keys << k.toString(QKeySequence::PortableText);
+        if (keys.isEmpty()) keys << QString(); // explicitly none
+        s.setValue(e.id, keys);
+    }
+}
+
+void MainWindow::showShortcuts()
+{
+    ShortcutsDialog dlg(shortcutEntries(), this);
+    if (dlg.exec() == QDialog::Accepted) saveShortcuts(dlg.entries());
+}
+
+void MainWindow::preferencesDialog()
+{
+    QString gpu;
+    Gpu::available(&gpu);
+    PreferencesDialog dlg(m_viewOptions, gpu, this);
     dlg.exec();
 }
 
@@ -2227,6 +2395,152 @@ void MainWindow::showAbout()
     connect(box, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     lay->addWidget(box);
     dlg.exec();
+}
+
+// ---------------- Actions ----------------
+
+MainWindow::HistoryMark MainWindow::historyMark() const
+{
+    HistoryMark m;
+    m.doc = currentDoc();
+    m.docs = m_tabs->count();
+    if (m.doc) {
+        QUndoStack* s = m.doc->undoStack();
+        m.index = s->index();
+        m.count = s->count();
+        m.top = s->index() > 0 ? s->command(s->index() - 1) : nullptr;
+    }
+    return m;
+}
+
+bool MainWindow::isRecordable(const QString& id)
+{
+    static const QStringList skipped = {QStringLiteral("view."), QStringLiteral("window."), QStringLiteral("file."), QStringLiteral("tool."),
+                                        QStringLiteral("brush."), QStringLiteral("color."), QStringLiteral("edit.undo"),
+                                        QStringLiteral("edit.redo"), QStringLiteral("edit.toggleLast"), QStringLiteral("edit.purge"),
+                                        QStringLiteral("edit.shortcuts"), QStringLiteral("edit.preferences"), QStringLiteral("edit.freeTransform"),
+                                        QStringLiteral("filter.last")};
+    return std::none_of(skipped.begin(), skipped.end(), [&](const QString& p) { return id.startsWith(p); });
+}
+
+bool MainWindow::playAction(int set, int index, int fromStep)
+{
+    const RecordedAction* ra = m_actionsModel->actionAt(set, index);
+    if (!ra || m_playingAction || m_actionsModel->isRecording()) return false;
+    const QList<ActionStep> steps = ra->steps; // the model may change while steps run
+    m_playingAction = true;
+    bool ok = true;
+    for (int i = std::max(0, fromStep); i < steps.size() && ok; ++i) {
+        const ActionStep& step = steps[i];
+        if (!step.enabled) continue;
+        QAction* a = action(step.command);
+        if (!a || !a->isEnabled()) {
+            alert(QStringLiteral("The command “%1” is not currently available.").arg(step.title));
+            ok = false;
+            break;
+        }
+        m_actionsPanel->select(set, index, i);
+        m_playback = Playback{true, step.values, step.showDialog};
+        const HistoryMark before = historyMark();
+        a->trigger();
+        m_playback = Playback();
+        // A cancelled dialog stops the action.
+        if (step.hasDialog && historyMark() == before) ok = false;
+    }
+    m_playingAction = false;
+    return ok;
+}
+
+// ---------------- Workspaces ----------------
+
+QStringList MainWindow::workspaceNames() const
+{
+    QSettings s;
+    s.beginGroup(QStringLiteral("workspaces"));
+    QStringList names = s.childKeys();
+    names.sort(Qt::CaseInsensitive);
+    return names;
+}
+
+void MainWindow::rebuildWorkspaceMenu()
+{
+    m_workspaceMenu->clear();
+    const QString current = QSettings().value(QStringLiteral("currentWorkspace")).toString();
+    auto* group = new QActionGroup(m_workspaceMenu);
+    auto entry = [&](const QString& label, const QString& name) {
+        QAction* a = m_workspaceMenu->addAction(label);
+        a->setCheckable(true);
+        a->setChecked(name == current);
+        group->addAction(a);
+        connect(a, &QAction::triggered, this, [this, name] { switchWorkspace(name); });
+    };
+    entry(QStringLiteral("Essentials (Default)"), QString());
+    const QStringList names = workspaceNames();
+    if (!names.isEmpty()) m_workspaceMenu->addSeparator();
+    for (const QString& n : names) entry(n, n);
+    m_workspaceMenu->addSeparator();
+    QAction* reset = action(QStringLiteral("window.resetWorkspace"));
+    reset->setText(QStringLiteral("Reset %1").arg(current.isEmpty() ? QStringLiteral("Essentials") : current));
+    m_workspaceMenu->addAction(reset);
+    m_workspaceMenu->addAction(action(QStringLiteral("window.newWorkspace")));
+    m_workspaceMenu->addAction(action(QStringLiteral("window.deleteWorkspace")));
+    action(QStringLiteral("window.deleteWorkspace"))->setEnabled(!names.isEmpty());
+}
+
+void MainWindow::switchWorkspace(const QString& name)
+{
+    QSettings s;
+    s.setValue(QStringLiteral("currentWorkspace"), name);
+    resetWorkspace();
+}
+
+void MainWindow::resetWorkspace()
+{
+    const QString current = QSettings().value(QStringLiteral("currentWorkspace")).toString();
+    const QByteArray state = current.isEmpty() ? m_defaultState
+                                               : QSettings().value(QStringLiteral("workspaces/") + current).toByteArray();
+    if (m_panelsHidden) toggleAllPanels(false);
+    m_strip->hideFlyout();
+    restoreState(state.isEmpty() ? m_defaultState : state, kStateVersion);
+    rebuildWorkspaceMenu();
+}
+
+bool MainWindow::newWorkspace(const QString& presetName)
+{
+    QString name = presetName;
+    if (name.isEmpty()) {
+        bool ok = false;
+        name = QInputDialog::getText(this, QStringLiteral("New Workspace"),
+                                     QStringLiteral("Name:\nPanel locations will be saved in this workspace."), QLineEdit::Normal,
+                                     QStringLiteral("Workspace %1").arg(workspaceNames().size() + 1), &ok)
+                   .trimmed();
+        if (!ok || name.isEmpty()) return false;
+    }
+    name.replace(QLatin1Char('/'), QLatin1Char('-'));
+    QSettings s;
+    if (s.contains(QStringLiteral("workspaces/") + name) && presetName.isEmpty()
+        && QMessageBox::question(this, QStringLiteral("PhotoSlop"), QStringLiteral("Replace the workspace “%1”?").arg(name))
+               != QMessageBox::Yes)
+        return false;
+    s.setValue(QStringLiteral("workspaces/") + name, saveState(kStateVersion));
+    s.setValue(QStringLiteral("currentWorkspace"), name);
+    rebuildWorkspaceMenu();
+    return true;
+}
+
+void MainWindow::deleteWorkspace(const QString& presetName)
+{
+    QString name = presetName;
+    if (name.isEmpty()) {
+        bool ok = false;
+        name = QInputDialog::getItem(this, QStringLiteral("Delete Workspace"), QStringLiteral("Workspace:"), workspaceNames(), 0,
+                                     false, &ok);
+        if (!ok || name.isEmpty()) return;
+    }
+    QSettings s;
+    s.remove(QStringLiteral("workspaces/") + name);
+    if (s.value(QStringLiteral("currentWorkspace")).toString() == name) s.remove(QStringLiteral("currentWorkspace"));
+    rebuildWorkspaceMenu();
 }
 
 void MainWindow::toggleAllPanels(bool docksOnly)

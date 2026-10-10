@@ -13,6 +13,20 @@ ViewOptions::ViewOptions(QObject* parent)
     snapGrid = s.value(QStringLiteral("snapGrid"), snapGrid).toBool();
     snapBounds = s.value(QStringLiteral("snapBounds"), snapBounds).toBool();
     units = Units(s.value(QStringLiteral("units"), int(units)).toInt());
+    gridEvery = s.value(QStringLiteral("gridEvery"), gridEvery).toDouble();
+    gridUnits = Units(s.value(QStringLiteral("gridUnits"), int(gridUnits)).toInt());
+    gridSubdivisions = s.value(QStringLiteral("gridSubdivisions"), gridSubdivisions).toInt();
+}
+
+double ViewOptions::gridSpacing(double dpi, int docWidth) const
+{
+    switch (gridUnits) {
+    case Units::Pixels: return gridEvery;
+    case Units::Centimeters: return gridEvery * dpi / 2.54;
+    case Units::Millimeters: return gridEvery * dpi / 25.4;
+    case Units::Percent: return gridEvery * docWidth / 100.0;
+    default: return gridEvery * dpi;
+    }
 }
 
 void ViewOptions::notify()
@@ -25,5 +39,8 @@ void ViewOptions::notify()
     s.setValue(QStringLiteral("snapGrid"), snapGrid);
     s.setValue(QStringLiteral("snapBounds"), snapBounds);
     s.setValue(QStringLiteral("units"), int(units));
+    s.setValue(QStringLiteral("gridEvery"), gridEvery);
+    s.setValue(QStringLiteral("gridUnits"), int(gridUnits));
+    s.setValue(QStringLiteral("gridSubdivisions"), gridSubdivisions);
     emit changed();
 }

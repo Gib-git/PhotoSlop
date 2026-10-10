@@ -84,6 +84,7 @@ DocumentPage::DocumentPage(Document* doc, ToolManager* tools, ViewOptions* optio
     connect(doc, &Document::layersChanged, this, &DocumentPage::titleChanged);
     connect(doc, &Document::quickMaskChanged, this, &DocumentPage::titleChanged);
     connect(doc, &Document::editTargetChanged, this, &DocumentPage::titleChanged);
+    connect(doc, &Document::colorModeChanged, this, &DocumentPage::titleChanged);
     updateStatus();
 }
 
@@ -105,7 +106,7 @@ QString DocumentPage::tabTitle() const
     QString target;
     if (m_doc->inQuickMask()) target = QStringLiteral("Quick Mask/8");
     else if (m_doc->editingMask()) target = QStringLiteral("%1, Layer Mask/8").arg(l ? l->name : QString());
-    else target = QStringLiteral("%1, RGB/8").arg(l ? l->name : QString());
+    else target = QStringLiteral("%1, %2/8").arg(l ? l->name : QString(), ColorModes::shortName(m_doc->colorMode()));
     return QStringLiteral("%1 @ %2 (%3)%4")
         .arg(m_doc->title(), formatZoom(m_view->zoom()), target, m_doc->isModified() ? QStringLiteral(" *") : QString());
 }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/ColorModes.h"
 #include "core/Layer.h"
 
 #include <QImage>
@@ -23,6 +24,7 @@ struct Guide {
 struct DocState {
     QSize size;
     double dpi = 72.0;
+    ColorMode mode = ColorMode::RGB;
     QList<Layer> layers;
     int active = 0;
     QImage selection;
@@ -35,6 +37,8 @@ class Document : public QObject {
     Q_OBJECT
 public:
     explicit Document(const QSize& size, QObject* parent = nullptr);
+    // History states kept by documents created from now on (Preferences > Performance).
+    static void setDefaultHistoryStates(int states);
     ~Document() override;
 
     QSize size() const { return m_size; }
@@ -43,6 +47,9 @@ public:
     int height() const { return m_size.height(); }
     double dpi() const { return m_dpi; }
     void setDpi(double dpi) { m_dpi = dpi; }
+    // Image > Mode. Changing it is undoable through modify(); Grayscale documents composite to grey.
+    ColorMode colorMode() const { return m_mode; }
+    void setColorModeRaw(ColorMode mode);
     // Changes the canvas size without touching layers; call inside modify().
     void setSizeRaw(const QSize& size) { m_size = size; }
 
@@ -154,6 +161,7 @@ signals:
     void guidesChanged();
     void quickMaskChanged();
     void sizeChanged();
+    void colorModeChanged();
     void modifiedChanged();
     void titleChanged();
 
@@ -166,6 +174,7 @@ private:
 
     QSize m_size;
     double m_dpi = 72.0;
+    ColorMode m_mode = ColorMode::RGB;
     QString m_title;
     QString m_filePath;
     QList<Layer> m_layers;

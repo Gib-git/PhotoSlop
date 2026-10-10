@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets Svg Concurrent Test)
+find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets Svg Concurrent OpenGL OpenGLWidgets Test)
 qt_standard_project_setup()
 
 if(MSVC)
@@ -31,12 +31,21 @@ file(GLOB_RECURSE UI_SOURCES CONFIGURE_DEPENDS
     src/ui/*.cpp src/ui/*.h
     src/tools/*.cpp src/tools/*.h)
 add_library(photoslop_ui STATIC ${UI_SOURCES})
-target_link_libraries(photoslop_ui PUBLIC photoslop_core Qt6::Widgets Qt6::Svg)
+target_link_libraries(photoslop_ui PUBLIC photoslop_core Qt6::Widgets Qt6::Svg Qt6::OpenGL Qt6::OpenGLWidgets)
 
 file(GLOB ICON_FILES RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} CONFIGURE_DEPENDS resources/icons/*.svg)
 
 # ---- Application ----
-qt_add_executable(PhotoSlop WIN32 MACOSX_BUNDLE src/main.cpp)
+# App icons: an .icns in the macOS bundle, an .ico resource in the Windows exe.
+set(APP_ICON_MACOS ${CMAKE_CURRENT_SOURCE_DIR}/packaging/macos/PhotoSlop.icns)
+set_source_files_properties(${APP_ICON_MACOS} PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+set(APP_EXTRA_SOURCES)
+if(APPLE)
+    list(APPEND APP_EXTRA_SOURCES ${APP_ICON_MACOS})
+elseif(WIN32)
+    list(APPEND APP_EXTRA_SOURCES packaging/windows/PhotoSlop.rc)
+endif()
+qt_add_executable(PhotoSlop WIN32 MACOSX_BUNDLE src/main.cpp ${APP_EXTRA_SOURCES})
 qt_add_resources(PhotoSlop "resources"
     PREFIX "/"
     BASE resources
@@ -45,6 +54,8 @@ target_link_libraries(PhotoSlop PRIVATE photoslop_ui)
 target_compile_definitions(PhotoSlop PRIVATE PHOTOSLOP_VERSION="${PROJECT_VERSION}")
 
 set_target_properties(PhotoSlop PROPERTIES
+    MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/packaging/macos/Info.plist.in
+    MACOSX_BUNDLE_ICON_FILE PhotoSlop.icns
     MACOSX_BUNDLE_GUI_IDENTIFIER com.photoslop.app
     MACOSX_BUNDLE_BUNDLE_NAME PhotoSlop
     MACOSX_BUNDLE_BUNDLE_VERSION ${PROJECT_VERSION}

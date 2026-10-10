@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/BlendMode.h"
+#include "core/ColorModes.h"
 #include "core/Selection.h"
 
 #include <QColor>
@@ -124,5 +125,7 @@ void imageSize(Document* doc, const QSize& newSize, double dpi, Resample method)
 void canvasSize(Document* doc, const QSize& newSize, const QPoint& anchorOffset,
                 const QColor& extensionColor);
 void rotate(Document* doc, Rotation how);
+// Image > Mode. Grayscale turns every layer's pixels grey; the other modes keep the pixels.
+void setColorMode(Document* doc, ColorMode mode);
 
 } // namespace Ops

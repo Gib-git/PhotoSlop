@@ -14,6 +14,7 @@
 #include "tools/VectorTools.h"
 #include "ui/CanvasView.h"
 #include "ui/DocumentPage.h"
+#include "ui/ActionsModel.h"
 #include "ui/MainWindow.h"
 #include "ui/Ruler.h"
 #include "ui/ViewOptions.h"
@@ -21,10 +22,19 @@
 #include "ui/dialogs/ColorPickerDialog.h"
 #include "ui/dialogs/Dialogs.h"
 #include "ui/dialogs/LayerStyleDialog.h"
+#include "ui/dialogs/PreferencesDialog.h"
+#include "ui/dialogs/ShortcutsDialog.h"
+#include "app/Preferences.h"
+#include "io/DocumentIO.h"
+#include "ui/panels/ActionsPanel.h"
 #include "ui/panels/LayersPanel.h"
 #include "ui/panels/Panels.h"
 
+#include <QCheckBox>
+#include <QComboBox>
+#include <QDockWidget>
 #include <QListView>
+#include <QSpinBox>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QSettings>
@@ -1183,6 +1193,238 @@ private slots:
         // A letter returns to the group's last used tool (the Sponge, from an earlier test).
         w->action(QStringLiteral("tool.O"))->trigger();
         QCOMPARE(tools()->current()->id(), QStringLiteral("sponge"));
+    }
+
+    // ---------------- Stage 5: pro and platform ----------------
+
+    void imageModeGrayscaleAndBack()
+    {
+        openWhite();
+        squareLayer(QRect(10, 10, 40, 40));
+        QVERIFY(Ops::fill(doc(), Qt::red, BlendMode::Normal, 1.f, true));
+        QCOMPARE(pixel(20, 20), QColor(Qt::red));
+        // Grayscale asks before discarding colour.
+        QTimer::singleShot(0, w.get(), [] {
+            auto* box = qobject_cast<QMessageBox*>(QApplication::activeModalWidget());
+            if (box) box->button(QMessageBox::Ok)->click();
+        });
+        w->action(QStringLiteral("image.modeGray"))->trigger();
+        QCoreApplication::processEvents();
+        QCOMPARE(doc()->colorMode(), ColorMode::Grayscale);
+        QVERIFY(w->action(QStringLiteral("image.modeGray"))->isChecked());
+        QVERIFY(page()->tabTitle().contains(QStringLiteral("Gray/8")));
+        const QColor g = pixel(20, 20);
+        QVERIFY(g.red() == g.green() && g.green() == g.blue());
+        // Colours paint as grey in a Grayscale document.
+        colors()->setForeground(Qt::blue);
+        QCOMPARE(colors()->foreground().red(), colors()->foreground().blue());
+        w->action(QStringLiteral("image.modeLab"))->trigger();
+        QCOMPARE(doc()->colorMode(), ColorMode::Lab);
+        QVERIFY(page()->tabTitle().contains(QStringLiteral("Lab/8")));
+        QCOMPARE(colors()->foreground(), QColor(Qt::blue));
+        doc()->undoStack()->undo();
+        doc()->undoStack()->undo();
+        QCOMPARE(doc()->colorMode(), ColorMode::RGB);
+        QCOMPARE(pixel(20, 20), QColor(Qt::red));
+        colors()->reset();
+    }
+
+    void psdSaveAndReopen()
+    {
+        openWhite();
+        squareLayer(QRect(10, 10, 40, 40));
+        Ops::rename(doc(), doc()->activeIndex(), QStringLiteral("Square"));
+        const QString path = dir.filePath(QStringLiteral("saved.psd"));
+        QString err;
+        QVERIFY2(DocumentIO::saveLayered(doc(), path, &err), qPrintable(err));
+        doc()->setClean();
+        w->action(QStringLiteral("file.close"))->trigger();
+        QCoreApplication::processEvents();
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        QVERIFY(!page());
+        w->openFiles({path});
+        QCoreApplication::processEvents();
+        QVERIFY(page());
+        QCOMPARE(doc()->layerCount(), 2);
+        QCOMPARE(doc()->layerAt(1).name, QStringLiteral("Square"));
+        QVERIFY(doc()->layerAt(0).isBackground);
+        QCOMPARE(pixel(20, 20), QColor(Qt::black));
+        // Saving keeps the Photoshop file without asking where.
+        Ops::setOpacity(doc(), 1, 0.5f);
+        w->action(QStringLiteral("file.save"))->trigger();
+        QCoreApplication::processEvents();
+        QVERIFY(!doc()->isModified());
+        QCOMPARE(doc()->filePath(), path);
+    }
+
+    void preferencesDialogApplies()
+    {
+        openWhite();
+        Preferences& prefs = Preferences::instance();
+        const PreferenceValues before = prefs;
+        bool seen = false;
+        QTimer::singleShot(0, w.get(), [&] {
+            auto* d = qobject_cast<PreferencesDialog*>(QApplication::activeModalWidget());
+            if (!d) return;
+            seen = true;
+            d->setPage(PreferencesDialog::Transparency);
+            for (QSpinBox* sb : d->findChildren<QSpinBox*>())
+                if (sb->suffix() == QStringLiteral(" files")) sb->setValue(7);
+            for (QCheckBox* cb : d->findChildren<QCheckBox*>())
+                if (cb->text() == QStringLiteral("Zoom with Scroll Wheel")) cb->setChecked(true);
+            d->accept();
+        });
+        w->action(QStringLiteral("edit.preferences"))->trigger();
+        QCoreApplication::processEvents();
+        QVERIFY(seen);
+        QCOMPARE(prefs.recentFileCount, 7);
+        QVERIFY(prefs.zoomWithScrollWheel);
+        // Saved for the next session.
+        Preferences::instance().load();
+        QCOMPARE(prefs.recentFileCount, 7);
+        // The wheel now zooms without Alt.
+        const double z = view()->zoom();
+        QWheelEvent wheel(QPointF(100, 100), view()->viewport()->mapToGlobal(QPoint(100, 100)), QPoint(), QPoint(0, 120),
+                          Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase, false);
+        QApplication::sendEvent(view()->viewport(), &wheel);
+        QVERIFY(view()->zoom() > z);
+        static_cast<PreferenceValues&>(prefs) = before;
+        prefs.notify();
+        // History states apply to new documents.
+        prefs.historyStates = 7;
+        prefs.notify();
+        openWhite();
+        QCOMPARE(doc()->undoStack()->undoLimit(), 7);
+        static_cast<PreferenceValues&>(prefs) = before;
+        prefs.notify();
+    }
+
+    void keyboardShortcutsEditor()
+    {
+        openWhite();
+        bool seen = false;
+        QTimer::singleShot(0, w.get(), [&] {
+            auto* d = qobject_cast<ShortcutsDialog*>(QApplication::activeModalWidget());
+            if (!d) return;
+            seen = true;
+            QVERIFY(d->indexOf(QStringLiteral("image.invert")) >= 0);
+            QVERIFY(d->indexOf(QStringLiteral("tool.V")) >= 0);
+            // Ctrl+I belongs to Invert; giving it to Desaturate takes it away.
+            const QStringList lost = d->setShortcuts(QStringLiteral("image.desaturate"), {QKeySequence(QStringLiteral("Ctrl+I"))});
+            QCOMPARE(lost.size(), 1);
+            QVERIFY(lost.first().contains(QStringLiteral("Invert")));
+            d->setShortcuts(QStringLiteral("tool.V"), {QKeySequence(QStringLiteral("K"))});
+            QVERIFY(d->summaryHtml().contains(QStringLiteral("Desaturate")));
+            d->accept();
+        });
+        w->action(QStringLiteral("edit.shortcuts"))->trigger();
+        QCoreApplication::processEvents();
+        QVERIFY(seen);
+        QCOMPARE(w->action(QStringLiteral("image.desaturate"))->shortcut(), QKeySequence(QStringLiteral("Ctrl+I")));
+        QVERIFY(w->action(QStringLiteral("image.invert"))->shortcut().isEmpty());
+        QCOMPARE(w->action(QStringLiteral("tool.V"))->shortcut(), QKeySequence(QStringLiteral("K")));
+        QCOMPARE(w->action(QStringLiteral("tool.V.cycle"))->shortcut(), QKeySequence(QStringLiteral("Shift+K")));
+        // Stored, and restored by a new window.
+        {
+            MainWindow other;
+            QCOMPARE(other.action(QStringLiteral("image.desaturate"))->shortcut(), QKeySequence(QStringLiteral("Ctrl+I")));
+            QVERIFY(other.action(QStringLiteral("image.invert"))->shortcut().isEmpty());
+        }
+        // Reset All puts the defaults back.
+        QTimer::singleShot(0, w.get(), [&] {
+            if (auto* d = qobject_cast<ShortcutsDialog*>(QApplication::activeModalWidget())) {
+                d->resetAll();
+                d->accept();
+            }
+        });
+        w->action(QStringLiteral("edit.shortcuts"))->trigger();
+        QCoreApplication::processEvents();
+        QCOMPARE(w->action(QStringLiteral("image.invert"))->shortcut(), QKeySequence(QStringLiteral("Ctrl+I")));
+        QCOMPARE(w->action(QStringLiteral("tool.V"))->shortcut(), QKeySequence(QStringLiteral("V")));
+        QSettings s;
+        s.beginGroup(QStringLiteral("shortcuts"));
+        QVERIFY(s.childKeys().isEmpty());
+    }
+
+    void workspacesSaveAndSwitch()
+    {
+        auto* layersDock = w->findChild<QDockWidget*>(QStringLiteral("LayersDock"));
+        QVERIFY(layersDock && layersDock->isVisible());
+        layersDock->hide();
+        QVERIFY(w->newWorkspace(QStringLiteral("No Layers")));
+        layersDock->show();
+        QVERIFY(layersDock->isVisible());
+        // Reset goes back to the saved layout of the current workspace.
+        w->action(QStringLiteral("window.resetWorkspace"))->trigger();
+        QVERIFY(!layersDock->isVisible());
+        QCOMPARE(w->action(QStringLiteral("window.resetWorkspace"))->text(), QStringLiteral("Reset No Layers"));
+        w->deleteWorkspace(QStringLiteral("No Layers"));
+        w->action(QStringLiteral("window.resetWorkspace"))->trigger();
+        QVERIFY(layersDock->isVisible());
+        QCOMPARE(w->action(QStringLiteral("window.resetWorkspace"))->text(), QStringLiteral("Reset Essentials"));
+    }
+
+    void actionsRecordAndPlay()
+    {
+        openWhite();
+        ActionsModel* model = w->actionsModel();
+        ActionsPanel* panel = w->actionsPanel();
+        QVERIFY(!model->sets().isEmpty()); // Default Actions
+        panel->newSet(QStringLiteral("Test Set"));
+        const int set = int(model->sets().size()) - 1;
+        panel->newAction(QStringLiteral("Invert and Blur")); // starts recording
+        QVERIFY(model->isRecording());
+        w->action(QStringLiteral("image.invert"))->trigger();
+        w->action(QStringLiteral("view.zoomIn"))->trigger(); // changes nothing: not recorded
+        QVERIFY(withDialog<ParamDialog>(QStringLiteral("filter.gaussianBlur"), [&](ParamDialog* d) {
+            d->setValue(QStringLiteral("radius"), 3.0);
+            d->waitForPreview();
+            d->accept();
+        }));
+        model->stopRecording();
+        const RecordedAction* ra = model->actionAt(set, 0);
+        QVERIFY(ra);
+        QCOMPARE(ra->steps.size(), 2);
+        QCOMPARE(ra->steps[0].command, QStringLiteral("image.invert"));
+        QCOMPARE(ra->steps[1].command, QStringLiteral("filter.gaussianBlur"));
+        QCOMPARE(ra->steps[1].values.value(QStringLiteral("radius")), 3.0);
+        QVERIFY(ra->steps[1].hasDialog);
+        const QImage recorded = doc()->composite().copy();
+
+        // Played on a fresh document, without dialogs, it gives the same result.
+        openWhite();
+        QVERIFY(w->playAction(set, 0));
+        QCOMPARE(doc()->composite(), recorded);
+        QCOMPARE(doc()->undoStack()->count(), 2);
+
+        // Switching a step off skips it.
+        openWhite();
+        model->sets()[set].actions[0].steps[1].enabled = false;
+        model->notify();
+        QVERIFY(w->playAction(set, 0));
+        QCOMPARE(pixel(5, 5), QColor(Qt::black));
+        QCOMPARE(doc()->undoStack()->count(), 1);
+
+        // Actions are kept between sessions.
+        ActionsModel reloaded;
+        QCOMPARE(reloaded.sets().size(), model->sets().size());
+        QCOMPARE(reloaded.sets()[set].actions[0].steps.size(), 2);
+        QVERIFY(!reloaded.sets()[set].actions[0].steps[1].enabled);
+        panel->select(set, -1);
+        panel->deleteSelected(false);
+        QCOMPARE(model->sets().size(), set);
+    }
+
+    void defaultActionPlays()
+    {
+        openWhite();
+        squareLayer(QRect(10, 10, 40, 40));
+        QVERIFY(Ops::fill(doc(), QColor(200, 50, 50), BlendMode::Normal, 1.f, true));
+        // "Sepia Toning (layer)": Layer via Copy, then a tinted Black & White.
+        QVERIFY(w->playAction(0, 0));
+        QCOMPARE(doc()->layerCount(), 3);
+        const QColor c = pixel(20, 20);
+        QVERIFY2(c.red() > c.blue(), qPrintable(c.name())); // warm, not grey
     }
 };
 

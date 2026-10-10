@@ -24,8 +24,11 @@ public:
     bool snapBounds = true;
     Units units = Units::Pixels;
     // Photoshop's defaults: a gridline every inch, four subdivisions.
-    double gridInches = 1.0;
+    double gridEvery = 1.0;
+    Units gridUnits = Units::Inches;
     int gridSubdivisions = 4;
+    // Canvas pixels between major gridlines.
+    double gridSpacing(double dpi, int docWidth) const;
 
     bool showsSelectionEdges() const { return extras && selectionEdges; }
     bool showsPixelGrid() const { return extras && pixelGrid; }

@@ -1,10 +1,13 @@
 #pragma once
 
 #include <QAbstractScrollArea>
+#include <QBrush>
 #include <QPointer>
 #include <QTimer>
 
 class Document;
+class GpuViewport;
+class QPainter;
 class Tool;
 class ToolManager;
 class ViewOptions;
@@ -39,6 +42,10 @@ public:
     void updateCursor();
     QPointF lastCanvasPos() const { return m_lastCanvasPos; }
     ViewOptions* options() const { return m_opts; }
+    // A pen for overlay lines that show on any colour (white in Difference mode, or a black and
+    // white pattern on the GPU canvas, which cannot blend that way).
+    void setContrastPen(QPainter& p, qreal width) const;
+    bool usesGpu() const { return m_gpu != nullptr; }
     // Hides the marching ants while a tool shows its own outline (Transform Selection).
     void setSelectionEdgesSuppressed(bool on);
 
@@ -80,6 +87,10 @@ protected:
     bool viewportEvent(QEvent* e) override;
 
 private:
+    void prepareViewport();
+    void paintCanvas(QPainter& p, const QRect& clip);
+    // Switches between the OpenGL and the plain viewport to follow Preferences.
+    void applyGpuPreference();
     void updateScrollBars();
     bool initialFit();
     void applyZoom(double zoom, const QPointF& anchorView);
@@ -122,5 +133,7 @@ private:
     bool m_guideMouse = false;
     bool m_hoverGuide = false;
     int m_antsPhase = 0;
+    QBrush m_checker;
+    GpuViewport* m_gpu = nullptr;
     QTimer m_antsTimer;
 };

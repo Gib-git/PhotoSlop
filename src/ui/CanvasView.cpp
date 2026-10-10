@@ -1,9 +1,11 @@
 #include "ui/CanvasView.h"
 
+#include "app/Preferences.h"
 #include "app/Theme.h"
 #include "core/Document.h"
 #include "tools/Tool.h"
 #include "tools/ToolManager.h"
+#include "ui/GpuViewport.h"
 #include "ui/ViewOptions.h"
 
 #include <QKeyEvent>
@@ -26,17 +28,26 @@ const double kZoomSteps[] = {0.01,   0.02, 0.03, 0.04, 0.05, 0.0625, 0.0833, 0.1
 constexpr double kMinZoom = 0.01;
 constexpr double kMaxZoom = 128.0;
 
-const QBrush& checkerBrush()
+// The transparency checkerboard, as set in Preferences > Transparency.
+QBrush checkerBrush()
 {
-    static QBrush brush = [] {
-        QPixmap pm(16, 16);
-        pm.fill(Qt::white);
-        QPainter p(&pm);
-        p.fillRect(0, 0, 8, 8, QColor(0xcc, 0xcc, 0xcc));
-        p.fillRect(8, 8, 8, 8, QColor(0xcc, 0xcc, 0xcc));
-        return QBrush(pm);
-    }();
-    return brush;
+    const Preferences& prefs = Preferences::instance();
+    const int n = prefs.checkerPixels();
+    if (n == 0) return QBrush(Qt::white);
+    QPixmap pm(2 * n, 2 * n);
+    pm.fill(prefs.checkerLight());
+    QPainter p(&pm);
+    p.fillRect(0, 0, n, n, prefs.checkerDark());
+    p.fillRect(n, n, n, n, prefs.checkerDark());
+    return QBrush(pm);
+}
+
+// A one-pixel line at any zoom. Zero-width pens draw nothing on the OpenGL paint engine.
+QPen hairline(const QColor& color, Qt::PenStyle style = Qt::SolidLine)
+{
+    QPen pen(color, 1.0, style);
+    pen.setCosmetic(true);
+    return pen;
 }
 
 QBrush antsBrush(int phase)
@@ -63,10 +74,7 @@ CanvasView::CanvasView(Document* doc, ToolManager* tools, ViewOptions* options, 
 {
     setFrameShape(QFrame::NoFrame);
     setFocusPolicy(Qt::StrongFocus);
-    viewport()->setMouseTracking(true);
-    viewport()->setAttribute(Qt::WA_OpaquePaintEvent);
-    viewport()->setAttribute(Qt::WA_TabletTracking);
-    viewport()->grabGesture(Qt::PinchGesture);
+    prepareViewport();
     setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
     setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
     horizontalScrollBar()->setSingleStep(20);
@@ -84,9 +92,18 @@ CanvasView::CanvasView(Document* doc, ToolManager* tools, ViewOptions* options, 
         else m_antsTimer.stop();
     });
 
-    connect(doc, &Document::guidesChanged, viewport(), qOverload<>(&QWidget::update));
-    connect(doc, &Document::quickMaskChanged, viewport(), qOverload<>(&QWidget::update));
-    connect(options, &ViewOptions::changed, viewport(), qOverload<>(&QWidget::update));
+    // Connected through lambdas: the viewport widget changes when the GPU setting does.
+    auto repaint = [this] { viewport()->update(); };
+    connect(doc, &Document::guidesChanged, this, repaint);
+    connect(doc, &Document::quickMaskChanged, this, repaint);
+    connect(options, &ViewOptions::changed, this, repaint);
+    connect(&Preferences::instance(), &Preferences::changed, this, [this] {
+        m_checker = checkerBrush();
+        applyGpuPreference();
+        updateCursor();
+    });
+    m_checker = checkerBrush();
+    applyGpuPreference();
 
     m_antsTimer.setInterval(120);
     connect(&m_antsTimer, &QTimer::timeout, this, [this] {
@@ -94,6 +111,52 @@ CanvasView::CanvasView(Document* doc, ToolManager* tools, ViewOptions* options, 
         QRectF r = selectionViewRect();
         if (!r.isEmpty()) viewport()->update(r.toAlignedRect().adjusted(-2, -2, 2, 2));
     });
+}
+
+void CanvasView::prepareViewport()
+{
+    viewport()->setMouseTracking(true);
+    viewport()->setAttribute(Qt::WA_OpaquePaintEvent);
+    viewport()->setAttribute(Qt::WA_TabletTracking);
+    viewport()->grabGesture(Qt::PinchGesture);
+}
+
+void CanvasView::applyGpuPreference()
+{
+    const bool want = Preferences::instance().useGraphicsProcessor && Gpu::available();
+    if (want == bool(m_gpu)) return;
+    // QAbstractScrollArea deletes the old viewport.
+    QWidget* vp = nullptr;
+    if (want) {
+        m_gpu = new GpuViewport(m_doc);
+        m_gpu->setPainter([this](QPainter& p) { paintCanvas(p, viewport()->rect()); });
+        vp = m_gpu;
+    } else {
+        m_gpu = nullptr;
+        vp = new QWidget;
+    }
+    setViewport(vp);
+    prepareViewport();
+    updateCursor();
+    viewport()->update();
+}
+
+void CanvasView::setContrastPen(QPainter& p, qreal width) const
+{
+    if (!m_gpu) {
+        // Inverts whatever is underneath, so the line shows on any colour.
+        p.setCompositionMode(QPainter::CompositionMode_Difference);
+        p.setPen(QPen(Qt::white, width));
+        return;
+    }
+    // OpenGL has no Difference blending without an extension: alternate black and white instead.
+    static const QBrush pattern = [] {
+        QImage img(4, 4, QImage::Format_ARGB32);
+        for (int y = 0; y < 4; ++y)
+            for (int x = 0; x < 4; ++x) img.setPixel(x, y, ((x + y) & 2) ? 0xff000000 : 0xffffffff);
+        return QBrush(img);
+    }();
+    p.setPen(QPen(pattern, std::max<qreal>(width, 1.0)));
 }
 
 double CanvasView::scale() const { return m_zoom / viewport()->devicePixelRatioF(); }
@@ -212,7 +275,7 @@ void CanvasView::setSelectionEdgesSuppressed(bool on)
 
 double CanvasView::gridStep() const
 {
-    const double major = std::max(2.0, m_opts->gridInches * m_doc->dpi());
+    const double major = std::max(2.0, m_opts->gridSpacing(m_doc->dpi(), m_doc->width()));
     return major / std::max(1, m_opts->gridSubdivisions);
 }
 
@@ -375,15 +438,21 @@ void CanvasView::paintGridAndGuides(QPainter& p, const QRectF& canvasView)
                 if (i % sub == 0) major.append(QLineF(vis.left(), y, vis.right(), y));
                 else if (showMinor) minor.append(QLineF(vis.left(), y, vis.right(), y));
             }
-            QPen minorPen(QColor(150, 150, 150, 110), 0, Qt::DotLine);
-            p.setPen(minorPen);
+            const Preferences& prefs = Preferences::instance();
+            QColor minorColor = prefs.gridColor, majorColor = prefs.gridColor;
+            minorColor.setAlpha(110);
+            majorColor.setAlpha(190);
+            const Qt::PenStyle style = prefs.gridStyle == Preferences::GridStyle::Dots         ? Qt::DotLine
+                                       : prefs.gridStyle == Preferences::GridStyle::DashedLines ? Qt::DashLine
+                                                                                                : Qt::SolidLine;
+            p.setPen(hairline(minorColor, Qt::DotLine));
             p.drawLines(minor);
-            p.setPen(QPen(QColor(150, 150, 150, 170), 0));
+            p.setPen(hairline(majorColor, style));
             p.drawLines(major);
         }
     }
     // Guides span the whole window, like Photoshop's.
-    const QColor guideColor(74, 255, 255);
+    const QColor guideColor = Preferences::instance().guideColor;
     auto drawGuide = [&](Qt::Orientation o, double pos) {
         if (o == Qt::Vertical) {
             const double x = std::round(canvasToView(QPointF(pos, 0)).x()) + 0.5;
@@ -394,13 +463,13 @@ void CanvasView::paintGridAndGuides(QPainter& p, const QRectF& canvasView)
         }
     };
     if (m_opts->showsGuides()) {
-        p.setPen(QPen(guideColor, 0));
+        p.setPen(hairline(guideColor));
         const auto& guides = m_doc->guides();
         for (int i = 0; i < guides.size(); ++i)
             if (!(m_guideDrag.active && i == m_guideDrag.index)) drawGuide(guides[i].orientation, guides[i].position);
     }
     if (m_guideDrag.active && m_guideDrag.visible) {
-        p.setPen(QPen(guideColor, 0));
+        p.setPen(hairline(guideColor));
         drawGuide(m_guideDrag.orientation, m_guideDrag.position);
     }
     p.restore();
@@ -448,6 +517,7 @@ void CanvasView::showEvent(QShowEvent* e)
 
 void CanvasView::onImageChanged(const QRect& r)
 {
+    if (m_gpu) m_gpu->invalidate(r);
     QRectF vr = canvasToView(QRectF(r));
     viewport()->update(vr.toAlignedRect().adjusted(-2, -2, 2, 2));
 }
@@ -463,14 +533,18 @@ QRectF CanvasView::selectionViewRect() const
 void CanvasView::paintEvent(QPaintEvent* e)
 {
     QPainter p(viewport());
-    const QRect clip = e->rect();
+    paintCanvas(p, e->rect());
+}
+
+void CanvasView::paintCanvas(QPainter& p, const QRect& clip)
+{
     p.fillRect(clip, Theme::kPasteboard);
 
     const QRectF canvasView = canvasToView(QRectF(m_doc->bounds()));
     const QRectF visible = canvasView & QRectF(clip);
     if (!visible.isEmpty()) {
         p.setBrushOrigin(canvasView.topLeft());
-        p.fillRect(visible, checkerBrush());
+        p.fillRect(visible, m_checker);
 
         // Source rectangle in canvas pixels covering the exposed area.
         QRectF srcF(viewToCanvas(visible.topLeft()), viewToCanvas(visible.bottomRight()));
@@ -482,8 +556,17 @@ void CanvasView::paintEvent(QPaintEvent* e)
             const QImage& img = m_doc->pyramidLevel(level);
             const double f = std::pow(2.0, level);
             const QRectF levelSrc(src.x() / f, src.y() / f, src.width() / f, src.height() / f);
-            p.setRenderHint(QPainter::SmoothPixmapTransform, m_zoom < 1.0 && std::fabs(m_zoom * f - 1.0) > 1e-6);
-            p.drawImage(canvasToView(QRectF(src)), img, levelSrc);
+            const bool smooth = m_zoom < 1.0 && std::fabs(m_zoom * f - 1.0) > 1e-6;
+            bool drawn = false;
+            if (m_gpu) {
+                p.beginNativePainting();
+                drawn = m_gpu->drawImage(canvasToView(QRectF(src)), src, level, smooth);
+                p.endNativePainting();
+            }
+            if (!drawn) {
+                p.setRenderHint(QPainter::SmoothPixmapTransform, smooth);
+                p.drawImage(canvasToView(QRectF(src)), img, levelSrc);
+            }
             if (m_doc->inQuickMask()) {
                 p.setRenderHint(QPainter::SmoothPixmapTransform, false);
                 p.drawImage(canvasToView(QRectF(src)), m_doc->quickMaskOverlay(), QRectF(src));
@@ -494,7 +577,7 @@ void CanvasView::paintEvent(QPaintEvent* e)
         if (m_opts->showsPixelGrid() && m_zoom >= 6.0) {
             QRect vis = (QRectF(viewToCanvas(visible.topLeft()), viewToCanvas(visible.bottomRight()))
                              .toAlignedRect() & m_doc->bounds());
-            p.setPen(QPen(QColor(128, 128, 128, 90), 0));
+            p.setPen(hairline(QColor(128, 128, 128, 90)));
             QVector<QLineF> lines;
             for (int x = vis.left(); x <= vis.right() + 1; ++x) {
                 double vx = canvasToView(QPointF(x, 0)).x();
@@ -539,12 +622,16 @@ void CanvasView::paintEvent(QPaintEvent* e)
         p.restore();
 
         const double outline = t->brushOutlineSize() * scale();
-        if (m_cursorInside && outline >= 6.0) {
+        const Preferences& prefs = Preferences::instance();
+        if (m_cursorInside && outline >= 6.0 && prefs.paintingCursor == Preferences::PaintingCursor::BrushTip) {
             p.setRenderHint(QPainter::Antialiasing, true);
-            p.setCompositionMode(QPainter::CompositionMode_Difference);
-            p.setPen(QPen(Qt::white, 1.0));
+            setContrastPen(p, 1.0);
             p.setBrush(Qt::NoBrush);
             p.drawEllipse(m_lastViewPos, outline / 2.0, outline / 2.0);
+            if (prefs.brushCrosshair) {
+                p.drawLine(m_lastViewPos - QPointF(4, 0), m_lastViewPos + QPointF(4, 0));
+                p.drawLine(m_lastViewPos - QPointF(0, 4), m_lastViewPos + QPointF(0, 4));
+            }
         }
     }
 }
@@ -675,7 +762,9 @@ void CanvasView::mouseDoubleClickEvent(QMouseEvent* e)
 
 void CanvasView::wheelEvent(QWheelEvent* e)
 {
-    if (e->modifiers() & Qt::AltModifier) {
+    // Preferences > General > Zoom with Scroll Wheel swaps plain and Alt scrolling.
+    const bool zoomKey = bool(e->modifiers() & Qt::AltModifier) != Preferences::instance().zoomWithScrollWheel;
+    if (zoomKey && !(e->modifiers() & Qt::ControlModifier)) {
         // Alt/Option + wheel zooms around the cursor.
         const int d = e->angleDelta().y() ? e->angleDelta().y() : e->angleDelta().x();
         if (d > 0) zoomIn(e->position());
@@ -720,6 +809,10 @@ bool CanvasView::eventFilter(QObject* obj, QEvent* e) { return QAbstractScrollAr
 bool CanvasView::viewportEvent(QEvent* e)
 {
     switch (e->type()) {
+    case QEvent::Paint:
+        // The OpenGL viewport paints itself through paintGL(), which calls paintCanvas().
+        if (m_gpu) return false;
+        break;
     case QEvent::TabletPress:
     case QEvent::TabletMove:
     case QEvent::TabletRelease: {
@@ -775,9 +868,21 @@ void CanvasView::updateCursor()
         viewport()->setCursor(Qt::ArrowCursor);
         return;
     }
+    // Preferences > Cursors: painting tools show their tip, a crosshair or the tool icon.
+    const Preferences& prefs = Preferences::instance();
     const double outline = t->brushOutlineSize() * scale();
-    if (outline >= 6.0) viewport()->setCursor(Qt::BlankCursor);
-    else if (outline > 0.0) viewport()->setCursor(Qt::CrossCursor);
-    else viewport()->setCursor(t->cursor(this, QGuiApplication::queryKeyboardModifiers()));
+    if (t->brushOutlineSize() > 0.0) {
+        if (prefs.paintingCursor == Preferences::PaintingCursor::Standard)
+            viewport()->setCursor(t->cursor(this, QGuiApplication::queryKeyboardModifiers()));
+        else if (prefs.paintingCursor == Preferences::PaintingCursor::BrushTip && outline >= 6.0)
+            viewport()->setCursor(Qt::BlankCursor);
+        else
+            viewport()->setCursor(Qt::CrossCursor);
+    } else if (prefs.otherCursors == Preferences::OtherCursor::Precise && t->id() != QLatin1String("hand")
+               && t->id() != QLatin1String("zoom") && t->id() != QLatin1String("move")) {
+        viewport()->setCursor(Qt::CrossCursor);
+    } else {
+        viewport()->setCursor(t->cursor(this, QGuiApplication::queryKeyboardModifiers()));
+    }
     viewport()->update();
 }

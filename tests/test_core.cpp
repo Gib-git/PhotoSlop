@@ -13,6 +13,7 @@
 #include "core/Selection.h"
 #include "core/Transform.h"
 #include "io/DocumentIO.h"
+#include "io/Psd.h"
 
 #include <QPainter>
 #include <QTemporaryDir>
@@ -1163,6 +1164,207 @@ private slots:
         const QImage parallel = doc->composite().copy();
         const QImage single = Compositor::flatten(doc->layers(), doc->bounds());
         QCOMPARE(parallel, single);
+    }
+    // ---------------- Stage 5: Photoshop files and colour modes ----------------
+
+    // Writes `data` to $PHOTOSLOP_PSD_DIR/name when set, so an outside reader can check it.
+    static void keepPsd(const QByteArray& data, const QString& name)
+    {
+        const QString dir = qEnvironmentVariable("PHOTOSLOP_PSD_DIR");
+        if (dir.isEmpty()) return;
+        QFile f(QDir(dir).filePath(name));
+        if (f.open(QIODevice::WriteOnly)) f.write(data);
+    }
+
+    static int maxDiff(const QImage& a, const QImage& b)
+    {
+        int worst = 0;
+        for (int y = 0; y < a.height(); ++y)
+            for (int x = 0; x < a.width(); ++x) {
+                const QRgb p = qUnpremultiply(a.pixel(x, y)), q = qUnpremultiply(b.pixel(x, y));
+                if (qAlpha(p) == 0 && qAlpha(q) == 0) continue;
+                worst = std::max({worst, std::abs(qRed(p) - qRed(q)), std::abs(qGreen(p) - qGreen(q)),
+                                  std::abs(qBlue(p) - qBlue(q)), std::abs(qAlpha(p) - qAlpha(q))});
+            }
+        return worst;
+    }
+
+    // A document using most of what a PSD can hold.
+    static Document* richDoc()
+    {
+        Document* doc = makeDoc(QSize(120, 90));
+        doc->setDpi(300);
+        doc->changeGuides({Guide{Qt::Vertical, 40.5}, Guide{Qt::Horizontal, 30}}, "Guides");
+        colorLayer(doc, QColor(200, 30, 30), QRect(10, 10, 60, 50), "Red");
+        Ops::setBlendMode(doc, doc->activeIndex(), BlendMode::Multiply);
+        Ops::setOpacity(doc, doc->activeIndex(), 0.8f);
+        Ops::setFill(doc, doc->activeIndex(), 0.6f);
+        QPainterPath maskPath;
+        maskPath.addEllipse(QRectF(20, 15, 40, 40));
+        doc->changeSelection(Sel::pathMask(doc->size(), maskPath, true), "Marquee");
+        Ops::addMask(doc, Ops::MaskFill::RevealSelection);
+        Ops::deselect(doc);
+        colorLayer(doc, QColor(30, 60, 220), QRect(40, 30, 70, 50), "Blue Ünïcode");
+        Ops::groupLayer(doc);
+        Ops::rename(doc, doc->activeIndex(), "Group A");
+        Ops::setBlendMode(doc, doc->activeIndex(), BlendMode::PassThrough);
+        // A clipped layer inside the group, above Blue.
+        doc->setActiveIndex(doc->activeIndex() - 1);
+        colorLayer(doc, QColor(250, 240, 20), QRect(0, 0, 120, 45), "Clipped");
+        Ops::toggleClippingMask(doc);
+        Ops::setLocks(doc, doc->activeIndex(), true, false, true, false);
+        doc->setActiveIndex(doc->layerCount() - 1);
+        Adjust::LayerSettings lv;
+        lv.kind = Adjust::Kind::Levels;
+        lv.levels.channels[0].inBlack = 20;
+        lv.levels.channels[0].gamma = 1.3;
+        lv.levels.channels[1].outWhite = 230;
+        Ops::newAdjustmentLayer(doc, lv.finalized());
+        Adjust::LayerSettings cv;
+        cv.kind = Adjust::Kind::Curves;
+        cv.curves.channels[0] = {QPointF(0, 10), QPointF(128, 150), QPointF(255, 255)};
+        Ops::newAdjustmentLayer(doc, cv.finalized());
+        Adjust::LayerSettings hs;
+        hs.kind = Adjust::Kind::HueSaturation;
+        hs.hueSaturation.ranges[0] = {20, -30, 5};
+        hs.hueSaturation.ranges[2] = {-10, 40, 0};
+        Ops::newAdjustmentLayer(doc, hs.finalized());
+        Ops::setVisible(doc, doc->activeIndex(), false);
+        colorLayer(doc, QColor(0, 200, 100), QRect(5, 60, 30, 25), "Top");
+        return doc;
+    }
+
+    void psdRoundTripKeepsLayers()
+    {
+        std::unique_ptr<Document> doc(richDoc());
+        QString err;
+        QStringList warnings;
+        const QByteArray data = Psd::encode(doc.get(), &err, &warnings);
+        QVERIFY2(!data.isEmpty(), qPrintable(err));
+        QVERIFY2(warnings.isEmpty(), qPrintable(warnings.join('\n')));
+        keepPsd(data, "rich.psd");
+        std::unique_ptr<Document> back(Psd::decode(data, "rich.psd", &err, &warnings));
+        QVERIFY2(back, qPrintable(err));
+        QVERIFY2(warnings.isEmpty(), qPrintable(warnings.join('\n')));
+        QCOMPARE(back->size(), doc->size());
+        QCOMPARE(back->dpi(), 300.0);
+        QCOMPARE(back->guides().size(), 2);
+        QCOMPARE(back->guides()[0].orientation, Qt::Vertical);
+        QCOMPARE(back->guides()[0].position, 40.5);
+        QCOMPARE(back->layerCount(), doc->layerCount());
+        for (int i = 0; i < doc->layerCount(); ++i) {
+            const Layer& a = doc->layerAt(i);
+            const Layer& b = back->layerAt(i);
+            QCOMPARE(b.name, a.name);
+            QCOMPARE(b.kind, a.kind);
+            QCOMPARE(b.visible, a.visible);
+            QCOMPARE(b.mode, a.mode);
+            QVERIFY(std::abs(b.opacity - a.opacity) < 0.01f);
+            QVERIFY(std::abs(b.fill - a.fill) < 0.01f);
+            QCOMPARE(b.clipped, a.clipped);
+            QCOMPARE(b.isBackground, a.isBackground);
+            QCOMPARE(b.lockTransparency, a.lockTransparency);
+            QCOMPARE(b.lockPosition, a.lockPosition);
+            QCOMPARE(b.hasMask(), a.hasMask());
+            QCOMPARE(Tree::parentIndex(back->layers(), i), Tree::parentIndex(doc->layers(), i));
+            if (a.adjustment) QCOMPARE(int(b.adjustment->kind), int(a.adjustment->kind));
+        }
+        QVERIFY2(maxDiff(back->composite(), doc->composite()) <= 1,
+                 qPrintable(QString::number(maxDiff(back->composite(), doc->composite()))));
+        // Outside readers may not apply adjustment layers; keep a copy without them to compare.
+        for (int i = 0; i < doc->layerCount(); ++i)
+            if (doc->layerAt(i).kind == LayerKind::Adjustment) Ops::setVisible(doc.get(), i, false);
+        keepPsd(Psd::encode(doc.get(), &err), "rich-noadj.psd");
+    }
+
+    void psdWritesStylesAndVectorsAsPixels()
+    {
+        std::unique_ptr<Document> doc(makeDoc(QSize(100, 60)));
+        colorLayer(doc.get(), QColor(10, 120, 200), QRect(20, 20, 40, 20), "Styled");
+        LayerStyle st;
+        st.stroke.enabled = true;
+        st.dropShadow.enabled = true;
+        Ops::setStyle(doc.get(), 1, std::make_shared<const LayerStyle>(st), "Layer Style");
+        ShapeData s;
+        s.path = Vector::ellipsePath(QRectF(70, 10, 20, 20));
+        Ops::newShapeLayer(doc.get(), s, "Ellipse");
+        Adjust::LayerSettings bw;
+        bw.kind = Adjust::Kind::BlackWhite;
+        Ops::newAdjustmentLayer(doc.get(), bw.finalized());
+        QString err;
+        QStringList warnings;
+        const QByteArray data = Psd::encode(doc.get(), &err, &warnings);
+        QCOMPARE(warnings.size(), 3);
+        std::unique_ptr<Document> back(Psd::decode(data, "t.psd", &err));
+        QVERIFY(back);
+        QCOMPARE(back->layerCount(), 3); // Black & White left out
+        QCOMPARE(back->layerAt(1).kind, LayerKind::Pixel);
+        QCOMPARE(back->layerAt(2).kind, LayerKind::Pixel);
+        // Without the Black & White layer the result is the coloured composite.
+        Ops::setVisible(doc.get(), 3, false);
+        QVERIFY(maxDiff(back->composite(), doc->composite()) <= 2);
+    }
+
+    void psdColorModesRoundTrip()
+    {
+        for (ColorMode mode : {ColorMode::Grayscale, ColorMode::CMYK, ColorMode::Lab}) {
+            std::unique_ptr<Document> doc(makeDoc(QSize(64, 48)));
+            doc->layerRef(0).image = pattern(64, 48);
+            colorLayer(doc.get(), QColor(240, 120, 10, 255), QRect(5, 5, 30, 30), "Orange");
+            Ops::setOpacity(doc.get(), 1, 0.5f);
+            doc->modify("Mode", [&] { doc->setColorModeRaw(mode); });
+            QString err;
+            const QByteArray data = Psd::encode(doc.get(), &err);
+            keepPsd(data, QStringLiteral("mode-%1.psd").arg(ColorModes::id(mode)));
+            std::unique_ptr<Document> back(Psd::decode(data, "m.psd", &err));
+            QVERIFY2(back, qPrintable(err));
+            QCOMPARE(back->colorMode(), mode);
+            QCOMPARE(back->layerCount(), 2);
+            // 8-bit Lab cannot hold colours near the edge of the sRGB gamut exactly.
+            const int tolerance = mode == ColorMode::Lab ? 16 : 1;
+            QVERIFY2(maxDiff(back->composite(), doc->composite()) <= tolerance,
+                     qPrintable(QStringLiteral("%1: %2").arg(ColorModes::id(mode)).arg(maxDiff(back->composite(), doc->composite()))));
+        }
+    }
+
+    void grayscaleModeCompositesGrey()
+    {
+        std::unique_ptr<Document> doc(makeDoc());
+        colorLayer(doc.get(), Qt::red, QRect(0, 0, 10, 10));
+        doc->modify("Grayscale", [&] { doc->setColorModeRaw(ColorMode::Grayscale); });
+        QColor c = at(doc.get(), 5, 5);
+        QCOMPARE(c.red(), c.green());
+        QCOMPARE(c.green(), c.blue());
+        QCOMPARE(c.red(), ColorModes::gray(255, 0, 0));
+        doc->undoStack()->undo();
+        QCOMPARE(doc->colorMode(), ColorMode::RGB);
+        QCOMPARE(at(doc.get(), 5, 5), QColor(Qt::red));
+    }
+
+    void labAndCmykConversions()
+    {
+        const auto white = ColorModes::rgbToLab(255, 255, 255);
+        QVERIFY(std::abs(white[0] - 100) < 0.1 && std::abs(white[1]) < 0.1 && std::abs(white[2]) < 0.1);
+        for (QRgb c : {qRgb(255, 0, 0), qRgb(12, 200, 99), qRgb(0, 0, 0), qRgb(128, 128, 128)}) {
+            const auto lab = ColorModes::rgbToLab(qRed(c), qGreen(c), qBlue(c));
+            const QRgb back = ColorModes::labToRgb(lab[0], lab[1], lab[2]);
+            QVERIFY(std::abs(qRed(back) - qRed(c)) <= 1 && std::abs(qGreen(back) - qGreen(c)) <= 1 && std::abs(qBlue(back) - qBlue(c)) <= 1);
+            const auto k = ColorModes::rgbToCmyk(qRed(c), qGreen(c), qBlue(c));
+            QCOMPARE(ColorModes::cmykToRgb(k[0], k[1], k[2], k[3]), c);
+        }
+    }
+
+    void nativeFileKeepsColorMode()
+    {
+        QTemporaryDir dir;
+        std::unique_ptr<Document> doc(makeDoc());
+        doc->modify("Lab", [&] { doc->setColorModeRaw(ColorMode::Lab); });
+        const QString path = dir.filePath("lab.pslop");
+        QString err;
+        QVERIFY(DocumentIO::saveNative(doc.get(), path, &err));
+        std::unique_ptr<Document> back(DocumentIO::load(path, &err));
+        QVERIFY(back);
+        QCOMPARE(back->colorMode(), ColorMode::Lab);
     }
 };
 

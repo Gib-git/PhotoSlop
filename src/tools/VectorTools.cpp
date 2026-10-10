@@ -453,8 +453,7 @@ void TypeTool::paintOverlay(QPainter& p, CanvasView* v)
     p.drawPolygon(box);
     if (m_caretOn) {
         const QLineF c = m_text.caretLine(m_caret);
-        p.setCompositionMode(QPainter::CompositionMode_Difference);
-        p.setPen(QPen(Qt::white, 1.5));
+        v->setContrastPen(p, 1.5);
         p.drawLine(QLineF(v->canvasToView(c.p1()), v->canvasToView(c.p2())));
     }
 }

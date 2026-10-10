@@ -5,6 +5,7 @@
 #include "core/ImageOps.h"
 #include "core/LayerStyle.h"
 #include "core/VectorLayers.h"
+#include "io/Psd.h"
 
 #include <QBuffer>
 #include <QColorSpace>
@@ -24,7 +25,7 @@ namespace DocumentIO {
 
 namespace {
 constexpr quint32 kMagic = 0x50534C50; // "PSLP"
-constexpr quint32 kVersion = 3; // 2 added guides, 3 groups, masks, adjustment/text/shape layers and styles
+constexpr quint32 kVersion = 4; // 2 added guides, 3 groups, masks, adjustment/text/shape layers and styles, 4 the colour mode
 QByteArray toPng(const QImage& img)
 {
     QByteArray png;
@@ -96,15 +97,15 @@ int applyExtra(Layer& l, const QByteArray& json)
 QString openFilter()
 {
     return QStringLiteral(
-        "All Formats (*.pslop *.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp);;"
-        "PhotoSlop (*.pslop);;PNG (*.png);;JPEG (*.jpg *.jpeg);;BMP (*.bmp);;GIF (*.gif);;"
+        "All Formats (*.pslop *.psd *.psb *.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp);;"
+        "PhotoSlop (*.pslop);;Photoshop (*.psd *.psb);;PNG (*.png);;JPEG (*.jpg *.jpeg);;BMP (*.bmp);;GIF (*.gif);;"
         "TIFF (*.tif *.tiff);;WebP (*.webp)");
 }
 
 QString saveFilter()
 {
     return QStringLiteral(
-        "PhotoSlop (*.pslop);;PNG (*.png);;JPEG (*.jpg *.jpeg);;BMP (*.bmp);;TIFF (*.tif *.tiff);;"
+        "PhotoSlop (*.pslop);;Photoshop (*.psd);;PNG (*.png);;JPEG (*.jpg *.jpeg);;BMP (*.bmp);;TIFF (*.tif *.tiff);;"
         "WebP (*.webp)");
 }
 
@@ -119,6 +120,18 @@ QStringList exportFormats()
 
 bool isNativePath(const QString& path) { return path.endsWith(QStringLiteral(".pslop"), Qt::CaseInsensitive); }
 
+bool isLayeredPath(const QString& path)
+{
+    return isNativePath(path) || path.endsWith(QStringLiteral(".psd"), Qt::CaseInsensitive);
+}
+
+bool saveLayered(Document* doc, const QString& path, QString* error, QStringList* warnings)
+{
+    if (warnings) warnings->clear();
+    if (Psd::isPsdPath(path)) return Psd::save(doc, path, error, warnings);
+    return saveNative(doc, path, error);
+}
+
 QByteArray formatForPath(const QString& path)
 {
     QString ext = QFileInfo(path).suffix().toLower();
@@ -130,6 +143,8 @@ QByteArray formatForPath(const QString& path)
 Document* fromImage(const QImage& src, const QString& title)
 {
     QImage img = src;
+    // Grey files open in Grayscale mode, as in Photoshop.
+    const bool grey = img.format() == QImage::Format_Grayscale8 || img.format() == QImage::Format_Grayscale16;
     if (img.colorSpace().isValid() && img.colorSpace() != QColorSpace::SRgb)
         img.convertToColorSpace(QColorSpace::SRgb);
     const bool hasAlpha = img.hasAlphaChannel();
@@ -139,6 +154,7 @@ Document* fromImage(const QImage& src, const QString& title)
     DocState s;
     s.size = img.size();
     s.dpi = img.dotsPerMeterX() > 0 ? std::round(img.dotsPerMeterX() * 0.0254) : 72.0;
+    if (grey) s.mode = ColorMode::Grayscale;
     // Photoshop opens flat opaque images as a Background layer, and images with
     // transparency as "Layer 0".
     Layer l = Layer::create(hasAlpha ? QStringLiteral("Layer 0") : QStringLiteral("Background"));
@@ -210,6 +226,11 @@ static Document* loadNative(const QString& path, QString* error)
             s.guides.append(g);
         }
     }
+    if (version >= 4) {
+        QString mode;
+        in >> mode;
+        s.mode = ColorModes::fromId(mode);
+    }
     if (in.status() != QDataStream::Ok) {
         if (error) *error = QStringLiteral("The document is damaged.");
         return nullptr;
@@ -222,9 +243,11 @@ static Document* loadNative(const QString& path, QString* error)
     return doc;
 }
 
-Document* load(const QString& path, QString* error)
+Document* load(const QString& path, QString* error, QStringList* warnings)
 {
+    if (warnings) warnings->clear();
     if (isNativePath(path)) return loadNative(path, error);
+    if (Psd::isPsdPath(path)) return Psd::load(path, error, warnings);
     QImageReader reader(path);
     reader.setAutoTransform(true);
     QImage img = reader.read();
@@ -260,6 +283,7 @@ bool saveNative(Document* doc, const QString& path, QString* error)
     }
     out << qint32(doc->guides().size());
     for (const Guide& g : doc->guides()) out << (g.orientation == Qt::Vertical) << g.position;
+    out << ColorModes::id(doc->colorMode());
     if (!f.commit()) {
         if (error) *error = f.errorString();
         return false;

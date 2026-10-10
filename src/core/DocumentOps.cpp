@@ -1295,4 +1295,15 @@ void rotate(Document* doc, Rotation how)
     });
 }
 
+void setColorMode(Document* doc, ColorMode mode)
+{
+    if (doc->colorMode() == mode) return;
+    doc->modify(ColorModes::menuName(mode), [&] {
+        if (mode == ColorMode::Grayscale)
+            for (Layer& l : doc->layersRef())
+                if (!l.image.isNull()) ColorModes::grayscaleInPlace(l.image);
+        doc->setColorModeRaw(mode);
+    });
+}
+
 } // namespace Ops

@@ -106,6 +106,16 @@ jobs:
           if (-not $crt) { throw "Visual C++ runtime DLLs not found under $env:VCToolsRedistDir" }
           $crt | Copy-Item -Destination dist/PhotoSlop/
           Copy-Item LICENSE dist/PhotoSlop/LICENSE.txt
+          # The installer (Inno Setup is on the Windows runners; install it if it is missing).
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "Could not install Inno Setup" }
+          }
+          $dist = (Resolve-Path dist).Path
+          & $iscc "/DAppVersion=$env:VERSION" "/DAppSource=$dist\PhotoSlop" "/DOutputDir=$dist" packaging\windows\PhotoSlop.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
+          # And a portable zip.
           Compress-Archive -Path dist/PhotoSlop -DestinationPath "dist/PhotoSlop-$env:VERSION-windows-x64.zip"
           Remove-Item -Recurse dist/PhotoSlop
 
@@ -124,11 +134,13 @@ jobs:
           export QMAKE="$QT_ROOT_DIR/bin/qmake"
           ./linuxdeploy-x86_64.AppImage --appdir AppDir \
             --executable build/PhotoSlop \
-            --desktop-file packaging/photoslop.desktop \
+            --desktop-file packaging/linux/photoslop.desktop \
             --icon-file photoslop.svg \
             --plugin qt --output appimage
           mkdir -p dist
           mv PhotoSlop-*.AppImage "dist/PhotoSlop-$VERSION-linux-x86_64.AppImage"
+          # A .deb for Debian and Ubuntu, built from the same AppDir.
+          packaging/linux/build-deb.sh AppDir "$VERSION" "dist/photoslop_${VERSION}_amd64.deb"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -160,8 +172,8 @@ jobs:
 
           ### Downloads
           - **macOS** (Apple silicon and Intel): `.dmg`. The app is not signed yet, so the first time, right-click PhotoSlop and choose Open.
-          - **Windows** (64-bit): `.zip`. Unzip it and run `PhotoSlop.exe`.
-          - **Linux** (x86-64): `.AppImage`. Make it executable (`chmod +x`) and run it.
+          - **Windows** (64-bit): `-setup.exe` installs PhotoSlop with a Start menu entry and file associations; the `.zip` is a portable copy (unzip it and run `PhotoSlop.exe`).
+          - **Linux** (x86-64): `.deb` for Debian and Ubuntu (`sudo apt install ./photoslop_*.deb`), or the `.AppImage` for any distribution (make it executable with `chmod +x` and run it).
           EOF
           cat notes.md
 

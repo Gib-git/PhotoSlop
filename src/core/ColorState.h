@@ -9,8 +9,16 @@ class ColorState : public QObject {
 public:
     explicit ColorState(QObject* parent = nullptr) : QObject(parent) {}
 
-    QColor foreground() const { return m_fg; }
-    QColor background() const { return m_bg; }
+    // In a Grayscale document the colours paint as their greys.
+    QColor foreground() const { return m_gray ? grey(m_fg) : m_fg; }
+    QColor background() const { return m_gray ? grey(m_bg) : m_bg; }
+    bool grayscale() const { return m_gray; }
+    void setGrayscale(bool on)
+    {
+        if (on == m_gray) return;
+        m_gray = on;
+        emit changed();
+    }
 
     void setForeground(const QColor& c)
     {
@@ -40,6 +48,12 @@ signals:
     void changed();
 
 private:
+    static QColor grey(const QColor& c)
+    {
+        const int v = (c.red() * 77 + c.green() * 151 + c.blue() * 28 + 128) >> 8;
+        return QColor(v, v, v, c.alpha());
+    }
     QColor m_fg = Qt::black;
     QColor m_bg = Qt::white;
+    bool m_gray = false;
 };

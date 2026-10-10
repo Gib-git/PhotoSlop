@@ -8,9 +8,13 @@
 #include <functional>
 
 #include "core/Adjustments.h"
+#include "core/ColorModes.h"
 #include "core/Filters.h"
 #include "ui/ViewOptions.h"
+#include "ui/dialogs/ShortcutsDialog.h"
 
+class ActionsModel;
+class ActionsPanel;
 class AdjustmentsPanel;
 struct LayerStyle;
 class CanvasView;
@@ -104,6 +108,8 @@ private:
     void featherDialog();
     void modifySelectionDialog(int how);
     void toggleQuickMask();
+    // Image > Mode; Grayscale asks before discarding colour.
+    void convertMode(ColorMode mode);
     // Layer > Layer Style (page is a LayerStyleDialog::Page).
     void layerStyleDialog(int page);
     // Adds an adjustment layer and opens its settings; Cancel removes it again.
@@ -135,8 +141,42 @@ private:
     bool canFade();
     void fadeDialog();
     void showShortcuts();
+    // Edit > Keyboard Shortcuts: the editable commands, and applying and saving changes.
+    QList<ShortcutsDialog::Entry> shortcutEntries() const;
+    void applyShortcut(const QString& id, const QList<QKeySequence>& keys);
+    void loadShortcuts();
+    void saveShortcuts(const QList<ShortcutsDialog::Entry>& entries);
+    void preferencesDialog();
     void showAbout();
     void toggleAllPanels(bool docksOnly);
+    // Actions: what the undo history looked like, to tell whether a command changed anything.
+    struct HistoryMark {
+        Document* doc = nullptr;
+        int docs = 0;
+        int index = 0;
+        int count = 0;
+        const QUndoCommand* top = nullptr;
+        bool operator==(const HistoryMark&) const = default;
+    };
+    HistoryMark historyMark() const;
+    static bool isRecordable(const QString& id);
+    // Window > Workspace: saved panel layouts. The empty name is Essentials.
+    QStringList workspaceNames() const;
+    void rebuildWorkspaceMenu();
+    void switchWorkspace(const QString& name);
+    void resetWorkspace();
+
+public:
+    // Plays an action from the Actions panel, from step `fromStep`. False if a step failed or
+    // its dialog was cancelled.
+    bool playAction(int set, int action, int fromStep = 0);
+    ActionsModel* actionsModel() const { return m_actionsModel; }
+    ActionsPanel* actionsPanel() const { return m_actionsPanel; }
+    // Saves the current layout as a workspace (asks for a name when none is given).
+    bool newWorkspace(const QString& name = QString());
+    void deleteWorkspace(const QString& name = QString());
+
+private:
     void cycleScreenMode();
     void setScreenMode(int mode);
     void handleDigit(int digit);
@@ -146,12 +186,22 @@ private:
     ToolManager* m_tools;
     QUndoGroup* m_undoGroup;
     ViewOptions* m_viewOptions;
+    ActionsModel* m_actionsModel;
+    ActionsPanel* m_actionsPanel = nullptr;
+    struct Playback {
+        bool active = false;
+        QHash<QString, double> values;
+        bool showDialog = false;
+    } m_playback;
+    QHash<QString, double> m_stepValues; // what the last dialog command used, for recording
+    bool m_playingAction = false;
     FreeTransformTool* m_transform = nullptr;
     ToolBox* m_toolBox = nullptr;
     QHash<QString, bool ViewOptions::*> m_viewToggles;
 
     QStackedWidget* m_central = nullptr;
     HomeScreen* m_home = nullptr;
+    QWidget* m_empty = nullptr;
     QTabWidget* m_tabs = nullptr;
     QToolBar* m_toolsBar = nullptr;
     QToolBar* m_optionsBar = nullptr;
@@ -171,9 +221,11 @@ private:
     QList<QDockWidget*> m_docks;
 
     QHash<QString, QAction*> m_actions;
+    QHash<QString, QList<QKeySequence>> m_defaultShortcuts;
     QList<QAction*> m_docActions;
     QMenu* m_recentMenu = nullptr;
     QMenu* m_windowMenu = nullptr;
+    QMenu* m_workspaceMenu = nullptr;
     QList<QAction*> m_windowDocActions;
     QByteArray m_defaultState;
 
