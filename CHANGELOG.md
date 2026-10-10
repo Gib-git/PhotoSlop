@@ -6,6 +6,8 @@ The current version is in the `VERSION` file. To release, add notes under **Unre
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-09
+
 ### Fixed
 - Photoshop files with layers could not be opened in the Windows build ("its layers are damaged").
 
