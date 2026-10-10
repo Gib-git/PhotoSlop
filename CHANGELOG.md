@@ -6,6 +6,8 @@ The current version is in the `VERSION` file. To release, add notes under **Unre
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-09
+
 Stage 5: pro and platform.
 
 ### Added
