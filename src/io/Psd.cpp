@@ -468,7 +468,9 @@ bool readRecord(Reader& r, Record& rec)
     rec.clipping = r.u8();
     rec.flags = r.u8();
     r.skip(1);
-    const qint64 extraEnd = r.pos() + r.u32() + 4;
+    // Read the length first: the order operands of + are evaluated in is unspecified (MSVC differs).
+    const quint32 extraLen = r.u32();
+    const qint64 extraEnd = r.pos() + extraLen;
     if (!r.ok() || extraEnd > r.size()) return false;
 
     // Layer mask data.
